@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+	<TargetFramework>net8.0</TargetFramework>
+	<IsPackable>false</IsPackable>
+	<Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+	<PackageReference Include="xunit" Version="2.6.2" />
+	<PackageReference Include="xunit.runner.visualstudio" Version="2.6.2"> 
+	  <PrivateAssets>all</PrivateAssets>
+	  <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+	</PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+	<ProjectReference Include="..\..\src\ProcessGuardian.Core\ProcessGuardian.Core.csproj" />
+	<ProjectReference Include="..\..\src\ProcessGuardian.Services\ProcessGuardian.Services.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,51 @@
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.csproj.user
+*.sln.docstates
+
+# Build output
+**/bin/
+**/obj/
+
+# Test results
+TestResults/
+
+# Coverage
+coverage/
+*.coverage
+*.coveragexml
+
+# Publish output
+publish/
+artifacts/
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+
+# Rider / ReSharper
+_ReSharper*/
+*.DotSettings.user
+
+# VS Code
+.vscode/
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local secrets
+.env
+.env.*
+*.local.json
+
+# User-specific MCP configuration
+.vs/mcp.json

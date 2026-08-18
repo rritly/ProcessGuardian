@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+	<OutputType>WinExe</OutputType>
+	<TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+	<TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+	<RootNamespace>ProcessGuardian</RootNamespace>
+	<ApplicationManifest>..\..\ProcessGuardian\app.manifest</ApplicationManifest>
+	<Platforms>x86;x64;ARM64</Platforms>
+	<RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+	<UseWinUI>true</UseWinUI>
+	<WinUISDKReferences>false</WinUISDKReferences>
+	<EnableMsixTooling>true</EnableMsixTooling>
+	<Nullable>enable</Nullable>
+
+	<!-- Unpackaged configuration -->
+	<WindowsPackageType>None</WindowsPackageType>
+	<WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+
+	<!-- Publish settings for single-file self-contained unpackaged target (win-x64) -->
+	<SelfContained>true</SelfContained>
+	<PublishSingleFile>true</PublishSingleFile>
+	<IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+	<EnableMsixTooling>true</EnableMsixTooling>
+  </PropertyGroup>
+
+  <ItemGroup>
+	<PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2526" />
+	<PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" />
+  </ItemGroup>
+
+	<ItemGroup>
+	<!-- UI files are placed physically inside this project folder (see App.xaml, MainWindow.xaml) -->
+  </ItemGroup>
+
+  <ItemGroup>
+	<!-- Include assets from original project as linked content so they are available during build and publish -->
+	<Content Include="..\..\ProcessGuardian\Assets\**\*">
+	  <Link>Assets\%(RecursiveDir)%(Filename)%(Extension)</Link>
+	  <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	</Content>
+  </ItemGroup>
+
+  <ItemGroup>
+	<ProjectReference Include="..\ProcessGuardian.Core\ProcessGuardian.Core.csproj" />
+	<ProjectReference Include="..\ProcessGuardian.Services\ProcessGuardian.Services.csproj" />
+  </ItemGroup>
+
+</Project>

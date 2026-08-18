@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "ProcessGuardian (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "ProcessGuardian (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
