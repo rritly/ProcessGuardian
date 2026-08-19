@@ -3,9 +3,10 @@ namespace ProcessGuardian.Core
     public enum GuardianStatus
     {
         Stopped,
-        Running,
-        Starting,
-        Stopping,
+        WaitingInitialDelay,
+        Monitoring,
+        Restarting,
+        Cooldown,
         Error
     }
 }

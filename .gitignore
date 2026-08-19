@@ -49,3 +49,5 @@ Thumbs.db
 
 # User-specific MCP configuration
 .vs/mcp.json
+
+TestResults/

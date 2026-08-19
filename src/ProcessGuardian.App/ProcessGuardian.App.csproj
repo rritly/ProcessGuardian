@@ -6,7 +6,7 @@
 	<RootNamespace>ProcessGuardian</RootNamespace>
 	<ApplicationManifest>..\..\ProcessGuardian\app.manifest</ApplicationManifest>
 	<Platforms>x86;x64;ARM64</Platforms>
-	<RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+	<RuntimeIdentifier>win-x64</RuntimeIdentifier>
 	<UseWinUI>true</UseWinUI>
 	<WinUISDKReferences>false</WinUISDKReferences>
 	<EnableMsixTooling>true</EnableMsixTooling>
