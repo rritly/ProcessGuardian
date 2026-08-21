@@ -1,195 +1,152 @@
 # ProcessGuardian — Architecture Decision Log
 
-This file records important project decisions that affect architecture, behavior, deployment, or compatibility.
-
-It is not a task list and does not replace the technical specification.
-
-New decisions should be added only when a meaningful architectural or behavioral choice is made.
+This file contains only accepted decisions that affect architecture, behavior, deployment, or compatibility. Current implementation status belongs in `docs/DEVELOPMENT_CONTEXT.md`.
 
 ## Decision 001 — WinUI 3 / Windows App SDK
 
 **Status:** Accepted
 
-**Decision**
+ProcessGuardian uses WinUI 3 / Windows App SDK with .NET 8 / C# for Windows 11.
 
-ProcessGuardian is implemented as a Windows 11 desktop application using:
-- WinUI 3
-- Windows App SDK
-- .NET 8
-- C#
-
-**Reason**
-
-This is the technology stack defined by the technical specification and provides the required desktop UI, lifecycle, notifications and Windows integration.
-
-## Decision 002 — Unpackaged application
+## Decision 002 — Unpackaged self-contained deployment
 
 **Status:** Accepted
 
-**Decision**
+The application uses unpackaged Windows App SDK deployment with self-contained publishing.
 
-ProcessGuardian is distributed as an unpackaged Windows App SDK application with self-contained publishing.
+The final MVP distribution is a single-file `win-x64` executable. Windows App SDK dependencies may be extracted at runtime according to the supported single-file deployment model.
 
-**Reason**
-
-The application is intended to run for the current user without requiring a traditional MSIX deployment.
-
-**Consequence**
-
-Deployment must include all dependencies required by the chosen Windows App SDK deployment model.
-
-## Decision 003 — Non-elevated application
+## Decision 003 — Non-elevated MVP
 
 **Status:** Accepted
 
-**Decision**
+The normal application runs with standard user privileges. MVP functionality must not require or automatically request elevation.
 
-The normal ProcessGuardian process runs with standard user privileges and does not request elevation.
-
-**Reason**
-
-The application should be usable without administrator rights and must support notification and per-user autostart scenarios.
-
-**Consequence**
-
-Features that genuinely require elevation, such as optional advanced Task Scheduler scenarios, must be isolated and explicitly handled rather than making the whole application elevated.
-
-## Decision 004 — One monitored target process
+## Decision 004 — One monitored target
 
 **Status:** Accepted
 
-**Decision**
+The MVP monitors one configured executable.
 
-The initial product version monitors one configured target executable.
+Multiple targets, PID-based targeting, and extended process/session filters are out of scope.
 
-**Reason**
-
-The current technical specification defines a single target. Support for multiple targets is future work.
-
-## Decision 005 — Executable path is the primary process identity
+## Decision 005 — Full executable path is process identity
 
 **Status:** Accepted
 
-**Decision**
+`TargetProcessPath` is authoritative.
 
-The configured full executable path is the authoritative identity of the target process.
+`Process.GetProcessesByName()` is only a preliminary candidate filter and cannot by itself establish target identity.
 
-**Reason**
+If process identity cannot be determined safely because executable-path information is unavailable, the controller must not launch a second instance in that monitoring cycle.
 
-Executable names are not unique. A check based only on `Process.GetProcessesByName()` can report an unrelated process as the target.
-
-**Consequence**
-
-Process existence checks must verify the intended executable rather than relying solely on the process name.
-
-## Decision 006 — Process.Start requires startup verification
+## Decision 006 — Restart requires verification
 
 **Status:** Accepted
 
-**Decision**
+`Process.Start()` success is not restart success.
 
-A successful call to `Process.Start()` is not treated as proof that the monitored process successfully started.
+After each restart attempt, the intended executable must be verified within `StartupVerificationTimeoutSeconds`.
 
-**Reason**
-
-The target can start and immediately terminate, fail during initialization, or become discoverable only after a short delay.
-
-**Consequence**
-
-After each restart attempt, ProcessGuardian waits for the configured verification interval and checks whether the intended process is actually running.
-
-## Decision 007 — Single monitoring loop
+## Decision 007 — Single monitoring loop and restart sequence
 
 **Status:** Accepted
 
-**Decision**
+At most one monitoring loop and one restart sequence may be active.
 
-There must be at most one active monitoring loop for the target process.
+Start/Stop and future Suspend/Resume integration must be idempotent and cancellation-safe.
 
-**Reason**
-
-Multiple concurrent loops could trigger duplicate restart attempts, conflicting state changes, duplicated notifications, and incorrect attempt counters.
-
-**Consequence**
-
-Start/Stop and Resume handling must be cancellation-safe and idempotent.
-
-## Decision 008 — Tray icon represents monitoring state
+## Decision 008 — Fixed-rate controller scheduling
 
 **Status:** Accepted
 
-**Decision**
+The controller uses a fixed-rate schedule based on `ITimeProvider.UtcNow` rather than `PeriodicTimer`.
 
-The notification-area icon is state-dependent:
-- `Assets/TrayIconOn.ico` — monitoring active / Start;
-- `Assets/TrayIconOff.ico` — monitoring stopped / Stop.
+The schedule is anchored to a start timestamp and advances by `CheckIntervalSeconds`, preventing cumulative drift while remaining deterministic for unit tests.
 
-**Reason**
+Do not replace this mechanism with another timer implementation without an explicit architectural decision.
 
-The tray icon provides an immediate visual indication of the application's monitoring mode.
-
-**Consequence**
-
-Tray icon changes must be synchronized with the authoritative application state and must not rely on independent UI flags.
-
-## Decision 009 — App icon is separate from tray icons
+## Decision 009 — State-driven tray icons
 
 **Status:** Accepted
 
-**Decision**
+`TrayIconOn.ico` represents active monitoring.
 
-`Assets/AppIcon.ico` is the main application icon.
+`TrayIconOff.ico` represents stopped/unavailable monitoring.
 
-It is used for the window, title bar, taskbar, Start menu, shortcuts and other system locations where the application icon is required.
+Tray state follows the authoritative application state.
 
-It is not used as the normal notification-area icon.
-
-## Decision 010 — Per-user autostart
+## Decision 010 — Separate application icon
 
 **Status:** Accepted
 
-**Decision**
+`AppIcon.ico` is the application icon for the window, taskbar, Start menu, shortcuts, and other application surfaces.
 
-The default autostart mechanism is the current user's Registry Run entry.
+It is not the normal tray icon.
 
-**Reason**
-
-It works without administrator privileges and fits the application's per-user, non-elevated execution model.
-
-**Consequence**
-
-The implementation must avoid creating duplicate autostart entries through multiple mechanisms unless explicitly requested.
-
-## Decision 011 — Per-user configuration and logs
+## Decision 011 — HKCU Run is canonical MVP autostart
 
 **Status:** Accepted
 
-**Decision**
+Use:
 
-Configuration and logs are stored under the current user's application data directory.
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 
-**Reason**
+with `--background` as the canonical MVP autostart mechanism.
 
-The application should not require write access to protected installation directories.
+The Startup folder is not a required second mechanism. Task Scheduler is outside the MVP baseline.
 
-**Consequence**
-
-Configuration and log services must handle missing directories and malformed configuration safely.
-
-## Decision 012 — No separate architecture document initially
+## Decision 012 — Autostart and monitoring are independent
 
 **Status:** Accepted
 
-**Decision**
+`AutostartEnabled` controls whether ProcessGuardian starts at user logon.
 
-`docs/ProcessGuardian_TZ.md` is the requirements document. This file records decisions that affect implementation.
+`MonitoringEnabled` controls whether the monitoring controller runs.
 
-A separate `ARCHITECTURE.md` is not required at the initial development stage.
+Neither setting may silently change the other.
 
-**Reason**
+## Decision 013 — Command-line arguments are stored as a single string
 
-The technical specification already defines the initial component architecture. Creating a second architecture document before implementation would duplicate information and create another document that can become inconsistent with the code.
+**Status:** Accepted
 
-**Consequence**
+The current configuration model stores `TargetProcessArguments` as a single nullable command-line string.
 
-Create `ARCHITECTURE.md` only when the implemented architecture becomes sufficiently complex that a standalone architecture overview provides value.
+The controller passes this value through `ProcessStartInfo.Arguments`.
+
+This decision matches the current implemented configuration model. If structured argument storage is introduced later, it must be an explicit schema/architecture change.
+
+## Decision 014 — Current Windows App SDK target
+
+**Status:** Accepted
+
+The current project targets Windows App SDK `2.3.1`.
+
+Upgrades must be deliberate and compatibility-tested rather than introduced during unrelated feature work.
+
+## Decision 015 — Per-user configuration and logs
+
+**Status:** Accepted
+
+Configuration and diagnostic logs are stored in the current user's application-data area.
+
+The implementation uses `Microsoft.Windows.Storage.ApplicationData.GetForUnpackaged(...)` for unpackaged application data.
+
+## Decision 016 — Documentation responsibilities
+
+**Status:** Accepted
+
+- `.github/copilot-instructions.md` — permanent Copilot workflow and coding constraints.
+- `docs/ProcessGuardian_TZ.md` — product requirements and acceptance criteria.
+- `docs/DECISIONS.md` — accepted architectural and behavioral decisions.
+- `docs/DEVELOPMENT_CONTEXT.md` — current implementation status, verified behavior, historical findings, risks, and current priorities.
+
+Avoid duplicating large amounts of implementation status across these documents.
+
+## Decision 017 — No separate ARCHITECTURE.md for now
+
+**Status:** Accepted
+
+A separate architecture document is not currently needed because the specification, decision log, and code structure adequately describe the system.
+
+Create `ARCHITECTURE.md` only if the implemented system becomes substantially more complex and such a document adds clear value.
