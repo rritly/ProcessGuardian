@@ -12,10 +12,10 @@ namespace ProcessGuardian
         private Window? _window;
         public ProcessGuardian.Core.AppState AppState { get; private set; } = new ProcessGuardian.Core.AppState();
         private IProcessGuardianController? _controller;
-        private CancellationTokenSource? _appCts;
         private IFileStorage? _storage;
         private RingLogger? _concreteLogger;
         private IRingLogger? _logger;
+        private int _shutdownFlag = 0;
 
         public App()
         {
@@ -55,15 +55,12 @@ namespace ProcessGuardian
                 // Create controller (single instance)
                 _controller = new ProcessGuardian.Services.ProcessGuardianController(configService, _logger, AppState, processManager, timeProvider);
 
-                // Prepare application cancellation token
-                _appCts = new CancellationTokenSource();
-
                 // Start monitoring if enabled in settings
                 if (AppState.Settings.MonitoringEnabled)
                 {
                     try
                     {
-                        await _controller.StartAsync(_appCts.Token);
+                        await _controller.StartAsync();
                     }
                     catch (Exception ex)
                     {
@@ -73,9 +70,8 @@ namespace ProcessGuardian
                     }
                 }
 
-                // Register shutdown handlers
+                // Register a single canonical shutdown entrypoint for process exit
                 AppDomain.CurrentDomain.ProcessExit += (_, __) => ShutdownSync();
-                this.UnhandledException += (_, e) => { try { ShutdownSync(); } catch { } };
 
                 // UI: only create window when not background
                 if (!isBackground)
@@ -96,39 +92,38 @@ namespace ProcessGuardian
 
         private async System.Threading.Tasks.Task ShutdownAsync()
         {
-            try
-            {
-                _appCts?.Cancel();
-                if (_controller != null)
-                {
-                    try
-                    {
-                        await _controller.StopAsync().ConfigureAwait(false);
-                    }
-                    catch { }
-                }
+            // Idempotent shutdown
+            if (System.Threading.Interlocked.Exchange(ref _shutdownFlag, 1) == 1)
+                return;
 
-                // Flush concrete logger if available
-                if (_concreteLogger != null)
-                {
-                    try
-                    {
-                        await _concreteLogger.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-                    }
-                    catch { }
-                }
-            }
-            finally
+            if (_controller != null)
             {
-                try { _appCts?.Dispose(); } catch { }
+                try
+                {
+                    await _controller.StopAsync().ConfigureAwait(false);
+                }
+                catch { }
+            }
+
+            // Flush concrete logger if available
+            if (_concreteLogger != null)
+            {
+                try
+                {
+                    await _concreteLogger.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+                catch { }
             }
         }
 
         private void ShutdownSync()
         {
+            // Ensure the async shutdown runs to completion synchronously
+            if (System.Threading.Interlocked.Exchange(ref _shutdownFlag, 1) == 1)
+                return;
+
             try
             {
-                _appCts?.Cancel();
                 if (_controller != null)
                 {
                     try { _controller.StopAsync().GetAwaiter().GetResult(); } catch { }
@@ -140,10 +135,6 @@ namespace ProcessGuardian
                 }
             }
             catch { }
-            finally
-            {
-                try { _appCts?.Dispose(); } catch { }
-            }
         }
     }
 }

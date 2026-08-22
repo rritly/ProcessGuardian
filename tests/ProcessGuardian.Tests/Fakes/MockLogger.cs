@@ -12,13 +12,11 @@ namespace ProcessGuardian.Tests.Fakes
         public void Log(string message)
         {
             _messages.Enqueue(message);
-            System.Console.WriteLine("LOG: " + message);
         }
 
         public void LogError(string message, System.Exception? ex = null)
         {
             _errors.Enqueue((message, ex));
-            System.Console.WriteLine("ERROR: " + message + (ex != null ? (" => " + ex.Message) : string.Empty));
         }
 
         public string[] GetMessages() => _messages.ToArray();

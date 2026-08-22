@@ -261,12 +261,10 @@ namespace ProcessGuardian.Tests
 
             // At this point controller should have attempted start; simulate external appearance before timeout
             pm.AddProcess(settings.TargetProcessPath);
-            tp.AdvanceBy(TimeSpan.FromMilliseconds(500));
+            tp.AdvanceBy(TimeSpan.FromMilliseconds(250));
             await Task.Yield();
 
-            var msgs = logger.GetMessages();
-            foreach (var mm in msgs) System.Console.WriteLine(mm);
-            Assert.IsTrue(msgs.Any(m => m.Contains("Startup verification succeeded")));
+            Assert.IsTrue(logger.GetMessages().Any(m => m.Contains("Startup verification succeeded")));
 
             await controller.StopAsync();
         }
