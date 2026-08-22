@@ -4,7 +4,7 @@ namespace ProcessGuardian.Services
 {
     public sealed class WindowsRunKeyAccessor : IRunKeyAccessor
     {
-        private const string RunKeyPath = @"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
 public string? GetValue(string name)
         {
