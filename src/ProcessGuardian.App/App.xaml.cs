@@ -1,6 +1,7 @@
 using Microsoft.UI.Xaml;
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 using ProcessGuardian.Services.Logging;
 using ProcessGuardian.Services;
 using ProcessGuardian.Core;
@@ -15,7 +16,8 @@ namespace ProcessGuardian
         private IFileStorage? _storage;
         private RingLogger? _concreteLogger;
         private IRingLogger? _logger;
-        private int _shutdownFlag = 0;
+        private readonly object _shutdownLock = new();
+        private Task? _shutdownTask;
 
         public App()
         {
@@ -92,47 +94,63 @@ namespace ProcessGuardian
 
         private async System.Threading.Tasks.Task ShutdownAsync()
         {
-            // Idempotent shutdown
-            if (System.Threading.Interlocked.Exchange(ref _shutdownFlag, 1) == 1)
-                return;
-
-            if (_controller != null)
+            Task? toAwait;
+            lock (_shutdownLock)
             {
-                try
+                if (_shutdownTask == null)
                 {
-                    await _controller.StopAsync().ConfigureAwait(false);
+                    _shutdownTask = ShutdownInternalAsync();
                 }
-                catch { }
+                toAwait = _shutdownTask;
             }
 
-            // Flush concrete logger if available
-            if (_concreteLogger != null)
-            {
-                try
-                {
-                    await _concreteLogger.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch { }
-            }
+            // Await the shared shutdown task without capturing context
+            await toAwait!.ConfigureAwait(false);
         }
 
-        private void ShutdownSync()
+        private async Task ShutdownInternalAsync()
         {
-            // Ensure the async shutdown runs to completion synchronously
-            if (System.Threading.Interlocked.Exchange(ref _shutdownFlag, 1) == 1)
-                return;
-
+            // Ensure StopAsync() -> FlushAsync() order, non-throwing
             try
             {
                 if (_controller != null)
                 {
-                    try { _controller.StopAsync().GetAwaiter().GetResult(); } catch { }
+                    try
+                    {
+                        await _controller.StopAsync().ConfigureAwait(false);
+                    }
+                    catch { }
                 }
 
                 if (_concreteLogger != null)
                 {
-                    try { _concreteLogger.FlushAsync(CancellationToken.None).GetAwaiter().GetResult(); } catch { }
+                    try
+                    {
+                        await _concreteLogger.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch { }
                 }
+            }
+            catch { }
+        }
+
+        private void ShutdownSync()
+        {
+            Task? toWait;
+            lock (_shutdownLock)
+            {
+                if (_shutdownTask == null)
+                {
+                    // Start the shutdown work on the threadpool so we can wait for it synchronously
+                    _shutdownTask = Task.Run(() => ShutdownInternalAsync());
+                }
+                toWait = _shutdownTask;
+            }
+
+            try
+            {
+                // Wait synchronously for the shared shutdown task to complete
+                toWait!.GetAwaiter().GetResult();
             }
             catch { }
         }
