@@ -62,13 +62,47 @@ namespace ProcessGuardian.Tests
         }
 
         [TestMethod]
-        public void IsEnabledReflectsPresence()
+        public void IsEnabled_CorrectCommand_ReturnsTrue()
+        {
+            var fake = new FakeRunKeyAccessor();
+            var svc = new AutostartService(fake, () => "C:\\prog\\pg.exe");
+            fake.SetValue(AppIdentity.Product, "C:\\prog\\pg.exe --background");
+            Assert.IsTrue(svc.IsEnabled());
+        }
+
+        [TestMethod]
+        public void IsEnabled_MissingEntry_ReturnsFalse()
         {
             var fake = new FakeRunKeyAccessor();
             var svc = new AutostartService(fake, () => "C:\\prog\\pg.exe");
             Assert.IsFalse(svc.IsEnabled());
-            fake.SetValue(AppIdentity.Product, "C:\\prog\\pg.exe --background");
-            Assert.IsTrue(svc.IsEnabled());
+        }
+
+        [TestMethod]
+        public void IsEnabled_WrongExecutable_ReturnsFalse()
+        {
+            var fake = new FakeRunKeyAccessor();
+            var svc = new AutostartService(fake, () => "C:\\prog\\pg.exe");
+            fake.SetValue(AppIdentity.Product, "C:\\other\\otherapp.exe --background");
+            Assert.IsFalse(svc.IsEnabled());
+        }
+
+        [TestMethod]
+        public void IsEnabled_MissingBackgroundArg_ReturnsFalse()
+        {
+            var fake = new FakeRunKeyAccessor();
+            var svc = new AutostartService(fake, () => "C:\\prog\\pg.exe");
+            fake.SetValue(AppIdentity.Product, "C:\\prog\\pg.exe");
+            Assert.IsFalse(svc.IsEnabled());
+        }
+
+        [TestMethod]
+        public void IsEnabled_UnrelatedExeWithBackground_ReturnsFalse()
+        {
+            var fake = new FakeRunKeyAccessor();
+            var svc = new AutostartService(fake, () => "C:\\prog\\pg.exe");
+            fake.SetValue(AppIdentity.Product, "C:\\SomeOther\\other.exe --background");
+            Assert.IsFalse(svc.IsEnabled());
         }
     }
 }

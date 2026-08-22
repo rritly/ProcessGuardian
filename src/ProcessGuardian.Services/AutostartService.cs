@@ -7,12 +7,14 @@ namespace ProcessGuardian.Services
     {
         private readonly IRunKeyAccessor _runKey;
         private readonly Func<string?> _processPathProvider;
+        private readonly IRingLogger? _logger;
         private readonly string _valueName = AppIdentity.Product;
 
-        public AutostartService(IRunKeyAccessor? runKey = null, Func<string?>? processPathProvider = null)
+        public AutostartService(IRunKeyAccessor? runKey = null, Func<string?>? processPathProvider = null, IRingLogger? logger = null)
         {
             _runKey = runKey ?? new WindowsRunKeyAccessor();
             _processPathProvider = processPathProvider ?? GetDefaultProcessPath;
+            _logger = logger;
         }
 
         private static string? GetDefaultProcessPath()
@@ -21,31 +23,44 @@ namespace ProcessGuardian.Services
             return Environment.ProcessPath ?? Assembly.GetEntryAssembly()?.Location;
         }
 
+        private static string BuildCommandForPath(string path)
+        {
+            var quoted = path.Contains(' ') ? $"\"{path}\"" : path;
+            return $"{quoted} --background";
+        }
+
         public async Task EnableAsync(bool enable)
         {
-            try
+            if (enable)
             {
-                if (enable)
+                try
                 {
                     var path = _processPathProvider();
                     if (string.IsNullOrWhiteSpace(path))
                     {
-                        // cannot determine a reliable path; be conservative and do nothing
+                        _logger?.Log("AutostartService: Unable to determine process path; skipping enable.");
                         return;
                     }
 
-                    var quoted = path.Contains(' ') ? $"\"{path}\"" : path;
-                    var command = $"{quoted} --background";
+                    var command = BuildCommandForPath(path);
                     _runKey.SetValue(_valueName, command);
                 }
-                else
+                catch (Exception ex)
+                {
+                    _logger?.LogError("AutostartService: Failed to write Run key.", ex);
+                    // Do not rethrow; keep non-throwing behavior
+                }
+            }
+            else
+            {
+                try
                 {
                     _runKey.DeleteValue(_valueName);
                 }
-            }
-            catch
-            {
-                // Swallow exceptions; services are expected to be conservative and not throw for registry issues
+                catch (Exception ex)
+                {
+                    _logger?.LogError("AutostartService: Failed to delete Run key.", ex);
+                }
             }
 
             await Task.CompletedTask;
@@ -57,11 +72,20 @@ namespace ProcessGuardian.Services
             {
                 var val = _runKey.GetValue(_valueName);
                 if (string.IsNullOrWhiteSpace(val)) return false;
-                if (!val.Contains("--background")) return false;
-                return true;
+
+                var path = _processPathProvider();
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    // cannot reliably compare without a known process path
+                    return false;
+                }
+
+                var expected = BuildCommandForPath(path);
+                return string.Equals(val.Trim(), expected.Trim(), System.StringComparison.OrdinalIgnoreCase);
             }
-            catch
+            catch (Exception ex)
             {
+                _logger?.LogError("AutostartService: Failed to read Run key.", ex);
                 return false;
             }
         }
