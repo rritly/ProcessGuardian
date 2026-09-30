@@ -478,10 +478,10 @@
                                        Orientation="Vertical"
                                        Value="{TemplateBinding VerticalOffset}"
                                        Maximum="{TemplateBinding ScrollableHeight}"
-                                       ViewportSize="{TemplateBinding ViewportHeight}"
-                                       Minimum="0"
-                                       Visibility="Visible"
-                                       IsEnabled="{TemplateBinding IsEnabled}" />
+                                        ViewportSize="{TemplateBinding ViewportHeight}"
+                                        Minimum="0"
+                                        Visibility="{TemplateBinding ComputedVerticalScrollBarVisibility}"
+                                        IsEnabled="{TemplateBinding IsEnabled}" />
                             <ScrollBar x:Name="PART_HorizontalScrollBar"
                                        Grid.Row="1" Grid.Column="0"
                                        Orientation="Horizontal"
@@ -812,7 +812,7 @@
                               Grid.Row="2"
                               Margin="15"
                               Style="{StaticResource DarkScrollViewerStyle}"
-                              VerticalScrollBarVisibility="Visible"
+                              VerticalScrollBarVisibility="Auto"
                               HorizontalScrollBarVisibility="Disabled"
                               CanContentScroll="False"
                               SnapsToDevicePixels="True">
