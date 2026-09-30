@@ -13,7 +13,7 @@
         FontWeight="SemiBold"
         UseLayoutRounding="True"
         TextOptions.TextRenderingMode="Grayscale"
-        TextOptions.TextHintingMode="Fixed">
+        TextOptions.TextHintingMode="Animated">
 
     <Window.Resources>
         <conv:StatusToDisplayConverter x:Key="StatusToDisplayConverter" />
@@ -247,7 +247,7 @@
         <Style x:Key="PrimaryButtonStyle" TargetType="Button">
             <Setter Property="Background" Value="{StaticResource PrimaryBrush}" />
             <Setter Property="Foreground" Value="{StaticResource WhiteBrush}" />
-            <Setter Property="FontSize" Value="13.5" />
+            <Setter Property="FontSize" Value="12.5" />
             <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="BorderThickness" Value="0" />
             <Setter Property="Cursor" Value="Hand" />
@@ -598,7 +598,7 @@
           Margin="0"
           UseLayoutRounding="True"
           TextOptions.TextRenderingMode="Grayscale"
-          TextOptions.TextHintingMode="Fixed">
+          TextOptions.TextHintingMode="Animated">
         <Grid Margin="15">
         <Grid.RowDefinitions>
             <RowDefinition Height="118" />
