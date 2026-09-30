@@ -13,7 +13,7 @@
         FontWeight="SemiBold"
         UseLayoutRounding="True"
         TextOptions.TextRenderingMode="Grayscale"
-        TextOptions.TextHintingMode="Animated">
+        TextOptions.TextHintingMode="Fixed">
 
     <Window.Resources>
         <conv:StatusToDisplayConverter x:Key="StatusToDisplayConverter" />
@@ -598,7 +598,7 @@
           Margin="0"
           UseLayoutRounding="True"
           TextOptions.TextRenderingMode="Grayscale"
-          TextOptions.TextHintingMode="Animated">
+          TextOptions.TextHintingMode="Fixed">
         <Grid Margin="15">
         <Grid.RowDefinitions>
             <RowDefinition Height="118" />
