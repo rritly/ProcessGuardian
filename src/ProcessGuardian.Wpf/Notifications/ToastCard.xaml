@@ -54,9 +54,8 @@
                        TextTrimming="CharacterEllipsis"
                        FontFamily="Noto Sans, Segoe UI"
                        FontWeight="Black"
-                       TextOptions.TextRenderingMode="ClearType"
-                       TextOptions.TextHintingMode="Fixed"
-                       RenderOptions.ClearTypeHint="Enabled"/>
+                       TextOptions.TextRenderingMode="Grayscale"
+                       TextOptions.TextHintingMode="Fixed"/>
         </Grid>
     </Border>
 </UserControl>

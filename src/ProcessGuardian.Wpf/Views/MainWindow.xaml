@@ -10,11 +10,10 @@
         ResizeMode="CanMinimize"
         Background="#1A252F"
         FontFamily="Segoe UI"
-        FontWeight="Bold"
+        FontWeight="SemiBold"
         UseLayoutRounding="True"
-        TextOptions.TextRenderingMode="ClearType"
-        TextOptions.TextHintingMode="Fixed"
-        RenderOptions.ClearTypeHint="Enabled">
+        TextOptions.TextRenderingMode="Grayscale"
+        TextOptions.TextHintingMode="Fixed">
 
     <Window.Resources>
         <conv:StatusToDisplayConverter x:Key="StatusToDisplayConverter" />
@@ -194,7 +193,7 @@
             <Setter Property="Foreground" Value="{StaticResource WhiteBrush}" />
             <Setter Property="CaretBrush" Value="{StaticResource WhiteBrush}" />
             <Setter Property="FontSize" Value="12" />
-            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Padding" Value="0" />
             <Setter Property="Template">
@@ -221,7 +220,7 @@
             <Setter Property="Foreground" Value="{StaticResource WhiteBrush}" />
             <Setter Property="CaretBrush" Value="{StaticResource WhiteBrush}" />
             <Setter Property="FontSize" Value="12" />
-            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="TextAlignment" Value="Center" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Padding" Value="0" />
@@ -249,7 +248,7 @@
             <Setter Property="Background" Value="{StaticResource PrimaryBrush}" />
             <Setter Property="Foreground" Value="{StaticResource WhiteBrush}" />
             <Setter Property="FontSize" Value="13.5" />
-            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="BorderThickness" Value="0" />
             <Setter Property="Cursor" Value="Hand" />
             <Setter Property="Template">
@@ -552,7 +551,7 @@
         <Style x:Key="StatusTextStyle" TargetType="TextBlock">
             <Setter Property="Foreground" Value="{StaticResource StoppedTextBrush}" />
             <Setter Property="FontSize" Value="13.5" />
-            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="FontWeight" Value="SemiBold" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Status}" Value="Monitoring">
                     <Setter Property="Foreground" Value="{StaticResource MonitoringTextBrush}" />
@@ -598,9 +597,8 @@
           VerticalAlignment="Top"
           Margin="0"
           UseLayoutRounding="True"
-          TextOptions.TextRenderingMode="ClearType"
-          TextOptions.TextHintingMode="Fixed"
-          RenderOptions.ClearTypeHint="Enabled">
+          TextOptions.TextRenderingMode="Grayscale"
+          TextOptions.TextHintingMode="Fixed">
         <Grid Margin="15">
         <Grid.RowDefinitions>
             <RowDefinition Height="118" />
@@ -822,7 +820,7 @@
                              Text="{Binding LogText, Mode=OneWay}"
                              IsReadOnly="True"
                              FontSize="10.5"
-                             FontWeight="Bold"
+                             FontWeight="SemiBold"
                              Foreground="{StaticResource LabelBrush}"
                              Background="Transparent"
                              BorderThickness="0"

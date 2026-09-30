@@ -65,8 +65,6 @@ internal sealed class TrayMenuPopup : Window
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(DpiRadius),
         };
-        // Card background is opaque; this re-enables ClearType inside the transparent window.
-        RenderOptions.SetClearTypeHint(_card, ClearTypeHint.Enabled);
 
         for (int i = 0; i < Specs.Length; i++)
         {
