@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <InternalsVisibleTo Include="ProcessGuardian.Infrastructure.Tests" />
+    <ProjectReference Include="..\ProcessGuardian.Application\ProcessGuardian.Application.csproj" />
+    <ProjectReference Include="..\ProcessGuardian.Domain\ProcessGuardian.Domain.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\ProcessGuardian.Wpf\Assets\TrayIconOn.ico" Link="Assets\TrayIconOn.ico" LogicalName="ProcessGuardian.Assets.TrayIconOn.ico" />
+    <EmbeddedResource Include="..\ProcessGuardian.Wpf\Assets\TrayIconOff.ico" Link="Assets\TrayIconOff.ico" LogicalName="ProcessGuardian.Assets.TrayIconOff.ico" />
+    <EmbeddedResource Include="..\ProcessGuardian.Wpf\Assets\TrayIconError.ico" Link="Assets\TrayIconError.ico" LogicalName="ProcessGuardian.Assets.TrayIconError.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Hardcodet.NotifyIcon.Wpf" Version="1.1.0" />
+    <PackageReference Include="Serilog" Version="4.2.0" />
+  </ItemGroup>
+</Project>

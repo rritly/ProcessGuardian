@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: Publish standalone single-file
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build\publish.ps1 -SelfContained
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$env:GITHUB_REF_NAME" "publish/self-contained/ProcessGuardian.exe" --title "ProcessGuardian $env:GITHUB_REF_NAME" --generate-notes

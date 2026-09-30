@@ -1,0 +1,22 @@
+name: Build & Test
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - run: dotnet restore
+      - run: dotnet build --no-restore --configuration Release
+      - run: dotnet test --no-restore --configuration Release --verbosity normal
+      - name: Publish framework-dependent
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build\publish.ps1 -FrameworkDependent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ProcessGuardian-x64
+          path: ./publish/framework-dependent
+          if-no-files-found: error

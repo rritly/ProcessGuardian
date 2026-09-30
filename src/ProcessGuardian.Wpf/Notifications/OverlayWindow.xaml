@@ -1,0 +1,21 @@
+<Window x:Class="ProcessGuardian.Wpf.Notifications.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ProcessGuardianNotifications"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        Width="400"
+        Height="500"
+        ResizeMode="NoResize"
+        ContentRendered="OnContentRendered">
+
+    <StackPanel x:Name="CardStack"
+                Orientation="Vertical"
+                VerticalAlignment="Bottom"
+                HorizontalAlignment="Right"
+                IsHitTestVisible="True"/>
+</Window>
