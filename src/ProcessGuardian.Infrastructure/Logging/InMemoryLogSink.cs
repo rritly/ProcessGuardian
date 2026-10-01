@@ -40,6 +40,7 @@ public sealed class InMemoryLogSink : ILogEventSink
         _logFilePath = Path.Combine(dir, "logs.log");
         _maxFileBytes = MaxFileBytes;
         _flushTimer = new Timer(FlushTimerCallback, null, FlushIntervalMs, FlushIntervalMs);
+        LoadTailFromFile();
     }
 
     // Test seam: hermetic file path and size cap; production always uses the other ctor.
@@ -48,6 +49,25 @@ public sealed class InMemoryLogSink : ILogEventSink
         _logFilePath = logFilePath;
         _maxFileBytes = maxFileBytes;
         _flushTimer = new Timer(FlushTimerCallback, null, FlushIntervalMs, FlushIntervalMs);
+        LoadTailFromFile();
+    }
+
+    // Seeds the UI ring with the file tail so the log card shows previous-session
+    // history immediately. Loaded lines are NOT re-written (pending stays empty).
+    private void LoadTailFromFile()
+    {
+        try
+        {
+            if (!File.Exists(_logFilePath))
+                return;
+            var lines = File.ReadAllLines(_logFilePath);
+            foreach (var line in lines.TakeLast(MaxBufferSize))
+                _messages.Enqueue(line);
+        }
+        catch
+        {
+            // Startup history load is best-effort; a fresh session is fine.
+        }
     }
 
     public void Emit(LogEvent logEvent)
