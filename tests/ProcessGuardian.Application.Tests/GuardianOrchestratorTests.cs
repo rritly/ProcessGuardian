@@ -14,21 +14,15 @@ namespace ProcessGuardian.Application.Tests;
 
 public class GuardianOrchestratorTests
 {
-    private const string TargetPath = @"C:\App\target.exe";
     private const int TimeoutMs = 10000;
 
-    private sealed class Harness
+    private sealed class Harness : IDisposable
     {
-        public AppSettings Settings { get; } = new()
-        {
-            IsMonitoringEnabled = true,
-            TargetProcessPath = TargetPath,
-            InitialDelaySeconds = 0,
-            CheckIntervalSeconds = 1,
-            RestartDelaySeconds = 1,
-            StartupVerificationTimeoutSeconds = 1,
-            MaxRestartAttempts = 5,
-        };
+        // A real on-disk .exe is required: ProcessTarget.TryCreate (FR-16) rejects
+        // paths whose file does not exist before any monitor call happens.
+        public string TargetPath { get; }
+
+        public AppSettings Settings { get; }
 
         public IProcessMonitor Monitor { get; } = Substitute.For<IProcessMonitor>();
         public IConfigurationStore Config { get; } = Substitute.For<IConfigurationStore>();
@@ -42,6 +36,22 @@ public class GuardianOrchestratorTests
 
         public Harness()
         {
+            var dir = Path.Combine(Path.GetTempPath(), "ProcessGuardian.Tests", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            TargetPath = Path.Combine(dir, "target.exe");
+            File.WriteAllText(TargetPath, string.Empty);
+
+            Settings = new AppSettings
+            {
+                IsMonitoringEnabled = true,
+                TargetProcessPath = TargetPath,
+                InitialDelaySeconds = 0,
+                CheckIntervalSeconds = 1,
+                RestartDelaySeconds = 1,
+                StartupVerificationTimeoutSeconds = 1,
+                MaxRestartAttempts = 5,
+            };
+
             Config.LoadAsync(Arg.Any<CancellationToken>())
                 .Returns(_ =>
                 {
@@ -73,6 +83,20 @@ public class GuardianOrchestratorTests
                 cts.Cancel();
                 await orchestrator.StopAsync(CancellationToken.None);
                 orchestrator.Dispose();
+            }
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(TargetPath);
+                if (Directory.Exists(dir))
+                    Directory.Delete(dir, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup; never throw from Dispose
             }
         }
     }

@@ -102,20 +102,14 @@ public sealed class GuardianOrchestrator : BackgroundService
             settings = await _config.LoadAsync(ct); // Reload every cycle for live updates
             if (!settings.IsMonitoringEnabled) break;
 
-            if (string.IsNullOrWhiteSpace(settings.TargetProcessPath))
+            if (!ProcessTarget.TryCreate(settings.TargetProcessPath, out var target, out var pathError))
             {
-                _logger.LogWarning("Target process path is empty; monitoring cannot start");
+                _logger.LogWarning("Invalid target path {Path}: {Reason}", settings.TargetProcessPath, pathError);
                 SetStatus(GuardianStatus.Error);
                 if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(settings.CheckIntervalSeconds), ct))
                     return;
                 continue;
             }
-
-            var target = new ProcessTarget(
-                settings.TargetProcessPath,
-                Path.GetFileNameWithoutExtension(settings.TargetProcessPath),
-                Path.GetDirectoryName(settings.TargetProcessPath) ?? string.Empty
-            );
 
             try
             {
