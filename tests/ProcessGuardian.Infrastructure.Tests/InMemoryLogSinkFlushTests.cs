@@ -85,4 +85,39 @@ public class InMemoryLogSinkFlushTests : IDisposable
         File.ReadAllText(path).Should().BeEmpty();
         sink.GetRecentLogs(200).Should().BeEmpty();
     }
+
+    [Fact]
+    public void Restart_NewSinkOnSamePath_AppendsWithoutTruncatingHistory()
+    {
+        var path = Path.Combine(_dir, "logs.log");
+
+        var first = new InMemoryLogSink(path);
+        first.Emit(CreateEvent("session one entry"));
+        first.Flush();
+
+        var second = new InMemoryLogSink(path);
+        second.Emit(CreateEvent("session two entry"));
+        second.Flush();
+
+        var text = File.ReadAllText(path);
+        text.Should().Contain("session one entry");
+        text.Should().Contain("session two entry");
+    }
+
+    [Fact]
+    public void Flush_WhenFileExceedsCap_RotatesToArchive()
+    {
+        var path = Path.Combine(_dir, "logs.log");
+        var archive = Path.Combine(_dir, "logs.1.log");
+        var sink = new InMemoryLogSink(path, maxFileBytes: 32);
+
+        sink.Emit(CreateEvent("first generation entry"));
+        sink.Flush();
+        sink.Emit(CreateEvent("second generation entry"));
+        sink.Flush();
+
+        File.ReadAllText(archive).Should().Contain("first generation entry");
+        File.ReadAllText(path).Should().Contain("second generation entry");
+        File.ReadAllText(path).Should().NotContain("first generation entry");
+    }
 }
