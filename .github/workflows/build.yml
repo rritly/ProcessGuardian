@@ -12,11 +12,17 @@ jobs:
           dotnet-version: '9.0.x'
       - run: dotnet restore
       - run: dotnet build --no-restore --configuration Release
+      - run: dotnet build --no-restore --configuration Release-Elevated
       - run: dotnet test --no-restore --configuration Release --verbosity normal
-      - name: Publish framework-dependent
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build\publish.ps1 -FrameworkDependent
+      - name: Publish (both editions, self-contained)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build\publish.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: ProcessGuardian-x64
-          path: ./publish/framework-dependent
+          path: ./publish/self-contained
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ProcessGuardianAdmin-x64
+          path: ./publish/self-contained-admin
           if-no-files-found: error
