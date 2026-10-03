@@ -74,6 +74,7 @@ public partial class ToastCard : UserControl
         {
             "Process Recovered" => new SolidColorBrush((Color)ColorConverter.ConvertFromString("#4CC86A")),
             "Recovery Failed" => new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FC3847")),
+            "Target Changed" => new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FC3847")),
             _ => new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFFFFF")),
         };
     }

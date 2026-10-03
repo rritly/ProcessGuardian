@@ -20,6 +20,7 @@ public partial class MainViewModel : ObservableObject
     private readonly INotificationService _notifications;
     private readonly ILogger<MainViewModel> _logger;
     private readonly InMemoryLogSink _logSink;
+    private readonly ITargetIntegrityService _integrity;
 
     // Track previous settings to unsubscribe from PropertyChanged on replacement.
     private AppSettings? _previousSettings;
@@ -60,7 +61,8 @@ public partial class MainViewModel : ObservableObject
         IStatusReporter statusReporter,
         INotificationService notifications,
         ILogger<MainViewModel> logger,
-        InMemoryLogSink logSink)
+        InMemoryLogSink logSink,
+        ITargetIntegrityService integrity)
     {
         _configStore = configStore;
         _autostart = autostart;
@@ -68,6 +70,7 @@ public partial class MainViewModel : ObservableObject
         _notifications = notifications;
         _logger = logger;
         _logSink = logSink;
+        _integrity = integrity;
 
         // Marshal status events to UI thread
         _statusReporter.StatusChanged += (s, e) =>
@@ -166,6 +169,7 @@ public partial class MainViewModel : ObservableObject
         try
         {
             Settings.IsMonitoringEnabled = true;
+            await PinTargetHashAsync();
             _logger.LogInformation("Start Monitoring: enabled={Enabled}, path={Path}", Settings.IsMonitoringEnabled, Settings.TargetProcessPath);
             if (Settings.EnableToasts)
                 _ = _notifications.ShowAsync("Monitoring Started", string.Empty);
@@ -176,6 +180,28 @@ public partial class MainViewModel : ObservableObject
         {
             EndOperation();
         }
+    }
+
+    // Records (or re-records) the target hash on every Start: recovery restarts are
+    // verified against this pin, so re-enabling monitoring is the explicit
+    // re-confirmation after a "Target Changed" block.
+    private async Task PinTargetHashAsync()
+    {
+        if (string.IsNullOrWhiteSpace(Settings.TargetProcessPath))
+        {
+            Settings.TargetHashSha256 = string.Empty;
+            return;
+        }
+
+        var hash = await _integrity.ComputeHashAsync(Settings.TargetProcessPath);
+        if (hash is null)
+        {
+            _logger.LogWarning("Failed to hash target {Path}; no pin recorded", Settings.TargetProcessPath);
+            hash = string.Empty;
+        }
+
+        if (!string.Equals(Settings.TargetHashSha256, hash, StringComparison.OrdinalIgnoreCase))
+            Settings.TargetHashSha256 = hash; // PropertyChanged -> debounced save; Start also flushes immediately.
     }
 
     [RelayCommand(CanExecute = nameof(CanStop))]

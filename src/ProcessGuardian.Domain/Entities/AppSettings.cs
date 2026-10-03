@@ -10,6 +10,12 @@ public partial class AppSettings : ObservableObject
     [ObservableProperty]
     private string _targetProcessPath = string.Empty;
 
+    // SHA-256 (uppercase hex) of the target binary, recorded when monitoring is
+    // enabled. Launches are blocked while the on-disk file no longer matches this
+    // pin. Empty = no pin (settings from before this feature).
+    [ObservableProperty]
+    private string _targetHashSha256 = string.Empty;
+
     [ObservableProperty]
     private int _checkIntervalSeconds = 5;
 

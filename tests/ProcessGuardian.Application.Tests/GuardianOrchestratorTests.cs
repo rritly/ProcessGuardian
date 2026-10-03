@@ -28,6 +28,7 @@ public class GuardianOrchestratorTests
         public IConfigurationStore Config { get; } = Substitute.For<IConfigurationStore>();
         public INotificationService Notifications { get; } = Substitute.For<INotificationService>();
         public IStatusReporter Status { get; } = Substitute.For<IStatusReporter>();
+        public ITargetIntegrityService Integrity { get; } = Substitute.For<ITargetIntegrityService>();
 
         public ConcurrentBag<GuardianStatus> Statuses { get; } = new();
         public ConcurrentBag<string> ToastTitles { get; } = new();
@@ -69,7 +70,7 @@ public class GuardianOrchestratorTests
         }
 
         public GuardianOrchestrator CreateOrchestrator() =>
-            new(Monitor, Config, Notifications, NullLogger<GuardianOrchestrator>.Instance, Status);
+            new(Monitor, Config, Notifications, NullLogger<GuardianOrchestrator>.Instance, Status, Integrity);
 
         public static async Task RunAsync(GuardianOrchestrator orchestrator, CancellationTokenSource cts, Func<Task> body)
         {
@@ -445,5 +446,109 @@ public class GuardianOrchestratorTests
 
         h.Statuses.Should().Contain(GuardianStatus.Error);
         h.CheckCount.Should().BeGreaterThanOrEqualTo(3);
+    }
+
+    [Fact]
+    public async Task HashMismatch_LaunchBlocked_MonitoringDisabled_TargetChangedToast()
+    {
+        var h = new Harness();
+        h.Settings.TargetHashSha256 = "AA11";
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<string?>("BB"));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
+        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
+
+        using var cts = new CancellationTokenSource();
+        var orchestrator = h.CreateOrchestrator();
+        await Harness.RunAsync(orchestrator, cts, async () =>
+        {
+            await WaitUntilAsync(() => h.ToastTitles.Contains("Target Changed"),
+                "Target Changed toast to be shown");
+            await WaitUntilAsync(() => h.Config.ReceivedCalls().Any(c =>
+                c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync)),
+                "SaveAsync to persist the disabled state");
+        });
+
+        await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Settings.IsMonitoringEnabled.Should().BeFalse();
+        h.Statuses.Should().Contain(GuardianStatus.Error);
+        h.ToastTitles.Should().Contain("Target Changed");
+    }
+
+    [Fact]
+    public async Task HashReadFailure_BlocksLaunch_FailClosed()
+    {
+        var h = new Harness();
+        h.Settings.TargetHashSha256 = "AA";
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<string?>(null));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+
+        using var cts = new CancellationTokenSource();
+        var orchestrator = h.CreateOrchestrator();
+        await Harness.RunAsync(orchestrator, cts, async () =>
+        {
+            await WaitUntilAsync(() => h.ToastTitles.Contains("Target Changed"),
+                "Target Changed toast after unreadable hash");
+        });
+
+        await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Settings.IsMonitoringEnabled.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task HashMatches_LaunchProceeds_StatusMonitoring()
+    {
+        var h = new Harness();
+        h.Settings.TargetHashSha256 = "AA";
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<string?>("aa"));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
+        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
+
+        using var cts = new CancellationTokenSource();
+        var orchestrator = h.CreateOrchestrator();
+        await Harness.RunAsync(orchestrator, cts, async () =>
+        {
+            await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Any(c =>
+                    c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)),
+                "StartAsync to be called when the hash matches");
+        });
+
+        await h.Integrity.Received().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().Contain(GuardianStatus.Monitoring);
+    }
+
+    [Fact]
+    public async Task EmptyHash_CheckSkipped_LaunchProceeds()
+    {
+        var h = new Harness();
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
+        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
+
+        using var cts = new CancellationTokenSource();
+        var orchestrator = h.CreateOrchestrator();
+        await Harness.RunAsync(orchestrator, cts, async () =>
+        {
+            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+                "Monitoring status after initial launch without a pin");
+        });
+
+        await h.Integrity.DidNotReceive().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
 }

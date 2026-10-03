@@ -42,6 +42,7 @@ public static class Bootstrapper
 
         // Infrastructure
         services.AddSingleton<IProcessMonitor, WindowsProcessMonitor>();
+        services.AddSingleton<ITargetIntegrityService, Sha256IntegrityService>();
         services.AddSingleton<INotificationService, OverlayNotificationService>();
         services.AddSingleton<IAutostartService, RegistryAutostartService>();
         services.AddSingleton<ITrayService, TrayIconService>();

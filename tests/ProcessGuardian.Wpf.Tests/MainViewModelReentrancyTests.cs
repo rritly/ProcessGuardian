@@ -61,7 +61,8 @@ public class MainViewModelReentrancyTests
         public void CompleteCurrentSave() => CurrentSaveGate.SetResult();
 
         public MainViewModel CreateVm() =>
-            new(Config, Autostart, Status, Notifications, NullLogger<MainViewModel>.Instance, new InMemoryLogSink());
+            new(Config, Autostart, Status, Notifications, NullLogger<MainViewModel>.Instance, new InMemoryLogSink(),
+                Substitute.For<ITargetIntegrityService>());
     }
 
     [Fact]

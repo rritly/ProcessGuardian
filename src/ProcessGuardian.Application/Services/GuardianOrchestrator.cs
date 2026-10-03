@@ -14,6 +14,7 @@ public sealed class GuardianOrchestrator : BackgroundService
     private readonly INotificationService _notifications;
     private readonly ILogger<GuardianOrchestrator> _logger;
     private readonly IStatusReporter _status;
+    private readonly ITargetIntegrityService _integrity;
 
     private GuardianStatus _currentStatus = GuardianStatus.Stopped;
     private int _restartAttempts = 0;
@@ -24,13 +25,15 @@ public sealed class GuardianOrchestrator : BackgroundService
         IConfigurationStore config,
         INotificationService notifications,
         ILogger<GuardianOrchestrator> logger,
-        IStatusReporter status)
+        IStatusReporter status,
+        ITargetIntegrityService integrity)
     {
         _monitor = monitor;
         _config = config;
         _notifications = notifications;
         _logger = logger;
         _status = status;
+        _integrity = integrity;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -177,6 +180,8 @@ public sealed class GuardianOrchestrator : BackgroundService
         _logger.LogInformation("Restart attempt #{Attempt} for {Target}", _restartAttempts, target.NameWithoutExtension);
 
         var outcome = await StartAndVerifyAsync(s, target, ct, showRecoveryToast: true);
+        if (outcome == StartOutcome.Blocked)
+            return; // Monitoring was already disabled; no retry against a changed target.
         if (outcome == StartOutcome.VerifyFailed && (_restartAttempts < s.MaxRestartAttempts || s.MaxRestartAttempts == 0))
         {
             try
@@ -190,10 +195,57 @@ public sealed class GuardianOrchestrator : BackgroundService
         }
     }
 
-    private enum StartOutcome { NotStarted, Verified, VerifyFailed }
+    private enum StartOutcome { NotStarted, Verified, VerifyFailed, Blocked }
+
+    // Target-hash pin verification. An empty pin (settings written before this
+    // feature, or Start never pressed) skips the check for backwards compatibility.
+    // A hash read failure is treated as a mismatch: fail closed.
+    private async Task<bool> VerifyTargetHashAsync(AppSettings s, ProcessTarget target, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(s.TargetHashSha256))
+        {
+            _logger.LogInformation("Target {Target} has no recorded hash; integrity check skipped", target.NameWithoutExtension);
+            return true;
+        }
+
+        var actual = await _integrity.ComputeHashAsync(target.FullPath, ct);
+        if (actual is not null &&
+            string.Equals(actual, s.TargetHashSha256, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        _logger.LogError(
+            "Target binary hash mismatch for {Target} (expected {Expected}, got {Actual}); launch blocked",
+            target.NameWithoutExtension, s.TargetHashSha256, actual ?? "<unreadable>");
+        SetStatus(GuardianStatus.Error);
+        try
+        {
+            if (s.EnableToasts)
+                await _notifications.ShowAsync("Target Changed", string.Empty, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to show target-changed toast");
+        }
+
+        _restartAttempts = 0;
+        s.IsMonitoringEnabled = false;
+        try
+        {
+            await _config.SaveAsync(s, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to persist monitoring disabled after target change");
+        }
+
+        return false;
+    }
 
     private async Task<StartOutcome> StartAndVerifyAsync(AppSettings s, ProcessTarget target, CancellationToken ct, bool showRecoveryToast)
     {
+        if (!await VerifyTargetHashAsync(s, target, ct))
+            return StartOutcome.Blocked;
+
         bool started;
         try
         {
