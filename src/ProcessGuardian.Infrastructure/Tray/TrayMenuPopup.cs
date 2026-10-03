@@ -22,6 +22,8 @@ internal sealed class TrayMenuPopup : Window
     private const double DpiHitHeight = 32;
     private const double DpiRadius = 12;
     private const double DpiFontSize = 12.75;
+    // Symmetric text inset (matches Specs.Tx) used to grow the window for long labels.
+    private const double DpiRightPadding = 14.25;
 
     // DIP layout: (textX, highlightY). Text and hit-area are centered on the highlight;
     // the hit-area is 1px taller. Widths come from canvas ActualWidth (any-DPI exactness).
@@ -66,6 +68,8 @@ internal sealed class TrayMenuPopup : Window
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(DpiRadius),
         };
+
+        double maxTextWidth = 0;
 
         for (int i = 0; i < Specs.Length; i++)
         {
@@ -116,6 +120,7 @@ internal sealed class TrayMenuPopup : Window
             // Center the text vertically on the highlight using its measured height.
             text.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
             double textY = hy + (DpiHoverHeight - text.DesiredSize.Height) / 2;
+            maxTextWidth = Math.Max(maxTextWidth, text.DesiredSize.Width);
 
             Canvas.SetLeft(hover, 0);
             Canvas.SetTop(hover, hy);
@@ -130,6 +135,12 @@ internal sealed class TrayMenuPopup : Window
             _canvas.Children.Add(hit);
             _canvas.Children.Add(text);
         }
+
+        // Width grows to fit the widest label ("Show {AppEdition.Name}"): text inset +
+        // measured text + right padding + 1 DIP card border on each side. Hover/hit rows
+        // and the work-area clamp follow the actual width; never below the designed 158 DIP.
+        double required = Specs[0].Tx + maxTextWidth + DpiRightPadding + 2;
+        Width = Math.Max(DpiWidth, Math.Ceiling(required));
 
         _card.Child = _canvas;
         Content = _card;
