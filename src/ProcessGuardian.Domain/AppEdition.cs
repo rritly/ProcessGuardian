@@ -22,6 +22,5 @@ public static class AppEdition
     public const string ShowEventName = Name + "_ShowRequested";
     public const string AutostartValueName = Name;
     public const string ScheduledTaskName = Name;
-    public const string TrayResourcePrefix = Name + ".Assets.";
     public const string WindowTitle = Name;
 }

@@ -32,9 +32,11 @@ public sealed class TrayIconService : ITrayService
     {
         _logger = logger;
 
-        (_icoOn, _icoOnOwned) = LoadIconSafe(AppEdition.TrayResourcePrefix + "TrayIconOn.ico");
-        (_icoOff, _icoOffOwned) = LoadIconSafe(AppEdition.TrayResourcePrefix + "TrayIconOff.ico");
-        (_icoError, _icoErrorOwned) = LoadIconSafe(AppEdition.TrayResourcePrefix + "TrayIconError.ico");
+        // Embedded tray icons carry fixed LogicalNames (Infrastructure.csproj) that are
+        // independent of the edition's assembly name — do NOT derive them from AppEdition.
+        (_icoOn, _icoOnOwned) = LoadIconSafe("ProcessGuardian.Assets.TrayIconOn.ico");
+        (_icoOff, _icoOffOwned) = LoadIconSafe("ProcessGuardian.Assets.TrayIconOff.ico");
+        (_icoError, _icoErrorOwned) = LoadIconSafe("ProcessGuardian.Assets.TrayIconError.ico");
 
         _icon = new TaskbarIcon
         {
