@@ -9,10 +9,12 @@ public static class AppEdition
 {
 #if ELEVATED_EDITION
     public const string Name = "ProcessGuardianAdmin";
-    public const bool IsElevated = true;
+    // Runtime (not const) on purpose: a const false would make the elevated
+    // code paths unreachable code (CS0162) under TreatWarningsAsErrors.
+    public static readonly bool IsElevated = true;
 #else
     public const string Name = "ProcessGuardian";
-    public const bool IsElevated = false;
+    public static readonly bool IsElevated = false;
 #endif
 
     public const string DataDirName = Name;

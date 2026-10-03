@@ -1,3 +1,5 @@
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using ProcessGuardian.Domain;
@@ -17,10 +19,14 @@ public sealed class JsonConfigurationStore : IConfigurationStore
     public JsonConfigurationStore(ILogger<JsonConfigurationStore> logger)
     {
         _logger = logger;
-        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppEdition.DataDirName);
+        var dir = AppEdition.IsElevated
+            ? GetAdminConfigDirectory()
+            : GetUserConfigDirectory();
         try
         {
             Directory.CreateDirectory(dir);
+            if (AppEdition.IsElevated)
+                HardenForAdministratorsOnly(dir);
         }
         catch (Exception ex)
         {
@@ -28,6 +34,31 @@ public sealed class JsonConfigurationStore : IConfigurationStore
             throw;
         }
         _path = Path.Combine(dir, "settings.json");
+    }
+
+    private static string GetUserConfigDirectory() =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppEdition.DataDirName);
+
+    // Admin edition: the settings file selects which binary the elevated guardian
+    // launches, so it must not be writable by user-level processes. ProgramData
+    // with inheritance stripped and only Administrators/SYSTEM granted closes
+    // that escalation path.
+    private static string GetAdminConfigDirectory() =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), AppEdition.DataDirName);
+
+    internal static void HardenForAdministratorsOnly(string directory)
+    {
+        var info = new DirectoryInfo(directory);
+        var security = info.GetAccessControl();
+        security.SetAccessRuleProtection(true, false);
+        var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
+        info.SetAccessControl(security);
     }
 
     public async Task<AppSettings> LoadAsync(CancellationToken ct = default)
