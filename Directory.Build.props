@@ -6,4 +6,10 @@
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
+  <!-- Admin edition build (ProcessGuardianAdmin): the define selects AppEdition
+       values in every layer; optimization matches a regular Release build. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release-Elevated'">
+    <DefineConstants>$(DefineConstants);ELEVATED_EDITION</DefineConstants>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
 </Project>

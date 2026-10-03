@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Windows;
 using Hardcodet.Wpf.TaskbarNotification;
 using Microsoft.Extensions.Logging;
+using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Enums;
 using ProcessGuardian.Domain.Interfaces;
 
@@ -31,14 +32,14 @@ public sealed class TrayIconService : ITrayService
     {
         _logger = logger;
 
-        (_icoOn, _icoOnOwned) = LoadIconSafe("ProcessGuardian.Assets.TrayIconOn.ico");
-        (_icoOff, _icoOffOwned) = LoadIconSafe("ProcessGuardian.Assets.TrayIconOff.ico");
-        (_icoError, _icoErrorOwned) = LoadIconSafe("ProcessGuardian.Assets.TrayIconError.ico");
+        (_icoOn, _icoOnOwned) = LoadIconSafe(AppEdition.TrayResourcePrefix + "TrayIconOn.ico");
+        (_icoOff, _icoOffOwned) = LoadIconSafe(AppEdition.TrayResourcePrefix + "TrayIconOff.ico");
+        (_icoError, _icoErrorOwned) = LoadIconSafe(AppEdition.TrayResourcePrefix + "TrayIconError.ico");
 
         _icon = new TaskbarIcon
         {
             Icon = _icoOff,
-            ToolTipText = "ProcessGuardian - Stopped",
+            ToolTipText = $"{AppEdition.Name} - Stopped",
             Visibility = Visibility.Visible,
         };
 
@@ -98,7 +99,7 @@ public sealed class TrayIconService : ITrayService
                 GuardianStatus.Error => _icoError,
                 _ => _icoOff,
             };
-            _icon.ToolTipText = $"ProcessGuardian - {status}";
+            _icon.ToolTipText = $"{AppEdition.Name} - {status}";
 
             ApplyStatus(status);
         }

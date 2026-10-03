@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using ProcessGuardian.Domain;
 
 namespace ProcessGuardian.Infrastructure.Native;
 
@@ -15,8 +16,8 @@ public sealed class SingleInstanceManager : IDisposable
     public SingleInstanceManager()
     {
         // LOCAL (no Global\) names: the Global\ prefix requires elevation and crashes without it.
-        _mutex = new Mutex(true, "ProcessGuardian_SingleInstance", out _owned);
-        _showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, "ProcessGuardian_ShowRequested", out _);
+        _mutex = new Mutex(true, AppEdition.MutexName, out _owned);
+        _showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, AppEdition.ShowEventName, out _);
     }
 
     public bool IsFirstInstance() => _owned;
@@ -27,7 +28,7 @@ public sealed class SingleInstanceManager : IDisposable
 
         try
         {
-            var hwnd = NativeMethods.FindWindow(null, "ProcessGuardian");
+            var hwnd = NativeMethods.FindWindow(null, AppEdition.WindowTitle);
             if (hwnd == IntPtr.Zero || !NativeMethods.IsWindowVisible(hwnd)) return;
             NativeMethods.ShowWindow(hwnd, NativeMethods.SW_RESTORE);
             NativeMethods.SetForegroundWindow(hwnd);

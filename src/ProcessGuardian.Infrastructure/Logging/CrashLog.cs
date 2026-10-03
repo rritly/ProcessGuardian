@@ -1,3 +1,5 @@
+using ProcessGuardian.Domain;
+
 namespace ProcessGuardian.Infrastructure.Logging;
 
 // Diagnostic log writer for global exception handlers. Files go to %LocalAppData%
@@ -8,7 +10,7 @@ public static class CrashLog
 
     private static readonly string LogDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "ProcessGuardian");
+        AppEdition.DataDirName);
 
     public static void Append(string fileName, string message) =>
         Append(LogDirectory, fileName, message, MaxBytes);

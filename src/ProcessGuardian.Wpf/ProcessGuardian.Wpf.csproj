@@ -9,6 +9,12 @@
     <DebugType>None</DebugType>
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
+  <!-- Admin edition: separate exe name + requireAdministrator manifest.
+       Regular Debug/Release builds keep the default (asInvoker) manifest. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release-Elevated'">
+    <AssemblyName>ProcessGuardianAdmin</AssemblyName>
+    <ApplicationManifest>app.admin.manifest</ApplicationManifest>
+  </PropertyGroup>
   <ItemGroup>
     <Resource Include="Assets\AppIcon.ico" />
   </ItemGroup>

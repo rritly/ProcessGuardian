@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Interfaces;
 using ProcessGuardian.Infrastructure.Logging;
 using ProcessGuardian.Infrastructure.Native;
@@ -33,7 +34,7 @@ public partial class App : System.Windows.Application
         {
             MessageBox.Show(
                 $"Fatal error during startup: {ex.Message}\n\n{ex.StackTrace}",
-                "ProcessGuardian - Fatal Error",
+                $"{AppEdition.Name} - Fatal Error",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
             Shutdown(1);
@@ -161,7 +162,7 @@ public partial class App : System.Windows.Application
             {
                 MessageBox.Show(
                     $"Error showing main window: {ex.Message}",
-                    "ProcessGuardian - Error",
+                    $"{AppEdition.Name} - Error",
                     MessageBoxButton.OK,
                     MessageBoxImage.Warning);
             }
@@ -267,7 +268,7 @@ public partial class App : System.Windows.Application
         {
             MessageBox.Show(
                 $"Unhandled exception: {ex?.Message}\nThe application will now exit.",
-                "ProcessGuardian - Fatal Error",
+                $"{AppEdition.Name} - Fatal Error",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
         }

@@ -90,7 +90,9 @@ public partial class ToastCard : UserControl
             // we do not upsample a tiny 16×16 frame onto a 30×30 DIP slot.
             var bitmap = new BitmapImage();
             bitmap.BeginInit();
-            bitmap.UriSource = new Uri("pack://application:,,,/ProcessGuardian;component/Assets/AppIcon.ico");
+            // Relative pack URI (no assembly name): resolves against the local assembly,
+            // which is renamed in the admin edition build.
+            bitmap.UriSource = new Uri("pack://application:,,,/;component/Assets/AppIcon.ico");
             bitmap.DecodePixelWidth = Math.Max(1, desiredPx);
             bitmap.CacheOption = BitmapCacheOption.OnLoad;
             bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;

@@ -1,6 +1,7 @@
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Win32;
+using ProcessGuardian.Domain;
 using ProcessGuardian.Infrastructure.Autostart;
 using Xunit;
 
@@ -8,7 +9,7 @@ namespace ProcessGuardian.Infrastructure.Tests;
 
 public class RegistryAutostartServiceTests : IDisposable
 {
-    private const string KeyName = "ProcessGuardian";
+    private static readonly string KeyName = AppEdition.AutostartValueName;
     private const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
     private readonly RegistryAutostartService _service;

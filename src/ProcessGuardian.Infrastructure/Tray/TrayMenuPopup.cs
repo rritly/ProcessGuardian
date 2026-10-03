@@ -4,6 +4,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
+using ProcessGuardian.Domain;
 
 namespace ProcessGuardian.Infrastructure.Tray;
 
@@ -101,9 +102,9 @@ internal sealed class TrayMenuPopup : Window
                 IsHitTestVisible = false,
                 Text = i switch
                 {
-                    0 => "Show ProcessGuardian",
+                    0 => $"Show {AppEdition.Name}",
                     1 => "Start monitoring",
-                    _ => "Exit ProcessGuardian",
+                    _ => $"Exit {AppEdition.Name}",
                 },
             };
             if (i == 1)

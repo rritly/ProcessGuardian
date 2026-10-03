@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using ProcessGuardian.Domain;
 using Serilog.Core;
 using Serilog.Events;
 
@@ -36,7 +37,7 @@ public sealed class InMemoryLogSink : ILogEventSink
     {
         var dir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "ProcessGuardian");
+            AppEdition.DataDirName);
         _logFilePath = Path.Combine(dir, "logs.log");
         _maxFileBytes = MaxFileBytes;
         _flushTimer = new Timer(FlushTimerCallback, null, FlushIntervalMs, FlushIntervalMs);

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Entities;
 using ProcessGuardian.Domain.Interfaces;
 
@@ -16,7 +17,7 @@ public sealed class JsonConfigurationStore : IConfigurationStore
     public JsonConfigurationStore(ILogger<JsonConfigurationStore> logger)
     {
         _logger = logger;
-        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessGuardian");
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppEdition.DataDirName);
         try
         {
             Directory.CreateDirectory(dir);

@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
+using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Interfaces;
 using System.Security;
 
@@ -7,7 +8,7 @@ namespace ProcessGuardian.Infrastructure.Autostart;
 
 public sealed class RegistryAutostartService : IAutostartService
 {
-    private const string KeyName = "ProcessGuardian";
+    private static readonly string KeyName = AppEdition.AutostartValueName;
     private const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private readonly ILogger<RegistryAutostartService> _logger;
 
