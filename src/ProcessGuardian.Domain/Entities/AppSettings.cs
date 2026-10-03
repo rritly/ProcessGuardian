@@ -40,6 +40,11 @@ public partial class AppSettings : ObservableObject
     [ObservableProperty]
     private bool _enableToasts = true;
 
+    // Admin edition: set after the one-time "runs with administrator rights"
+    // notice is acknowledged. Always false in the regular edition (unused).
+    [ObservableProperty]
+    private bool _elevatedWarningAcknowledged = false;
+
     // Range clamps [min, MaxNumericValue]: out-of-range values from settings.json or the
     // UI would hot-loop, restart-spam, or overflow the 3-digit mini boxes. UI + JSON alike.
     partial void OnCheckIntervalSecondsChanged(int value)

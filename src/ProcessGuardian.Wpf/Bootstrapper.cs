@@ -44,7 +44,12 @@ public static class Bootstrapper
         services.AddSingleton<IProcessMonitor, WindowsProcessMonitor>();
         services.AddSingleton<ITargetIntegrityService, Sha256IntegrityService>();
         services.AddSingleton<INotificationService, OverlayNotificationService>();
+#if ELEVATED_EDITION
+        // HKCU Run cannot auto-elevate; the admin edition uses a scheduled task.
+        services.AddSingleton<IAutostartService, ScheduledTaskAutostartService>();
+#else
         services.AddSingleton<IAutostartService, RegistryAutostartService>();
+#endif
         services.AddSingleton<ITrayService, TrayIconService>();
         services.AddSingleton<IStatusReporter, StatusReporter>();
 
