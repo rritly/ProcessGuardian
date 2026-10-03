@@ -111,10 +111,6 @@ public partial class App : System.Windows.Application
         // the Dispatcher, so waiting on StartAsync here would deadlock. Fire-and-forget.
         StartHostAsync();
 
-#if ELEVATED_EDITION
-        _ = ShowElevatedNoticeOnceAsync();
-#endif
-
         // Background mode? Show the window immediately after host start, without
         // waiting for the monitoring cycle to complete.
         var isBackground = e.Args.Any(a => a.Equals("--background", StringComparison.OrdinalIgnoreCase));
@@ -138,37 +134,6 @@ public partial class App : System.Windows.Application
             }
         });
     }
-
-#if ELEVATED_EDITION
-    // One-time notice: this edition runs elevated and launches its target with the
-    // same administrator token. Acknowledged state persists in settings (§8.5).
-    private async Task ShowElevatedNoticeOnceAsync()
-    {
-        try
-        {
-            var config = _host!.Services.GetRequiredService<IConfigurationStore>();
-            var settings = await config.LoadAsync();
-            if (settings.ElevatedWarningAcknowledged)
-                return;
-
-            await Dispatcher.BeginInvoke(() =>
-                MessageBox.Show(
-                    $"{AppEdition.Name} runs with administrator rights.\n\n" +
-                    "The monitored target is launched with the same elevated token. " +
-                    $"Settings are stored in %ProgramData%\\{AppEdition.DataDirName} and are writable only by administrators.",
-                    $"{AppEdition.Name} - Administrator Mode",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Warning));
-
-            settings.ElevatedWarningAcknowledged = true;
-            await config.SaveAsync(settings);
-        }
-        catch (Exception ex)
-        {
-            CrashLog.Append("crash.log", $"[{DateTime.Now}] Elevated notice: {ex}\n");
-        }
-    }
-#endif
 
     private void ShowMainWindow()
     {
