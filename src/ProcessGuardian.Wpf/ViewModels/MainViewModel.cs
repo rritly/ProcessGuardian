@@ -55,6 +55,10 @@ public partial class MainViewModel : ObservableObject
     // HKCU autostart key (that would re-add it when JSON AutostartEnabled is true).
     private bool _suppressAutostartSync;
 
+    // Set while the initial load assigns Settings: the subscription is wired, but the
+    // debounced save must not rewrite settings.json right after it was loaded.
+    private bool _suppressSave;
+
     public MainViewModel(
         IConfigurationStore configStore,
         IAutostartService autostart,
@@ -130,7 +134,8 @@ public partial class MainViewModel : ObservableObject
             _previousSettings.PropertyChanged -= OnSettingsPropertyChanged;
         _previousSettings = value;
         value.PropertyChanged += OnSettingsPropertyChanged;
-        ScheduleSave();
+        if (!_suppressSave)
+            ScheduleSave();
     }
 
     private async Task LoadSettingsAsync()
@@ -138,19 +143,20 @@ public partial class MainViewModel : ObservableObject
         try
         {
             var loaded = await _configStore.LoadAsync();
-            Settings = loaded;
-            // Temporarily unsubscribe to avoid triggering save during initialization
-            if (_previousSettings is not null)
-                _previousSettings.PropertyChanged -= OnSettingsPropertyChanged;
+            _suppressSave = true;
+            try
+            {
+                Settings = loaded; // subscription is wired, but no debounced save on load
+            }
+            finally
+            {
+                _suppressSave = false;
+            }
 
             // settings.json AutostartEnabled is the source of truth (never overwrite it
             // from the registry); (re)write the Run key so it survives a previous Exit.
             if (Settings.AutostartEnabled)
                 await _autostart.SetEnabledAsync(true, CancellationToken.None);
-
-            // Re-subscribe
-            if (_previousSettings is not null)
-                _previousSettings.PropertyChanged += OnSettingsPropertyChanged;
         }
         catch (Exception ex)
         {
@@ -159,7 +165,12 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    private void OnSettingsPropertyChanged(object? sender, PropertyChangedEventArgs e) => ScheduleSave();
+    private void OnSettingsPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (_suppressSave)
+            return;
+        ScheduleSave();
+    }
 
     [RelayCommand(CanExecute = nameof(CanStart))]
     private async Task Start()
@@ -168,8 +179,18 @@ public partial class MainViewModel : ObservableObject
             return;
         try
         {
+            // Pin the hash BEFORE enabling monitoring: the orchestrator polls the shared
+            // settings instance, so enabling first would expose the stale pin inside its
+            // config-poll window and could trigger a false "Target Changed" block.
+            if (!await PinTargetHashAsync())
+            {
+                _logger.LogWarning("Start aborted: target {Path} could not be hashed", Settings.TargetProcessPath);
+                if (Settings.EnableToasts)
+                    _ = _notifications.ShowAsync("Target Unreadable", string.Empty);
+                return; // fail-closed: monitoring stays off, the previous pin is kept
+            }
+
             Settings.IsMonitoringEnabled = true;
-            await PinTargetHashAsync();
             _logger.LogInformation("Start Monitoring: enabled={Enabled}, path={Path}", Settings.IsMonitoringEnabled, Settings.TargetProcessPath);
             if (Settings.EnableToasts)
                 _ = _notifications.ShowAsync("Monitoring Started", string.Empty);
@@ -184,24 +205,28 @@ public partial class MainViewModel : ObservableObject
 
     // Records (or re-records) the target hash on every Start: recovery restarts are
     // verified against this pin, so re-enabling monitoring is the explicit
-    // re-confirmation after a "Target Changed" block.
-    private async Task PinTargetHashAsync()
+    // re-confirmation after a "Target Changed" block. Returns false when the target
+    // cannot be read: Start must then fail closed (no monitoring without a pin).
+    private async Task<bool> PinTargetHashAsync()
     {
         if (string.IsNullOrWhiteSpace(Settings.TargetProcessPath))
         {
             Settings.TargetHashSha256 = string.Empty;
-            return;
+            return true;
         }
 
         var hash = await _integrity.ComputeHashAsync(Settings.TargetProcessPath);
         if (hash is null)
         {
-            _logger.LogWarning("Failed to hash target {Path}; no pin recorded", Settings.TargetProcessPath);
-            hash = string.Empty;
+            // Fail-closed: without a fresh hash there is no pin to verify restarts
+            // against. Keep the previous pin untouched; monitoring stays off.
+            _logger.LogWarning("Failed to hash target {Path}; Start aborted", Settings.TargetProcessPath);
+            return false;
         }
 
         if (!string.Equals(Settings.TargetHashSha256, hash, StringComparison.OrdinalIgnoreCase))
             Settings.TargetHashSha256 = hash; // PropertyChanged -> debounced save; Start also flushes immediately.
+        return true;
     }
 
     [RelayCommand(CanExecute = nameof(CanStop))]

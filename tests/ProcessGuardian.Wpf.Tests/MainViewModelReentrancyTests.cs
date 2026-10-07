@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
@@ -33,6 +34,11 @@ public class MainViewModelReentrancyTests
         public IAutostartService Autostart { get; } = Substitute.For<IAutostartService>();
         public IStatusReporter Status { get; } = new StatusReporter();
         public INotificationService Notifications { get; } = Substitute.For<INotificationService>();
+        public ITargetIntegrityService Integrity { get; } = Substitute.For<ITargetIntegrityService>();
+
+        // The single instance LoadAsync returns, so tests can mutate settings after
+        // the initial load has settled (the VM replaces its Settings with it).
+        public AppSettings Loaded { get; } = new();
 
         public TaskCompletionSource CurrentSaveGate { get; private set; } = CreateGate();
         public int SaveCount { get; set; }
@@ -40,12 +46,13 @@ public class MainViewModelReentrancyTests
         public Harness()
         {
             Config.LoadAsync(Arg.Any<CancellationToken>())
-                .Returns(_ => Task.FromResult(new AppSettings()));
+                .Returns(_ => Task.FromResult(Loaded));
             Autostart.IsEnabledAsync(Arg.Any<CancellationToken>())
                 .Returns(Task.FromResult(false));
             Notifications.ShowAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
                 .Returns(Task.CompletedTask);
-
+            Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult<string?>("PIN"));
             Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
                 .Returns(_ =>
                 {
@@ -62,7 +69,64 @@ public class MainViewModelReentrancyTests
 
         public MainViewModel CreateVm() =>
             new(Config, Autostart, Status, Notifications, NullLogger<MainViewModel>.Instance, new InMemoryLogSink(),
-                Substitute.For<ITargetIntegrityService>());
+                Integrity);
+    }
+
+    private static Task WaitUntilHashRequestedAsync(Harness h) =>
+        WaitUntilAsync(
+            () => h.Integrity.ReceivedCalls().Any(c => c.GetMethodInfo().Name == nameof(ITargetIntegrityService.ComputeHashAsync)),
+            "hash computation to be requested");
+
+    [Fact]
+    public async Task Start_WhenHashUnreadable_AbortsFailClosed_KeepsPreviousPin()
+    {
+        var h = new Harness();
+        var vm = h.CreateVm();
+        await WaitUntilAsync(() => ReferenceEquals(vm.Settings, h.Loaded), "initial settings load to complete");
+        h.Loaded.TargetProcessPath = @"C:\App\target.exe";
+        h.Loaded.TargetHashSha256 = "OLDPIN";
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<string?>(null));
+
+        await vm.StartCommand.ExecuteAsync(null!);
+
+        vm.Settings.IsMonitoringEnabled.Should().BeFalse("fail-closed: monitoring must not start without a fresh pin");
+        vm.Settings.TargetHashSha256.Should().Be("OLDPIN", "a failed hash read must not erase the existing pin");
+        _ = h.Config.DidNotReceive().SaveAsync(
+            Arg.Is<AppSettings>(s => s.IsMonitoringEnabled), Arg.Any<CancellationToken>());
+        await h.Notifications.Received(1).ShowAsync("Target Unreadable", Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Start_PinsHashBeforeEnablingMonitoring()
+    {
+        var h = new Harness();
+        var vm = h.CreateVm();
+        await WaitUntilAsync(() => ReferenceEquals(vm.Settings, h.Loaded), "initial settings load to complete");
+        vm.Settings.TargetProcessPath = @"C:\App\target.exe";
+
+        var hashGate = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(hashGate.Task);
+
+        var start = vm.StartCommand.ExecuteAsync(null!);
+        await WaitUntilHashRequestedAsync(h);
+
+        // While the pin is still being computed, monitoring must stay disabled: the
+        // orchestrator's config poll must never observe enabled + stale pin.
+        vm.Settings.IsMonitoringEnabled.Should().BeFalse("the pin must be recorded before monitoring is enabled");
+
+        hashGate.SetResult("ABC123");
+        await WaitUntilAsync(() => h.SaveCount >= 1, "the pin+enable save to be in flight");
+        h.CompleteCurrentSave();
+        h.Status.Report(GuardianStatus.Monitoring);
+        await start;
+
+        vm.Settings.IsMonitoringEnabled.Should().BeTrue();
+        vm.Settings.TargetHashSha256.Should().Be("ABC123", "the fresh pin must be recorded");
+        await h.Config.Received().SaveAsync(
+            Arg.Is<AppSettings>(s => s.IsMonitoringEnabled && s.TargetHashSha256 == "ABC123"),
+            Arg.Any<CancellationToken>());
     }
 
     [Fact]
