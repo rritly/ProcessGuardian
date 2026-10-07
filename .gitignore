@@ -1,51 +1,14 @@
-# Build output
 [Bb]in/
 [Oo]bj/
-[Ll]og/
-[Ll]ogs/
-
-# Visual Studio
+publish/
 .vs/
-
-# VS Code
-.vscode/*
-!.vscode/extensions.json
-!.vscode/tasks.json
-!.vscode/launch.json
-
-# User-specific files
+.vscode/
 *.user
 *.suo
 *.userosscache
-*.sln.docstates
-
-# Test results
 TestResults/
 *.trx
-
-# Coverage
-coverage/
-*.coverage
-*.coveragexml
-
-# NuGet
-*.nupkg
-*.snupkg
-packages/
-
-# Publish output
-publish/
-
-# Temporary files
 *.tmp
 *.temp
 *.cache
-
-# OS files
-.DS_Store
 Thumbs.db
-
-# Local secrets / environment
-.env
-.env.*
-!.env.example
