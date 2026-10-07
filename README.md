@@ -45,6 +45,7 @@ Built with WPF on .NET 9 using Clean Architecture
       </ul>
     </li>
     <li><a href="#limitations">Limitations</a></li>
+    <li><a href="#license">License</a></li>
   </ol>
 </details>
 
@@ -354,6 +355,12 @@ Reason: the `net9.0-windows10.0.17763.0` TFM pulls in the Windows SDK bindings, 
 
 - Distribution size (≈ 78 MB per edition) is above the original design goal (see the size table above).
 - Power events (e.g. reacting to system sleep/resume) are not implemented.
+
+<!-- LICENSE -->
+
+## License
+
+Distributed under the MIT License. See `LICENSE` for more information.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
