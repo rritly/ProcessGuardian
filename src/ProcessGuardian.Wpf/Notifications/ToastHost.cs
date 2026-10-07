@@ -35,7 +35,8 @@ public sealed class ToastHost
             _window.Show();
         }
 
-        // Evict oldest cards if stack exceeds 4.
+        // Evict oldest cards if the stack exceeds 4. RemoveOldestCard detaches the card
+        // synchronously, so the loop always terminates (deferred dismissal would deadlock).
         while (_window.CardCount >= 4)
         {
             _window.RemoveOldestCard();

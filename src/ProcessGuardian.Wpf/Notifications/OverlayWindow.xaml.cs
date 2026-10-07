@@ -44,16 +44,19 @@ public partial class OverlayWindow : Window
 
     public int CardCount => CardStack.Children.Count;
 
+    /// <summary>
+    /// Removes the oldest card from the stack synchronously (no exit animation). The
+    /// count must decrease before this method returns: <see cref="Notifications.ToastHost"/>
+    /// evicts inside a loop, so a deferred removal would never terminate it.
+    /// </summary>
     public void RemoveOldestCard()
     {
         if (CardStack.Children.Count == 0) return;
-        if (CardStack.Children[0] is ToastCard oldest)
+        var oldest = CardStack.Children[0];
+        CardStack.Children.RemoveAt(0);
+        if (oldest is ToastCard card)
         {
-            oldest.Dismiss();
-        }
-        else
-        {
-            CardStack.Children.RemoveAt(0);
+            card.OnEvicted();
         }
     }
 

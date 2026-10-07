@@ -16,6 +16,9 @@
     <ApplicationManifest>app.admin.manifest</ApplicationManifest>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="ProcessGuardian.Wpf.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <Resource Include="Assets\AppIcon.ico" />
   </ItemGroup>
   <ItemGroup>

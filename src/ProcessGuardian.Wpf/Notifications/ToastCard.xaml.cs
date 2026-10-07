@@ -11,6 +11,7 @@ namespace ProcessGuardian.Wpf.Notifications;
 public partial class ToastCard : UserControl
 {
     private Action? _closeAction;
+    private bool _dismissed;
     private readonly DispatcherTimer _autoHideTimer;
 
     // Card geometry authored in DIP at 75% of the legacy physical size (254x81).
@@ -116,20 +117,50 @@ public partial class ToastCard : UserControl
         }
     }
 
+    /// <summary>Internal test seam: whether this card has already been dismissed or evicted.</summary>
+    internal bool IsDismissed => _dismissed;
+
+    /// <summary>
+    /// Dismisses the card with the exit animation; removal happens when the animation
+    /// completes. Idempotent: duplicate calls (auto-hide tick racing a user click) are no-ops.
+    /// </summary>
     public void Dismiss()
     {
+        if (_dismissed)
+            return;
+        _dismissed = true;
+
         if (_autoHideTimer.IsEnabled)
             _autoHideTimer.Stop();
 
         if (Resources["ExitStoryboard"] is Storyboard exit)
         {
-            exit.Completed += (_, __) => _closeAction?.Invoke();
+            exit.Completed += (_, __) => InvokeCloseAction();
             exit.Begin();
         }
         else
         {
-            _closeAction?.Invoke();
+            InvokeCloseAction();
         }
+    }
+
+    /// <summary>
+    /// Evicts the card without the exit animation (stack overflow). The caller removes the
+    /// element from the overlay synchronously; pending close callbacks are detached so a
+    /// late animation-completed or timer tick cannot touch the overlay afterwards.
+    /// </summary>
+    public void OnEvicted()
+    {
+        _dismissed = true;
+        _autoHideTimer.Stop();
+        _closeAction = null;
+    }
+
+    private void InvokeCloseAction()
+    {
+        var action = _closeAction;
+        _closeAction = null;
+        action?.Invoke();
     }
 
     private void OnClick(object sender, MouseButtonEventArgs e)
