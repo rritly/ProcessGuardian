@@ -9,19 +9,27 @@ namespace ProcessGuardian.Infrastructure.Autostart;
 public sealed class RegistryAutostartService : IAutostartService
 {
     private static readonly string KeyName = AppEdition.AutostartValueName;
-    private const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string DefaultRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private readonly string _registryPath;
     private readonly ILogger<RegistryAutostartService> _logger;
 
     public RegistryAutostartService(ILogger<RegistryAutostartService> logger)
+        : this(logger, DefaultRegistryPath)
+    {
+    }
+
+    // Test seam: run against a scratch key instead of the real HKCU Run entry.
+    internal RegistryAutostartService(ILogger<RegistryAutostartService> logger, string registryPath)
     {
         _logger = logger;
+        _registryPath = registryPath;
     }
 
     public Task<bool> IsEnabledAsync(CancellationToken ct = default)
     {
         try
         {
-            using var key = Registry.CurrentUser.OpenSubKey(RegistryPath, false);
+            using var key = Registry.CurrentUser.OpenSubKey(_registryPath, false);
             var value = key?.GetValue(KeyName) as string;
             return Task.FromResult(!string.IsNullOrEmpty(value));
         }
@@ -41,8 +49,8 @@ public sealed class RegistryAutostartService : IAutostartService
     {
         try
         {
-            using var key = Registry.CurrentUser.OpenSubKey(RegistryPath, true)
-                            ?? Registry.CurrentUser.CreateSubKey(RegistryPath);
+            using var key = Registry.CurrentUser.OpenSubKey(_registryPath, true)
+                            ?? Registry.CurrentUser.CreateSubKey(_registryPath);
 
             if (enabled)
             {

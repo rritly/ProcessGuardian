@@ -116,7 +116,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task Stop_DuringInitialDelay_ExitsPromptly_DoesNotWaitFullDelay()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.InitialDelaySeconds = 999; // would pin the orchestrator in Waiting for ~16 min
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
@@ -141,7 +141,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task FailedLaunch_HonorsRestartDelay_BetweenAttempts()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.MaxRestartAttempts = 0; // infinite attempts
         h.Settings.RestartDelaySeconds = 2;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
@@ -173,7 +173,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task TargetRunning_NoRestart_StatusMonitoring()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
 
@@ -192,7 +192,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task TargetMissing_RestartTriggered_RecoveryToast_StatusMonitoring()
     {
-        var h = new Harness();
+        using var h = new Harness();
         // Target is running initially, then goes missing: the recovery is a real
         // budgeted restart (not the free initial launch), so a Recovered toast fires.
         bool running = true;
@@ -232,7 +232,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task Exhaustion_SetsError_DisablesMonitoring_NoAutoRestart()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.MaxRestartAttempts = 3;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
@@ -262,7 +262,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task NewStartAfterError_RestoresFullAttemptBudget()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.MaxRestartAttempts = 1;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
@@ -279,8 +279,11 @@ public class GuardianOrchestratorTests
             await h.Monitor.Received(2).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
 
             // User Start again: full budget restored -> one free launch + one attempt (Max=1).
-            // Let the exhausted cycle exit fully so the next Start grants a free launch.
-            await Task.Delay(1000);
+            // Wait for the exhausted cycle to fully exit and the outer loop to observe
+            // the disabled flag, so the next Start grants a free launch.
+            var loadsAfterExhaustion = h.LoadCount;
+            await WaitUntilAsync(() => h.LoadCount >= loadsAfterExhaustion + 2,
+                "exhausted cycle to exit (two config loads: slice + outer loop)");
             h.Monitor.ClearReceivedCalls();
             h.Settings.IsMonitoringEnabled = true;
             await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error) && !h.Settings.IsMonitoringEnabled,
@@ -293,7 +296,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task FirstStart_ConsumesNoAttempts_StatusMonitoring_NoExhaustion()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.MaxRestartAttempts = 1;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
@@ -321,7 +324,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task FirstStart_Free_ThenBudgetConsumed_Error()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.MaxRestartAttempts = 1;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
@@ -344,7 +347,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task ProtectedProcess_TargetNotRunning_RestartTriggered()
     {
-        var h = new Harness();
+        using var h = new Harness();
         // Target is running initially, then goes missing: recovery is a real budgeted
         // restart (not the free initial launch), so a Recovered toast fires.
         bool running = true;
@@ -378,7 +381,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task SettingsChangeDuringCycle_NewSettingsPickedUpNextIteration()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
@@ -405,7 +408,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task StartAsyncThrows_LoopStaysAlive()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
@@ -429,7 +432,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task ShowAsyncThrows_RestartStillSucceeds_StatusMonitoring()
     {
-        var h = new Harness();
+        using var h = new Harness();
         bool started = false;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(started ? ProcessOutcome.Running : ProcessOutcome.NotRunning)));
@@ -457,7 +460,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task HugeCheckInterval_DoesNotBusyLoop()
     {
-        var h = new Harness();
+        using var h = new Harness();
         // Upper bound is intentionally unclamped at the entity level. Before the wait cap,
         // the int cast overflowed and CheckAsync was invoked thousands of times per second.
         h.Settings.CheckIntervalSeconds = int.MaxValue;
@@ -484,7 +487,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task CheckAsyncThrows_StatusError_LoopContinues()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
@@ -509,7 +512,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task HashMismatch_LaunchBlocked_MonitoringDisabled_TargetChangedToast()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.TargetHashSha256 = "AA11";
         h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult<string?>("BB"));
@@ -540,7 +543,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task HashReadFailure_BlocksLaunch_FailClosed()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.TargetHashSha256 = "AA";
         h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult<string?>(null));
@@ -562,7 +565,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task HashMatches_LaunchProceeds_StatusMonitoring()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Settings.TargetHashSha256 = "AA";
         h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult<string?>("aa"));
@@ -590,7 +593,7 @@ public class GuardianOrchestratorTests
     [Fact]
     public async Task EmptyHash_CheckSkipped_LaunchProceeds()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())

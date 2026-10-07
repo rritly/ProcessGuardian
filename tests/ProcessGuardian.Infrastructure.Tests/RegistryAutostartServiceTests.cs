@@ -7,35 +7,30 @@ using Xunit;
 
 namespace ProcessGuardian.Infrastructure.Tests;
 
+// Tests run against a scratch HKCU key (never the real Run entry) and delete it
+// afterwards, so no machine state is touched and no restore bookkeeping is needed.
 public class RegistryAutostartServiceTests : IDisposable
 {
     private static readonly string KeyName = AppEdition.AutostartValueName;
-    private const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
     private readonly RegistryAutostartService _service;
-    private readonly object? _originalValue;
+    private readonly string _scratchPath;
 
     public RegistryAutostartServiceTests()
     {
-        _service = new RegistryAutostartService(NullLogger<RegistryAutostartService>.Instance);
-        using var key = Registry.CurrentUser.OpenSubKey(RegistryPath, false);
-        _originalValue = key?.GetValue(KeyName);
+        _scratchPath = @"Software\ProcessGuardian.Tests\Run-" + Guid.NewGuid().ToString("N");
+        _service = new RegistryAutostartService(NullLogger<RegistryAutostartService>.Instance, _scratchPath);
     }
 
     public void Dispose()
     {
         try
         {
-            using var key = Registry.CurrentUser.OpenSubKey(RegistryPath, true);
-            if (key == null) return;
-            if (_originalValue is string s)
-                key.SetValue(KeyName, s);
-            else
-                key.DeleteValue(KeyName, false);
+            Registry.CurrentUser.DeleteSubKeyTree(_scratchPath, throwOnMissingSubKey: false);
         }
         catch
         {
-            // Best-effort restore; never throw from Dispose
+            // Best-effort cleanup; never throw from Dispose
         }
     }
 
@@ -52,7 +47,7 @@ public class RegistryAutostartServiceTests : IDisposable
     {
         await _service.SetEnabledAsync(true);
 
-        using var key = Registry.CurrentUser.OpenSubKey(RegistryPath, false);
+        using var key = Registry.CurrentUser.OpenSubKey(_scratchPath, false);
         var value = key?.GetValue(KeyName) as string;
         value.Should().NotBeNullOrEmpty();
         value!.Should().Contain("--background");
@@ -68,7 +63,7 @@ public class RegistryAutostartServiceTests : IDisposable
         await _service.SetEnabledAsync(false);
 
         (await _service.IsEnabledAsync()).Should().BeFalse();
-        using var key = Registry.CurrentUser.OpenSubKey(RegistryPath, false);
+        using var key = Registry.CurrentUser.OpenSubKey(_scratchPath, false);
         key?.GetValue(KeyName).Should().BeNull();
     }
 

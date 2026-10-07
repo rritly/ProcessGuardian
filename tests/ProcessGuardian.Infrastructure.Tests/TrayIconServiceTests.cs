@@ -15,9 +15,6 @@ public class TrayIconServiceTests
     {
         RunOnSta(() =>
         {
-            var assetsDir = Path.Combine(AppContext.BaseDirectory, "Assets");
-            bool iconsMissing = !File.Exists(Path.Combine(assetsDir, "TrayIconOn.ico"));
-
             using var service = new TrayIconService(NullLogger<TrayIconService>.Instance);
 
             // With missing asset icons this exercises the SystemIcons fallback path.

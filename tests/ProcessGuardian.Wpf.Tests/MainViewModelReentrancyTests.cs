@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -68,7 +69,10 @@ public class MainViewModelReentrancyTests
         public void CompleteCurrentSave() => CurrentSaveGate.SetResult();
 
         public MainViewModel CreateVm() =>
-            new(Config, Autostart, Status, Notifications, NullLogger<MainViewModel>.Instance, new InMemoryLogSink(),
+            new(Config, Autostart, Status, Notifications, NullLogger<MainViewModel>.Instance,
+                // Throwaway path: the default constructor writes the real user log file.
+                new InMemoryLogSink(Path.Combine(Path.GetTempPath(), "ProcessGuardian.Tests",
+                    "wm-" + Guid.NewGuid().ToString("N") + ".log")),
                 Integrity);
     }
 

@@ -7,8 +7,27 @@ using Xunit;
 
 namespace ProcessGuardian.Infrastructure.Tests;
 
-public class InMemoryLogSinkTests
+// Sinks run against throwaway files under %TEMP%: tests must never touch the
+// real %LocalAppData% log (the default constructor path).
+public class InMemoryLogSinkTests : IDisposable
 {
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "ProcessGuardian.Tests", Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        try
+        {
+            if (Directory.Exists(_dir))
+                Directory.Delete(_dir, recursive: true);
+        }
+        catch
+        {
+            // Best-effort cleanup; never throw from Dispose
+        }
+    }
+
+    private InMemoryLogSink CreateSink() => new(Path.Combine(_dir, "logs.log"));
+
     private static LogEvent CreateEvent(string message, LogEventLevel level = LogEventLevel.Information)
         => new(
             new DateTimeOffset(new DateTime(2026, 4, 10, 19, 20, 42, DateTimeKind.Local)),
@@ -20,7 +39,7 @@ public class InMemoryLogSinkTests
     [Fact]
     public void Emit_601Messages_RingCapsAt600_GetRecentLogsReturnsLast200()
     {
-        var sink = new InMemoryLogSink();
+        var sink = CreateSink();
 
         for (int i = 0; i < 601; i++)
             sink.Emit(CreateEvent($"message {i}", LogEventLevel.Information));
@@ -36,7 +55,7 @@ public class InMemoryLogSinkTests
     [Fact]
     public void Emit_Format_HasNoBrackets_InfoLevel_TwoSpacesAfterLevel()
     {
-        var sink = new InMemoryLogSink();
+        var sink = CreateSink();
         sink.Emit(CreateEvent("Monitoring enabled for notepad"));
 
         var lines = sink.GetRecentLogs(1).Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
@@ -49,7 +68,7 @@ public class InMemoryLogSinkTests
     [Fact]
     public void Emit_ErrorLevel_MapsToErr_TwoSpacesAfterLevel()
     {
-        var sink = new InMemoryLogSink();
+        var sink = CreateSink();
         sink.Emit(CreateEvent("something failed", LogEventLevel.Error));
 
         var lines = sink.GetRecentLogs(1).Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
@@ -60,7 +79,7 @@ public class InMemoryLogSinkTests
     [Fact]
     public void Clear_EmptiesBuffer_AndFile_GetRecentLogsEmpty()
     {
-        var sink = new InMemoryLogSink();
+        var sink = CreateSink();
 
         for (int i = 0; i < 10; i++)
             sink.Emit(CreateEvent($"message {i}"));

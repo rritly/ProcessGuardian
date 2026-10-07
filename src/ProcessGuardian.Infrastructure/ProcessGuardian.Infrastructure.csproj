@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <InternalsVisibleTo Include="ProcessGuardian.Infrastructure.Tests" />
+    <InternalsVisibleTo Include="ProcessGuardian.Wpf.Tests" />
     <ProjectReference Include="..\ProcessGuardian.Application\ProcessGuardian.Application.csproj" />
     <ProjectReference Include="..\ProcessGuardian.Domain\ProcessGuardian.Domain.csproj" />
   </ItemGroup>
