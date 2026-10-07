@@ -339,10 +339,10 @@ Debug builds:
 
 Output sizes (self-contained single exe):
 
-| Edition | Output size | SPEC goal |
-|---------|-------------|-----------|
-| ProcessGuardian | ≈ 78 MB | NFR-06 ≤ 55 MB (not met) |
-| ProcessGuardianAdmin | ≈ 78 MB | NFR-06 ≤ 55 MB (not met) |
+| Edition | Output size |
+|---------|-------------|
+| ProcessGuardian | ≈ 78 MB |
+| ProcessGuardianAdmin | ≈ 78 MB |
 
 Reason: the `net9.0-windows10.0.17763.0` TFM pulls in the Windows SDK bindings, and WPF does not trim well in single-file mode.
 
@@ -352,8 +352,8 @@ Reason: the `net9.0-windows10.0.17763.0` TFM pulls in the Windows SDK bindings, 
 
 ## Limitations
 
-- Distribution size NFRs (NFR-05/NFR-06) are not yet met (see the size table above).
-- Power events (SPEC §2.7) are not implemented (`[MAY]`).
+- Distribution size (≈ 78 MB per edition) is above the original design goal (see the size table above).
+- Power events (e.g. reacting to system sleep/resume) are not implemented.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
