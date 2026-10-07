@@ -51,8 +51,10 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
         }
         catch (Exception ex)
         {
+            // Enumeration failed: the state is unknown. Reporting NotRunning here
+            // would trigger a restart of a possibly still-running target.
             _logger.LogError(ex, "CheckAsync failed unexpectedly");
-            return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
         }
     }
 

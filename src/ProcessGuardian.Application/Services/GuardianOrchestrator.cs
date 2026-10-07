@@ -127,6 +127,14 @@ public sealed class GuardianOrchestrator : BackgroundService
                     _initialLaunchPending = false;
                     SetStatus(GuardianStatus.Monitoring);
                 }
+                else if (result.Outcome == ProcessOutcome.Unknown)
+                {
+                    // Enumeration failed: treating it as "dead" would relaunch a
+                    // possibly still-running target. Skip the cycle; keep the current
+                    // status; the next check re-evaluates.
+                    _logger.LogWarning("Process state for {Target} could not be determined; skipping this cycle",
+                        target.NameWithoutExtension);
+                }
                 else
                 {
                     await HandleMissingAsync(settings, target, ct).ConfigureAwait(false);

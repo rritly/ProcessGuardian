@@ -171,6 +171,58 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
+    public async Task UnknownCheck_SkipsCycle_NoRestart_NoStatusFlip()
+    {
+        var h = new Harness();
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
+            });
+
+        using var cts = new CancellationTokenSource();
+        var orchestrator = h.CreateOrchestrator();
+        await Harness.RunAsync(orchestrator, cts, async () =>
+        {
+            await WaitUntilAsync(() => h.CheckCount >= 3,
+                "the loop to keep polling after Unknown results");
+        });
+
+        // Unknown must never look like "dead": no restart, no status flip.
+        _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().NotContain(GuardianStatus.Monitoring);
+        h.Statuses.Should().NotContain(GuardianStatus.Error);
+        h.Settings.IsMonitoringEnabled.Should().BeTrue("an unknown check must not disable monitoring");
+    }
+
+    [Fact]
+    public async Task UnknownThenRunning_RecoversNormally_NoRestart()
+    {
+        var h = new Harness();
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    h.CheckCount <= 2 ? ProcessOutcome.Unknown : ProcessOutcome.Running, 42));
+            });
+
+        using var cts = new CancellationTokenSource();
+        var orchestrator = h.CreateOrchestrator();
+        await Harness.RunAsync(orchestrator, cts, async () =>
+        {
+            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+                "Monitoring status once the state is determinable again");
+        });
+
+        // Transient enumeration failures must not consume the restart budget or
+        // trigger launches: the target was likely running all along.
+        _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().Contain(GuardianStatus.Monitoring);
+    }
+
+    [Fact]
     public async Task TargetRunning_NoRestart_StatusMonitoring()
     {
         using var h = new Harness();

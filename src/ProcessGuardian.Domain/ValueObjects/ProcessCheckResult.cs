@@ -5,5 +5,10 @@ public sealed record ProcessCheckResult(ProcessOutcome Outcome, int? ProcessId =
 public enum ProcessOutcome
 {
     Running,
-    NotRunning
+    NotRunning,
+
+    // Enumeration failed: the process state could not be determined. The
+    // orchestrator must skip the cycle instead of triggering a restart that
+    // could duplicate a still-running target.
+    Unknown
 }
