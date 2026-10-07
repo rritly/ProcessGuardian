@@ -12,33 +12,28 @@ public class JsonConfigurationStoreTests : IDisposable
 {
     private readonly string _dir;
     private readonly string _path;
-    private readonly bool _fileExisted;
-    private readonly byte[]? _originalBytes;
     private readonly JsonConfigurationStore _store;
 
     public JsonConfigurationStoreTests()
     {
-        _dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ProcessGuardian");
+        // Isolated scratch directory: tests must never touch the real user or admin
+        // config location (the admin edition hardens its directory, so a non-elevated
+        // test host could not even construct a store pointed at it).
+        _dir = Path.Combine(Path.GetTempPath(), "ProcessGuardian.Tests", "config-" + Guid.NewGuid().ToString("N"));
         _path = Path.Combine(_dir, "settings.json");
-        _fileExisted = File.Exists(_path);
-        if (_fileExisted)
-            _originalBytes = File.ReadAllBytes(_path);
-
-        _store = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance);
+        _store = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir, hardenWhenElevated: false);
     }
 
     public void Dispose()
     {
         try
         {
-            if (_fileExisted && _originalBytes != null)
-                File.WriteAllBytes(_path, _originalBytes);
-            else
-                File.Delete(_path);
+            if (Directory.Exists(_dir))
+                Directory.Delete(_dir, recursive: true);
         }
         catch
         {
-            // Best-effort restore; never throw from Dispose
+            // Best-effort cleanup; never throw from Dispose
         }
     }
 
@@ -115,7 +110,7 @@ public class JsonConfigurationStoreTests : IDisposable
             }
             """);
 
-        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance);
+        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir, hardenWhenElevated: false);
         var loaded = await freshStore.LoadAsync();
 
         loaded.CheckIntervalSeconds.Should().Be(1);
@@ -143,7 +138,7 @@ public class JsonConfigurationStoreTests : IDisposable
             }
             """);
 
-        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance);
+        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir, hardenWhenElevated: false);
         var loaded = await freshStore.LoadAsync();
 
         loaded.CheckIntervalSeconds.Should().Be(999);
@@ -180,7 +175,7 @@ public class JsonConfigurationStoreTests : IDisposable
 
         await _store.SaveAsync(settings);
 
-        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance);
+        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir, hardenWhenElevated: false);
         var loaded = await freshStore.LoadAsync();
 
         loaded.IsMonitoringEnabled.Should().BeTrue();

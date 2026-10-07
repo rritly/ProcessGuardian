@@ -17,15 +17,21 @@ public sealed class JsonConfigurationStore : IConfigurationStore
     private AppSettings? _current;
 
     public JsonConfigurationStore(ILogger<JsonConfigurationStore> logger)
+        : this(logger, ResolveDefaultDirectory())
+    {
+    }
+
+    // Internal seam for tests: run the store against a scratch directory instead of
+    // the real user/admin config location; hardening can be disabled for non-elevated
+    // test hosts (the admin-edition directory ACL would deny them write access).
+    internal JsonConfigurationStore(ILogger<JsonConfigurationStore> logger, string configDirectory, bool hardenWhenElevated = true)
     {
         _logger = logger;
-        var dir = AppEdition.IsElevated
-            ? GetAdminConfigDirectory()
-            : GetUserConfigDirectory();
+        var dir = configDirectory;
         try
         {
             Directory.CreateDirectory(dir);
-            if (AppEdition.IsElevated)
+            if (AppEdition.IsElevated && hardenWhenElevated)
                 HardenForAdministratorsOnly(dir);
         }
         catch (Exception ex)
@@ -35,6 +41,10 @@ public sealed class JsonConfigurationStore : IConfigurationStore
         }
         _path = Path.Combine(dir, "settings.json");
     }
+
+    private static string ResolveDefaultDirectory() => AppEdition.IsElevated
+        ? GetAdminConfigDirectory()
+        : GetUserConfigDirectory();
 
     private static string GetUserConfigDirectory() =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppEdition.DataDirName);

@@ -14,6 +14,7 @@ jobs:
       - run: dotnet build --no-restore --configuration Release
       - run: dotnet build --no-restore --configuration Release-Elevated
       - run: dotnet test --no-restore --configuration Release --verbosity normal
+      - run: dotnet test --no-restore --configuration Release-Elevated --verbosity normal
       - name: Publish (both editions, self-contained)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\build\publish.ps1
       - uses: actions/upload-artifact@v4
