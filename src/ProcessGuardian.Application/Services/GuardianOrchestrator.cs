@@ -38,30 +38,13 @@ public sealed class GuardianOrchestrator : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Every step is under the catch-all: an unexpected exception from the config
+        // store or any await must degrade to Error + cooldown, never stop the host.
         while (!stoppingToken.IsCancellationRequested)
         {
-            var settings = await _config.LoadAsync(stoppingToken);
-            if (!settings.IsMonitoringEnabled)
-            {
-                if (_currentStatus != GuardianStatus.Error)
-                    SetStatus(GuardianStatus.Stopped);
-                try
-                {
-                    await WaitForNextCheckAsync(TimeSpan.FromSeconds(1), stoppingToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                continue;
-            }
-
-            _logger.LogInformation("Monitoring enabled: path={Path}, flag={Enabled}",
-                settings.TargetProcessPath, settings.IsMonitoringEnabled);
-
             try
             {
-                await RunMonitoringCycleAsync(stoppingToken);
+                await RunLoopStepAsync(stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -69,20 +52,45 @@ public sealed class GuardianOrchestrator : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Monitoring cycle crashed unexpectedly");
+                _logger.LogError(ex, "Monitoring loop crashed unexpectedly");
                 SetStatus(GuardianStatus.Error);
-                if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(5), stoppingToken))
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
                     break;
+                }
             }
         }
         SetStatus(GuardianStatus.Stopped);
+    }
+
+    // One outer-loop step: load settings, idle while disabled, or run the cycle.
+    private async Task RunLoopStepAsync(CancellationToken ct)
+    {
+        var settings = await _config.LoadAsync(ct).ConfigureAwait(false);
+        if (!settings.IsMonitoringEnabled)
+        {
+            if (_currentStatus != GuardianStatus.Error)
+                SetStatus(GuardianStatus.Stopped);
+            await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+            return;
+        }
+
+        _logger.LogInformation("Monitoring enabled: path={Path}, flag={Enabled}",
+            settings.TargetProcessPath, settings.IsMonitoringEnabled);
+
+        await RunMonitoringCycleAsync(ct).ConfigureAwait(false);
     }
 
     private async Task RunMonitoringCycleAsync(CancellationToken ct)
     {
         var settings = await _config.LoadAsync(ct);
 
-        // Restart budget resets once per session (user Start), not per inner iteration.
+        // The budget counts consecutive failed restarts; it resets when a check
+        // observes the process running, and a fresh cycle (user Start) starts at 0.
         _restartAttempts = 0;
         // The first launch of a session is free: it consumes no attempts. Granted once.
         _initialLaunchPending = true;
@@ -90,33 +98,29 @@ public sealed class GuardianOrchestrator : BackgroundService
         if (settings.InitialDelaySeconds > 0)
         {
             SetStatus(GuardianStatus.Waiting);
-            try
-            {
-                await Task.Delay(TimeSpan.FromSeconds(settings.InitialDelaySeconds), ct);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
+            // Sliced like every other wait so Stop and settings changes stay responsive
+            // instead of pinning the orchestrator in Waiting for the whole delay.
+            if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(settings.InitialDelaySeconds), ct).ConfigureAwait(false))
+                return;
         }
 
         while (!ct.IsCancellationRequested)
         {
-            settings = await _config.LoadAsync(ct); // Reload every cycle for live updates
+            settings = await _config.LoadAsync(ct).ConfigureAwait(false); // Reload every cycle for live updates
             if (!settings.IsMonitoringEnabled) break;
 
             if (!ProcessTarget.TryCreate(settings.TargetProcessPath, out var target, out var pathError))
             {
                 _logger.LogWarning("Invalid target path {Path}: {Reason}", settings.TargetProcessPath, pathError);
                 SetStatus(GuardianStatus.Error);
-                if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(settings.CheckIntervalSeconds), ct))
+                if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(settings.CheckIntervalSeconds), ct).ConfigureAwait(false))
                     return;
                 continue;
             }
 
             try
             {
-                var result = await _monitor.CheckAsync(target, ct);
+                var result = await _monitor.CheckAsync(target, ct).ConfigureAwait(false);
                 if (result.Outcome == ProcessOutcome.Running)
                 {
                     _restartAttempts = 0;
@@ -125,16 +129,16 @@ public sealed class GuardianOrchestrator : BackgroundService
                 }
                 else
                 {
-                    await HandleMissingAsync(settings, target, ct);
+                    await HandleMissingAsync(settings, target, ct).ConfigureAwait(false);
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogError(ex, "CheckAsync failed for {Target}", target.NameWithoutExtension);
                 SetStatus(GuardianStatus.Error);
             }
 
-            if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(settings.CheckIntervalSeconds), ct))
+            if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(settings.CheckIntervalSeconds), ct).ConfigureAwait(false))
                 return;
         }
     }
@@ -146,7 +150,7 @@ public sealed class GuardianOrchestrator : BackgroundService
             // Free initial launch: consumes no attempts and never flashes Restarting.
             _initialLaunchPending = false;
             _logger.LogInformation("Initial start for {Target}", target.NameWithoutExtension);
-            await StartAndVerifyAsync(s, target, ct, showRecoveryToast: false);
+            await StartAndVerifyAsync(s, target, ct, showRecoveryToast: false).ConfigureAwait(false);
             return;
         }
 
@@ -157,7 +161,7 @@ public sealed class GuardianOrchestrator : BackgroundService
             try
             {
                 if (s.EnableToasts)
-                    await _notifications.ShowAsync("Recovery Failed", string.Empty, ct);
+                    await _notifications.ShowAsync("Recovery Failed", string.Empty, ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -167,7 +171,7 @@ public sealed class GuardianOrchestrator : BackgroundService
             s.IsMonitoringEnabled = false;
             try
             {
-                await _config.SaveAsync(s, CancellationToken.None);
+                await _config.SaveAsync(s, CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -177,16 +181,22 @@ public sealed class GuardianOrchestrator : BackgroundService
         }
 
         _restartAttempts++;
+        SetStatus(GuardianStatus.Restarting); // budgeted restart is user-visible, unlike the free initial launch
         _logger.LogInformation("Restart attempt #{Attempt} for {Target}", _restartAttempts, target.NameWithoutExtension);
 
-        var outcome = await StartAndVerifyAsync(s, target, ct, showRecoveryToast: true);
+        var outcome = await StartAndVerifyAsync(s, target, ct, showRecoveryToast: true).ConfigureAwait(false);
         if (outcome == StartOutcome.Blocked)
             return; // Monitoring was already disabled; no retry against a changed target.
-        if (outcome == StartOutcome.VerifyFailed && (_restartAttempts < s.MaxRestartAttempts || s.MaxRestartAttempts == 0))
+
+        // Back off before the next attempt after a failed launch or a failed startup
+        // verification. Exhaustion (the budget was just consumed) is reported on the
+        // next check without an extra delay.
+        var hasMoreAttempts = _restartAttempts < s.MaxRestartAttempts || s.MaxRestartAttempts == 0;
+        if (outcome == StartOutcome.NotStarted || (outcome == StartOutcome.VerifyFailed && hasMoreAttempts))
         {
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(s.RestartDelaySeconds), ct);
+                await Task.Delay(TimeSpan.FromSeconds(s.RestartDelaySeconds), ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -208,7 +218,7 @@ public sealed class GuardianOrchestrator : BackgroundService
             return true;
         }
 
-        var actual = await _integrity.ComputeHashAsync(target.FullPath, ct);
+        var actual = await _integrity.ComputeHashAsync(target.FullPath, ct).ConfigureAwait(false);
         if (actual is not null &&
             string.Equals(actual, s.TargetHashSha256, StringComparison.OrdinalIgnoreCase))
             return true;
@@ -220,7 +230,7 @@ public sealed class GuardianOrchestrator : BackgroundService
         try
         {
             if (s.EnableToasts)
-                await _notifications.ShowAsync("Target Changed", string.Empty, ct);
+                await _notifications.ShowAsync("Target Changed", string.Empty, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -231,7 +241,7 @@ public sealed class GuardianOrchestrator : BackgroundService
         s.IsMonitoringEnabled = false;
         try
         {
-            await _config.SaveAsync(s, CancellationToken.None);
+            await _config.SaveAsync(s, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -243,13 +253,17 @@ public sealed class GuardianOrchestrator : BackgroundService
 
     private async Task<StartOutcome> StartAndVerifyAsync(AppSettings s, ProcessTarget target, CancellationToken ct, bool showRecoveryToast)
     {
-        if (!await VerifyTargetHashAsync(s, target, ct))
+        if (!await VerifyTargetHashAsync(s, target, ct).ConfigureAwait(false))
             return StartOutcome.Blocked;
 
         bool started;
         try
         {
-            started = await _monitor.StartAsync(target, ct);
+            started = await _monitor.StartAsync(target, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -265,19 +279,18 @@ public sealed class GuardianOrchestrator : BackgroundService
 
         try
         {
-            var verified = await _monitor.VerifyStartupAsync(target, TimeSpan.FromSeconds(s.StartupVerificationTimeoutSeconds), ct);
+            var verified = await _monitor.VerifyStartupAsync(target, TimeSpan.FromSeconds(s.StartupVerificationTimeoutSeconds), ct).ConfigureAwait(false);
             if (verified)
             {
-                var attemptNumber = _restartAttempts; // Do NOT reset here; reset only when CheckAsync sees Running
                 _logger.LogInformation("Process {Target} verified running", target.NameWithoutExtension);
                 SetStatus(GuardianStatus.Monitoring);
-                    if (showRecoveryToast)
+                if (showRecoveryToast)
+                {
+                    try
                     {
-                        try
-                        {
-                            if (s.EnableToasts)
-                                await _notifications.ShowAsync("Process Recovered", string.Empty, ct);
-                        }
+                        if (s.EnableToasts)
+                            await _notifications.ShowAsync("Process Recovered", string.Empty, ct).ConfigureAwait(false);
+                    }
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "Failed to show recovery toast");
@@ -288,6 +301,12 @@ public sealed class GuardianOrchestrator : BackgroundService
 
             _logger.LogWarning("Startup verification failed for {Target}", target.NameWithoutExtension);
             return StartOutcome.VerifyFailed;
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation during startup verification is not a failed attempt;
+            // let it propagate so the loop exits cleanly.
+            throw;
         }
         catch (Exception ex)
         {
@@ -316,10 +335,10 @@ public sealed class GuardianOrchestrator : BackgroundService
         while (remaining > 0)
         {
             var slice = Math.Min(sliceMs, remaining);
-            await Task.Delay(slice, ct);
+            await Task.Delay(slice, ct).ConfigureAwait(false);
             remaining -= slice;
 
-            var settings = await _config.LoadAsync(ct);
+            var settings = await _config.LoadAsync(ct).ConfigureAwait(false);
             if (!settings.IsMonitoringEnabled)
                 return false;
         }

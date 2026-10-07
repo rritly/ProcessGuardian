@@ -114,6 +114,63 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
+    public async Task Stop_DuringInitialDelay_ExitsPromptly_DoesNotWaitFullDelay()
+    {
+        var h = new Harness();
+        h.Settings.InitialDelaySeconds = 999; // would pin the orchestrator in Waiting for ~16 min
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
+
+        using var cts = new CancellationTokenSource();
+        var orchestrator = h.CreateOrchestrator();
+        await Harness.RunAsync(orchestrator, cts, async () =>
+        {
+            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Waiting),
+                "Status Waiting to be reported during the initial delay");
+
+            // User stops monitoring mid-delay: the sliced wait must notice quickly.
+            h.Settings.IsMonitoringEnabled = false;
+            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Stopped),
+                "Status Stopped to be reported shortly after Stop");
+        });
+
+        // The cycle must have exited long before the 999 s delay elapsed.
+        _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task FailedLaunch_HonorsRestartDelay_BetweenAttempts()
+    {
+        var h = new Harness();
+        h.Settings.MaxRestartAttempts = 0; // infinite attempts
+        h.Settings.RestartDelaySeconds = 2;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(false));
+
+        using var cts = new CancellationTokenSource();
+        var orchestrator = h.CreateOrchestrator();
+        await Harness.RunAsync(orchestrator, cts, async () =>
+        {
+            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Restarting),
+                "first budgeted restart to begin");
+            await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Count(c =>
+                    c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)) >= 2,
+                "free launch plus first budgeted attempt to have run");
+
+            await Task.Delay(1200);
+
+            // RestartDelaySeconds (2 s) has not elapsed since the failed launch, so no
+            // further attempt is allowed; the old behavior re-attempted every
+            // CheckInterval (1 s) and would already have made a third launch.
+            h.Monitor.ReceivedCalls().Count(c =>
+                    c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync))
+                .Should().Be(2, "RestartDelaySeconds must be honored between failed launches");
+        });
+    }
+
+    [Fact]
     public async Task TargetRunning_NoRestart_StatusMonitoring()
     {
         var h = new Harness();
@@ -167,7 +224,8 @@ public class GuardianOrchestratorTests
         await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         await h.Monitor.Received(1).VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
         h.Statuses.Should().Contain(GuardianStatus.Monitoring);
-        h.Statuses.Should().NotContain(GuardianStatus.Restarting);
+        h.Statuses.Should().Contain(GuardianStatus.Restarting,
+            "a budgeted restart is user-visible while it is in flight");
         h.ToastTitles.Should().Contain(t => t.Contains("Recovered"));
     }
 
