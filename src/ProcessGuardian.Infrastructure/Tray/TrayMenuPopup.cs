@@ -179,30 +179,58 @@ internal sealed class TrayMenuPopup : Window
             return;
         }
 
-        Show();
+        // Position before showing: the menu appears directly at the cursor instead of
+        // flashing at the default (centered) position for one frame.
         PlaceAtCursor();
+        Show();
         Activate();
     }
 
     private void PlaceAtCursor()
     {
-        // Cursor is reported in physical (device) pixels; convert to DIP through the
-        // WPF composition transform, then clamp to the work area in DIP coordinates.
+        // The cursor and monitor rects are physical (device) pixels; the window's
+        // Left/Top are DIP. The monitor under the cursor (not the primary) decides
+        // placement and clamping, and its effective DPI does the physical→DIP
+        // conversion — correct for secondary monitors and mixed-DPI setups.
         GetCursorPos(out var pt);
-        var source = PresentationSource.FromVisual(this);
-        var dip = source?.CompositionTarget.TransformFromDevice.Transform(new Point(pt.X, pt.Y))
-                  ?? new Point(pt.X, pt.Y);
+        var hMonitor = MonitorFromPoint(pt, MonitorDefaultToNearest);
 
-        var area = SystemParameters.WorkArea;
+        var info = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+        if (!GetMonitorInfo(new HandleRef(this, hMonitor), ref info))
+        {
+            // Fallback: no monitor info — use the primary work area at unscaled DIP.
+            var area = SystemParameters.WorkArea;
+            double fallbackLeft = pt.X;
+            double fallbackTop = pt.Y - Height;
+            if (fallbackLeft + Width > area.Right) fallbackLeft = area.Right - Width;
+            if (fallbackLeft < area.Left) fallbackLeft = area.Left;
+            if (fallbackTop < area.Top) fallbackTop = area.Top;
+            if (fallbackTop + Height > area.Bottom) fallbackTop = area.Bottom - Height;
+            Left = fallbackLeft;
+            Top = fallbackTop;
+            return;
+        }
+
+        double scale = 1.0;
+        if (GetDpiForMonitor(hMonitor, MdtEffectiveDpi, out uint dpiX, out _) == S_OK && dpiX > 0)
+            scale = dpiX / 96.0;
+
+        // Physical → DIP of the target monitor.
+        double dipX = pt.X / scale;
+        double dipY = pt.Y / scale;
+        double workLeft = info.rcWork.left / scale;
+        double workRight = info.rcWork.right / scale;
+        double workTop = info.rcWork.top / scale;
+        double workBottom = info.rcWork.bottom / scale;
 
         // Grow upward from the click point (tray is at the bottom of the screen).
-        double left = dip.X;
-        double top = dip.Y - Height;
+        double left = dipX;
+        double top = dipY - Height;
 
-        if (left + Width > area.Right) left = area.Right - Width;
-        if (left < area.Left) left = area.Left;
-        if (top < area.Top) top = area.Top;
-        if (top + Height > area.Bottom) top = area.Bottom - Height;
+        if (left + Width > workRight) left = workRight - Width;
+        if (left < workLeft) left = workLeft;
+        if (top < workTop) top = workTop;
+        if (top + Height > workBottom) top = workBottom - Height;
 
         Left = left;
         Top = top;
@@ -239,15 +267,64 @@ internal sealed class TrayMenuPopup : Window
 
     private const int GwlExStyle = -20;
     private const int WsExToolwindow = 0x00000080;
+    private const uint MonitorDefaultToNearest = 2; // MONITOR_DEFAULTTONEAREST
+    private const int MdtEffectiveDpi = 0; // MDT_EFFECTIVE_DPI
+    private const int S_OK = 0;
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetCursorPos(out POINT lpPoint);
 
-    [DllImport("user32.dll")]
-    private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    // GetWindowLong/SetWindowLongPtr shim: on 64-bit the *Ptr variants are the
+    // documented API; GWL_EXSTYLE values fit an int either way.
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    private static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int dwNewLong);
+
+    private static int GetWindowLong(IntPtr hWnd, int nIndex) =>
+        IntPtr.Size == 8 ? GetWindowLongPtr64(hWnd, nIndex).ToInt32() : GetWindowLong32(hWnd, nIndex);
+
+    private static void SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong)
+    {
+        if (IntPtr.Size == 8)
+            SetWindowLongPtr64(hWnd, nIndex, new IntPtr(dwNewLong));
+        else
+            SetWindowLong32(hWnd, nIndex, dwNewLong);
+    }
 
     [DllImport("user32.dll")]
-    private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfo(HandleRef hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(IntPtr hMonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int left;
+        public int top;
+        public int right;
+        public int bottom;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT

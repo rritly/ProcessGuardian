@@ -73,10 +73,13 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                 return (-1, string.Empty);
             }
 
-            var output = await process.StandardOutput.ReadToEndAsync(ct);
-            var error = await process.StandardError.ReadToEndAsync(ct);
-            await process.WaitForExitAsync(ct);
-            return (process.ExitCode, $"{output} {error}".Trim());
+            // Read both streams concurrently: a sequential read can deadlock if
+            // schtasks fills the stderr pipe buffer while stdout is still open.
+            var outputTask = process.StandardOutput.ReadToEndAsync(ct);
+            var errorTask = process.StandardError.ReadToEndAsync(ct);
+            await Task.WhenAll(outputTask, errorTask).ConfigureAwait(false);
+            await process.WaitForExitAsync(ct).ConfigureAwait(false);
+            return (process.ExitCode, $"{outputTask.Result} {errorTask.Result}".Trim());
         }
         catch (OperationCanceledException)
         {

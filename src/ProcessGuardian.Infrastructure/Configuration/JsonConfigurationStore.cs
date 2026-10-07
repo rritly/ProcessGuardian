@@ -201,11 +201,13 @@ public sealed class JsonConfigurationStore : IConfigurationStore
         {
             try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
             _logger.LogError(ex, "IO error writing config file");
+            throw;
         }
         catch (UnauthorizedAccessException ex)
         {
             try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
             _logger.LogError(ex, "Access denied writing config file");
+            throw;
         }
         finally { _lock.Release(); }
     }
