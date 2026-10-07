@@ -12,6 +12,10 @@ public static class CrashLog
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         AppEdition.DataDirName);
 
+    // Serializes appends: AppendAllText opens with read-only sharing, so two
+    // concurrent reports would collide and one report would be silently dropped.
+    private static readonly object _writeLock = new();
+
     public static void Append(string fileName, string message) =>
         Append(LogDirectory, fileName, message, MaxBytes);
 
@@ -20,10 +24,13 @@ public static class CrashLog
     {
         try
         {
-            Directory.CreateDirectory(directory);
-            var path = Path.Combine(directory, fileName);
-            TryDeleteIfTooLarge(path, maxBytes);
-            File.AppendAllText(path, message);
+            lock (_writeLock)
+            {
+                Directory.CreateDirectory(directory);
+                var path = Path.Combine(directory, fileName);
+                TryDeleteIfTooLarge(path, maxBytes);
+                File.AppendAllText(path, message);
+            }
         }
         catch
         {

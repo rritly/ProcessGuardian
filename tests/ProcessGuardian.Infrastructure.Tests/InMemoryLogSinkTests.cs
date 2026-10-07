@@ -39,7 +39,7 @@ public class InMemoryLogSinkTests : IDisposable
     [Fact]
     public void Emit_601Messages_RingCapsAt600_GetRecentLogsReturnsLast200()
     {
-        var sink = CreateSink();
+        using var sink = CreateSink();
 
         for (int i = 0; i < 601; i++)
             sink.Emit(CreateEvent($"message {i}", LogEventLevel.Information));
@@ -55,7 +55,7 @@ public class InMemoryLogSinkTests : IDisposable
     [Fact]
     public void Emit_Format_HasNoBrackets_InfoLevel_TwoSpacesAfterLevel()
     {
-        var sink = CreateSink();
+        using var sink = CreateSink();
         sink.Emit(CreateEvent("Monitoring enabled for notepad"));
 
         var lines = sink.GetRecentLogs(1).Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
@@ -68,7 +68,7 @@ public class InMemoryLogSinkTests : IDisposable
     [Fact]
     public void Emit_ErrorLevel_MapsToErr_TwoSpacesAfterLevel()
     {
-        var sink = CreateSink();
+        using var sink = CreateSink();
         sink.Emit(CreateEvent("something failed", LogEventLevel.Error));
 
         var lines = sink.GetRecentLogs(1).Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
@@ -79,7 +79,7 @@ public class InMemoryLogSinkTests : IDisposable
     [Fact]
     public void Clear_EmptiesBuffer_AndFile_GetRecentLogsEmpty()
     {
-        var sink = CreateSink();
+        using var sink = CreateSink();
 
         for (int i = 0; i < 10; i++)
             sink.Emit(CreateEvent($"message {i}"));

@@ -1,14 +1,13 @@
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO;
-using System.Text;
 using ProcessGuardian.Domain;
 using Serilog.Core;
 using Serilog.Events;
 
 namespace ProcessGuardian.Infrastructure.Logging;
 
-public sealed class InMemoryLogSink : ILogEventSink
+public sealed class InMemoryLogSink : ILogEventSink, IDisposable
 {
     private const int MaxBufferSize = 600;
     private const int DefaultRecentCount = 200;
@@ -65,9 +64,25 @@ public sealed class InMemoryLogSink : ILogEventSink
             foreach (var line in lines.TakeLast(MaxBufferSize))
                 _messages.Enqueue(line);
         }
+        catch (Exception ex)
+        {
+            // Startup history load is best-effort; surface the reason inside the
+            // ring itself so an empty history card is diagnosable.
+            _messages.Enqueue(
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} WARN  log history could not be loaded: {ex.Message}");
+        }
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            _flushTimer.Dispose();
+            Flush();
+        }
         catch
         {
-            // Startup history load is best-effort; a fresh session is fine.
+            // Dispose must never throw.
         }
     }
 
@@ -76,10 +91,15 @@ public sealed class InMemoryLogSink : ILogEventSink
         try
         {
             var msg = Format(logEvent);
-            _messages.Enqueue(msg);
-            while (_messages.Count > MaxBufferSize && _messages.TryDequeue(out _)) { }
-            _pendingWrite.Enqueue(msg);
-            _dirty = true;
+            // Under the write lock so a concurrent Clear() cannot drain between the
+            // enqueue and the dirty flag (which would strand the entry unflushed).
+            lock (_writeLock)
+            {
+                _messages.Enqueue(msg);
+                while (_messages.Count > MaxBufferSize && _messages.TryDequeue(out _)) { }
+                _pendingWrite.Enqueue(msg);
+                _dirty = true;
+            }
         }
         catch (Exception)
         {
@@ -105,9 +125,12 @@ public sealed class InMemoryLogSink : ILogEventSink
     {
         try
         {
-            while (_messages.TryDequeue(out _)) { }
-            while (_pendingWrite.TryDequeue(out _)) { }
-            _dirty = false;
+            lock (_writeLock)
+            {
+                while (_messages.TryDequeue(out _)) { }
+                while (_pendingWrite.TryDequeue(out _)) { }
+                _dirty = false;
+            }
             TruncateFile();
             LogUpdated?.Invoke(this, EventArgs.Empty);
         }
@@ -161,11 +184,24 @@ public sealed class InMemoryLogSink : ILogEventSink
         {
             if (_pendingWrite.IsEmpty)
                 return;
-            var sb = new StringBuilder();
+            var lines = new List<string>();
             while (_pendingWrite.TryDequeue(out var line))
-                sb.AppendLine(line);
-            RotateIfNeeded();
-            File.AppendAllText(_logFilePath, sb.ToString());
+                lines.Add(line);
+
+            try
+            {
+                RotateIfNeeded();
+                File.AppendAllText(_logFilePath, string.Join(Environment.NewLine, lines) + Environment.NewLine);
+            }
+            catch
+            {
+                // Write failed (sharing violation, disk full): put the lines back so
+                // the next flush retries instead of losing them silently.
+                foreach (var line in lines)
+                    _pendingWrite.Enqueue(line);
+                _dirty = true;
+                throw;
+            }
         }
     }
 

@@ -48,7 +48,7 @@ public class InMemoryLogSinkHistoryTests : IDisposable
         File.WriteAllLines(path, Enumerable.Range(0, 300)
             .Select(i => $"2026-04-10 19:20:42 INFO  file line {i}"));
 
-        var sink = new InMemoryLogSink(path);
+        using var sink = new InMemoryLogSink(path);
 
         var recent = sink.GetRecentLogs(200).Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
         recent.Should().HaveCount(200);
@@ -60,11 +60,11 @@ public class InMemoryLogSinkHistoryTests : IDisposable
     public void Restart_OldEntriesVisibleInBuffer_AndNewOnesAppend()
     {
         var path = Path.Combine(_dir, "logs.log");
-        var first = new InMemoryLogSink(path);
+        using var first = new InMemoryLogSink(path);
         first.Emit(CreateEvent("old session entry"));
         first.Flush();
 
-        var second = new InMemoryLogSink(path);
+        using var second = new InMemoryLogSink(path);
         second.GetRecentLogs(200).Should().Contain("old session entry");
 
         second.Emit(CreateEvent("new session entry"));
@@ -83,7 +83,7 @@ public class InMemoryLogSinkHistoryTests : IDisposable
         File.WriteAllLines(path, new[] { "2026-04-10 19:20:42 INFO  seeded entry" });
         var before = File.ReadAllText(path);
 
-        var sink = new InMemoryLogSink(path);
+        using var sink = new InMemoryLogSink(path);
         sink.Flush();
 
         File.ReadAllText(path).Should().Be(before);

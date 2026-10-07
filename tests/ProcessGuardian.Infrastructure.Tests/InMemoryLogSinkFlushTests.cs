@@ -44,7 +44,7 @@ public class InMemoryLogSinkFlushTests : IDisposable
     public void Emit_DoesNotWriteSynchronously_ThenFlushPersistsBuffer()
     {
         var path = Path.Combine(_dir, "logs.log");
-        var sink = new InMemoryLogSink(path);
+        using var sink = new InMemoryLogSink(path);
 
         sink.Emit(CreateEvent("persist me"));
 
@@ -61,7 +61,7 @@ public class InMemoryLogSinkFlushTests : IDisposable
     public void Flush_WhenClean_IsNoOp()
     {
         var path = Path.Combine(_dir, "logs.log");
-        var sink = new InMemoryLogSink(path);
+        using var sink = new InMemoryLogSink(path);
 
         sink.Flush();
 
@@ -73,7 +73,7 @@ public class InMemoryLogSinkFlushTests : IDisposable
     public void Clear_AfterFlush_EmptiesFileImmediately()
     {
         var path = Path.Combine(_dir, "logs.log");
-        var sink = new InMemoryLogSink(path);
+        using var sink = new InMemoryLogSink(path);
 
         sink.Emit(CreateEvent("entry one"));
         sink.Emit(CreateEvent("entry two"));
@@ -91,11 +91,11 @@ public class InMemoryLogSinkFlushTests : IDisposable
     {
         var path = Path.Combine(_dir, "logs.log");
 
-        var first = new InMemoryLogSink(path);
+        using var first = new InMemoryLogSink(path);
         first.Emit(CreateEvent("session one entry"));
         first.Flush();
 
-        var second = new InMemoryLogSink(path);
+        using var second = new InMemoryLogSink(path);
         second.Emit(CreateEvent("session two entry"));
         second.Flush();
 
@@ -109,7 +109,7 @@ public class InMemoryLogSinkFlushTests : IDisposable
     {
         var path = Path.Combine(_dir, "logs.log");
         var archive = Path.Combine(_dir, "logs.1.log");
-        var sink = new InMemoryLogSink(path, maxFileBytes: 32);
+        using var sink = new InMemoryLogSink(path, maxFileBytes: 32);
 
         sink.Emit(CreateEvent("first generation entry"));
         sink.Flush();
@@ -119,5 +119,24 @@ public class InMemoryLogSinkFlushTests : IDisposable
         File.ReadAllText(archive).Should().Contain("first generation entry");
         File.ReadAllText(path).Should().Contain("second generation entry");
         File.ReadAllText(path).Should().NotContain("first generation entry");
+    }
+
+    [Fact]
+    public void Flush_WhenFileLocked_KeepsPendingEntries_ForNextFlush()
+    {
+        var path = Path.Combine(_dir, "logs.log");
+        using var sink = new InMemoryLogSink(path);
+        sink.Emit(CreateEvent("survive me"));
+
+        using (File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            // Append fails (sharing violation); the entries must be re-enqueued,
+            // not lost, so the next flush can retry.
+            sink.Flush();
+        }
+
+        sink.Flush();
+
+        File.ReadAllText(path).Should().Contain("survive me");
     }
 }
