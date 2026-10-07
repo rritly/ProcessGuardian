@@ -366,3 +366,8 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 <!-- MARKDOWN LINKS & IMAGES -->
 [product-screenshot]: assets/mainWindow.png
+
+---
+
+<sub>**Keywords:** process guardian, process watchdog, process monitor, auto restart, keep process alive, crash recovery, restart on crash, windows autostart, system tray utility, toast notifications, sha-256 integrity, wpf, dotnet, c#, open source, application watchdog, process watcher, application monitor, background service, dependency injection, mvvm toolkit, generic host, serilog, notifyicon, clean architecture, single instance, single-file publish, self-contained exe, scheduled task, .net 9, windows 10, windows 11</sub>
+
