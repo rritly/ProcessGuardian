@@ -14,6 +14,7 @@ public sealed class JsonConfigurationStore : IConfigurationStore
     private readonly JsonSerializerOptions _options = new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly ILogger<JsonConfigurationStore> _logger;
+    private readonly bool _hardenWhenElevated;
     private AppSettings? _current;
 
     public JsonConfigurationStore(ILogger<JsonConfigurationStore> logger)
@@ -27,12 +28,23 @@ public sealed class JsonConfigurationStore : IConfigurationStore
     internal JsonConfigurationStore(ILogger<JsonConfigurationStore> logger, string configDirectory, bool hardenWhenElevated = true)
     {
         _logger = logger;
+        _hardenWhenElevated = AppEdition.IsElevated && hardenWhenElevated;
         var dir = configDirectory;
         try
         {
-            Directory.CreateDirectory(dir);
-            if (AppEdition.IsElevated && hardenWhenElevated)
+            if (_hardenWhenElevated)
+            {
+                // Born-hardened creation: the directory never exists with inherited
+                // (user-writable) rights before hardening is applied.
+                if (!Directory.Exists(dir))
+                    new DirectoryInfo(dir).Create(CreateHardenedDirectorySecurity());
+                // Pre-existing directories keep whatever ACL they have; re-harden them.
                 HardenForAdministratorsOnly(dir);
+            }
+            else
+            {
+                Directory.CreateDirectory(dir);
+            }
         }
         catch (Exception ex)
         {
@@ -40,6 +52,12 @@ public sealed class JsonConfigurationStore : IConfigurationStore
             throw;
         }
         _path = Path.Combine(dir, "settings.json");
+        if (_hardenWhenElevated && File.Exists(_path))
+        {
+            // Legacy migration: a settings.json created before hardening (or via a
+            // pre-create race) may still carry weak inherited ACEs.
+            HardenFileForAdministratorsOnly(_path);
+        }
     }
 
     private static string ResolveDefaultDirectory() => AppEdition.IsElevated
@@ -61,14 +79,35 @@ public sealed class JsonConfigurationStore : IConfigurationStore
         var info = new DirectoryInfo(directory);
         var security = info.GetAccessControl();
         security.SetAccessRuleProtection(true, false);
-        var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+        AddHardenedRules(security, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit);
+        info.SetAccessControl(security);
+    }
+
+    internal static void HardenFileForAdministratorsOnly(string filePath)
+    {
+        var info = new FileInfo(filePath);
+        var security = info.GetAccessControl();
+        security.SetAccessRuleProtection(true, false);
+        AddHardenedRules(security, InheritanceFlags.None);
+        info.SetAccessControl(security);
+    }
+
+    internal static DirectorySecurity CreateHardenedDirectorySecurity()
+    {
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(true, false);
+        AddHardenedRules(security, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit);
+        return security;
+    }
+
+    private static void AddHardenedRules(FileSystemSecurity security, InheritanceFlags inheritance)
+    {
         security.AddAccessRule(new FileSystemAccessRule(
             new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
             FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
         security.AddAccessRule(new FileSystemAccessRule(
             new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
             FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
-        info.SetAccessControl(security);
     }
 
     public async Task<AppSettings> LoadAsync(CancellationToken ct = default)
@@ -134,6 +173,21 @@ public sealed class JsonConfigurationStore : IConfigurationStore
             // the save must complete atomically to avoid a truncated file.
             await File.WriteAllTextAsync(tmpPath, json, ct);
             File.Move(tmpPath, _path, overwrite: true);
+            if (_hardenWhenElevated)
+            {
+                // The moved file may have been created before hardening applied or
+                // inherited a weak legacy ACL; re-assert the admin-only DACL.
+                try
+                {
+                    HardenFileForAdministratorsOnly(_path);
+                }
+                catch (Exception ex)
+                {
+                    // The save itself succeeded; a failed re-harden is logged but must
+                    // not report the settings change as lost.
+                    _logger.LogError(ex, "Failed to re-harden settings file ACL {Path}", _path);
+                }
+            }
             // Publish _current only after the file is replaced: on a failed write,
             // LoadAsync must keep returning the last successfully persisted settings.
             _current = settings;
