@@ -155,8 +155,9 @@ public partial class MainViewModel : ObservableObject
 
             // settings.json AutostartEnabled is the source of truth (never overwrite it
             // from the registry); (re)write the Run key so it survives a previous Exit.
+            // Off the dispatcher: the elevated edition spawns schtasks.exe here.
             if (Settings.AutostartEnabled)
-                await _autostart.SetEnabledAsync(true, CancellationToken.None);
+                await Task.Run(() => _autostart.SetEnabledAsync(true, CancellationToken.None));
         }
         catch (Exception ex)
         {

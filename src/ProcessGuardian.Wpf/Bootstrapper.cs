@@ -59,6 +59,8 @@ public static class Bootstrapper
 
         // Presentation
         services.AddSingleton<MainViewModel>();
-        services.AddSingleton<MainWindow>();
+        // Transient: a closed WPF Window can never be re-shown, so re-opening after
+        // a real close must resolve a fresh instance.
+        services.AddTransient<MainWindow>();
     }
 }

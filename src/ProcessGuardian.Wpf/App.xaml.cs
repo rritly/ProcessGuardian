@@ -77,7 +77,7 @@ public partial class App : System.Windows.Application
             if (vm.StopCommand.CanExecute(null))
                 vm.StopCommand.Execute(null);
         });
-        _tray.ExitRequested += (_, __) => Dispatcher.BeginInvoke(() =>
+        _tray.ExitRequested += (_, __) => Dispatcher.BeginInvoke(async () =>
         {
             _userRequestedExit = true;
             if (_host != null)
@@ -85,9 +85,10 @@ public partial class App : System.Windows.Application
                 try
                 {
                     var vm = _host.Services.GetRequiredService<MainViewModel>();
-                // Stop monitoring and persist BEFORE Shutdown so the next launch does
-                // not auto-start. The save runs on the thread pool, so blocking is safe.
-                Task.Run(() => vm.StopMonitoringAndSaveAsync()).GetAwaiter().GetResult();
+                    // Stop monitoring and persist BEFORE Shutdown so the next launch does
+                    // not auto-start. Awaited (not blocked on) so the dispatcher keeps
+                    // servicing queued work during the save/autostart sync.
+                    await vm.StopMonitoringAndSaveAsync();
                 }
                 catch (Exception ex)
                 {
@@ -131,6 +132,19 @@ public partial class App : System.Windows.Application
             catch (Exception ex)
             {
                 CrashLog.Append("crash.log", $"[{DateTime.Now}] Host start fault: {ex}\n");
+                // Silent failure would leave a working-looking UI with no monitoring.
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    try
+                    {
+                        MessageBox.Show(
+                            $"Background services failed to start: {ex.Message}\nMonitoring is unavailable.",
+                            $"{AppEdition.Name} - Host Error",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Error);
+                    }
+                    catch { }
+                });
             }
         });
     }
@@ -139,8 +153,10 @@ public partial class App : System.Windows.Application
     {
         try
         {
-            if (_mainWindow == null)
+            if (_mainWindow == null || !_mainWindow.IsLoaded)
             {
+                // Registered transient: a previously closed window cannot be re-shown,
+                // so a fresh instance is resolved after the old one actually closed.
                 _mainWindow = _host!.Services.GetRequiredService<MainWindow>();
                 _mainWindow.DataContext = _host.Services.GetRequiredService<MainViewModel>();
                 _mainWindow.Closing += OnMainWindowClosing;
@@ -187,6 +203,8 @@ public partial class App : System.Windows.Application
 
     private void OnMainWindowClosed(object? sender, EventArgs e)
     {
+        // A closed WPF Window can never be shown again; the registration is transient,
+        // so the next ShowMainWindow creates a fresh instance.
         _mainWindow = null;
     }
 
@@ -273,14 +291,35 @@ public partial class App : System.Windows.Application
                 MessageBoxImage.Error);
         }
         catch { }
+        try
+        {
+            // Best-effort: remove the tray icon so no ghost icon lingers after exit.
+            _tray?.Dispose();
+        }
+        catch { }
         Environment.Exit(1);
     }
 
-    // Policy: swallow UI exceptions to keep the app running; only crash.log records them.
+    private bool _uiErrorReported;
+
+    // Policy: swallow UI exceptions to keep the app running; the first one is also
+    // surfaced to the user (crash.log always records them).
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
         e.Handled = true;
         CrashLog.Append("crash.log", $"[{DateTime.Now}] UI FATAL: {e.Exception}\n");
+        if (_uiErrorReported)
+            return;
+        _uiErrorReported = true;
+        try
+        {
+            MessageBox.Show(
+                $"An unexpected error occurred and was logged:\n{e.Exception.Message}\nThe application will keep running.",
+                $"{AppEdition.Name} - Error",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+        catch { }
     }
 
     private void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)

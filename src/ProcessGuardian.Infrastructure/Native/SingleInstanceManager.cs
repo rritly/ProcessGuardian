@@ -50,7 +50,12 @@ public sealed class SingleInstanceManager : IDisposable
                 try
                 {
                     if (_showEvent.WaitOne(200))
+                    {
+                        // Dispose() sets the event to wake this watcher; never fire
+                        // ShowRequested for that final wake-up during shutdown.
+                        if (_disposed) return;
                         ShowRequested?.Invoke(this, EventArgs.Empty);
+                    }
                 }
                 catch
                 {
