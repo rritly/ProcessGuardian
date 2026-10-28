@@ -12,7 +12,7 @@ own, for programs that crash periodically and need to be brought back up automat
 or for testing. The app also collects event logs you can inspect at any time — handy
 for seeing exactly what the guardian did and when.
 
-Built with WPF on .NET 9 using Clean Architecture
+Built with WPF on .NET 10 using Clean Architecture
 (Domain → Application → Infrastructure → Presentation).
 
 [About](#about-the-project) &middot; [Usage](#usage) &middot; [Build &amp; Publish](#build--publish)
@@ -85,7 +85,7 @@ Both editions run side by side: separate executable identity, single-instance mu
 
 ### Built With
 
-* [.NET 9](https://dotnet.microsoft.com/) — `net9.0-windows10.0.17763.0`, WPF
+* [.NET 10](https://dotnet.microsoft.com/) — `net10.0-windows10.0.17763.0`, WPF
 * [CommunityToolkit.Mvvm](https://www.nuget.org/packages/CommunityToolkit.Mvvm) — MVVM source generators
 * [Microsoft.Extensions.Hosting](https://www.nuget.org/packages/Microsoft.Extensions.Hosting) — generic host, DI, `BackgroundService`
 * [Serilog](https://serilog.net/) — file logging
@@ -305,10 +305,8 @@ Run manually by a person after a build (no automated pass marks here):
 
 ### Prerequisites
 
-* **To run:** Windows 10 1809+ / Windows Server 2019+, x64. The published builds are
-  self-contained — no .NET runtime needs to be installed.
-* **To build:** .NET SDK 9.0 (the repository pins `9.0.100` with `rollForward: latestFeature`)
-  with the Windows Desktop workload.
+* **To run:** Windows 11, or Windows 10 **LTSC/Enterprise** editions only (the `.NET 10` runtime supports Windows 10 1607/1809/21H2 only for those channel/edition combinations — not Home/Pro), plus Windows Server 2016+; x64. The published builds are self-contained — no .NET runtime needs to be installed.
+* **To build:** .NET SDK 10.0 (the repository pins `10.0.100` with `rollForward: latestFeature`) with the Windows Desktop workload.
 
 ### Installation
 
@@ -334,8 +332,8 @@ dotnet test .\ProcessGuardian.sln
 
 Debug builds:
 
-* `src\ProcessGuardian.Wpf\bin\Debug\net9.0-windows10.0.17763.0\ProcessGuardian.exe` (regular)
-* `src\ProcessGuardian.Wpf\bin\Release-Elevated\net9.0-windows10.0.17763.0\ProcessGuardianAdmin.exe`
+* `src\ProcessGuardian.Wpf\bin\Debug\net10.0-windows10.0.17763.0\ProcessGuardian.exe` (regular)
+* `src\ProcessGuardian.Wpf\bin\Release-Elevated\net10.0-windows10.0.17763.0\ProcessGuardianAdmin.exe`
   (admin — only the `Release-Elevated` configuration exists for the admin edition)
 
 Output sizes (self-contained single exe):
@@ -345,7 +343,7 @@ Output sizes (self-contained single exe):
 | ProcessGuardian | ≈ 78 MB |
 | ProcessGuardianAdmin | ≈ 78 MB |
 
-Reason: the `net9.0-windows10.0.17763.0` TFM pulls in the Windows SDK bindings, and WPF does not trim well in single-file mode.
+Reason: the `net10.0-windows10.0.17763.0` TFM pulls in the Windows SDK bindings, and WPF does not trim well in single-file mode.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -369,5 +367,5 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 ---
 
-<sub>**Keywords:** process guardian, process watchdog, process monitor, auto restart, keep process alive, crash recovery, restart on crash, windows autostart, system tray utility, toast notifications, sha-256 integrity, wpf, dotnet, c#, open source, application watchdog, process watcher, application monitor, background service, dependency injection, mvvm toolkit, generic host, serilog, notifyicon, clean architecture, single instance, single-file publish, self-contained exe, scheduled task, .net 9, windows 10, windows 11</sub>
+<sub>**Keywords:** process guardian, process watchdog, process monitor, auto restart, keep process alive, crash recovery, restart on crash, windows autostart, system tray utility, toast notifications, sha-256 integrity, wpf, dotnet, c#, open source, application watchdog, process watcher, application monitor, background service, dependency injection, mvvm toolkit, generic host, serilog, notifyicon, clean architecture, single instance, single-file publish, self-contained exe, scheduled task, .net 10, windows 10, windows 11</sub>
 

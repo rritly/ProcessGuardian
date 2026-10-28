@@ -5,7 +5,7 @@
   <ItemGroup>
     <!-- Only BackgroundService/DI abstractions are used; the full Hosting package
          drags in configuration/DI infrastructure the Application layer does not need. -->
-    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.20" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.20" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.14" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.14" />
   </ItemGroup>
 </Project>
