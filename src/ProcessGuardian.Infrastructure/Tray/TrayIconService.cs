@@ -22,6 +22,8 @@ public sealed class TrayIconService : ITrayService
     private readonly ILogger<TrayIconService> _logger;
     private readonly TrayMenuPopup _menu;
     private bool _isMonitoring;
+    private string _statusLabel = GuardianStatus.Stopped.ToString();
+    private string? _notice;
 
     public event EventHandler? ShowRequested;
     public event EventHandler? StartRequested;
@@ -101,14 +103,35 @@ public sealed class TrayIconService : ITrayService
                 GuardianStatus.Error => _icoError,
                 _ => _icoOff,
             };
-            _icon.ToolTipText = $"{AppEdition.Name} - {status}";
+            _statusLabel = status.ToString();
 
             ApplyStatus(status);
+            RefreshTooltip();
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to set tray icon status");
         }
+    }
+
+    public void SetNotice(string? message)
+    {
+        try
+        {
+            _notice = message;
+            RefreshTooltip();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to set tray icon notice");
+        }
+    }
+
+    private void RefreshTooltip()
+    {
+        _icon.ToolTipText = string.IsNullOrWhiteSpace(_notice)
+            ? $"{AppEdition.Name} - {_statusLabel}"
+            : _notice!;
     }
 
     private void ApplyStatus(GuardianStatus status)

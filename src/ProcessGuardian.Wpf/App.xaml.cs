@@ -3,6 +3,7 @@ using System.Windows.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using ProcessGuardian.Domain;
+using ProcessGuardian.Domain.Enums;
 using ProcessGuardian.Domain.Interfaces;
 using ProcessGuardian.Infrastructure.Logging;
 using ProcessGuardian.Infrastructure.Native;
@@ -40,6 +41,15 @@ public partial class App : System.Windows.Application
             Shutdown(1);
         }
     }
+
+    private static readonly string RefusedTrayNotice =
+        $"{AppEdition.Name}: configuration is unavailable. An administrator must repair the elevated configuration " +
+        "(owner BUILTIN\\Administrators or SYSTEM; no reparse points) or the recovery state at " +
+        "HKLM\\SOFTWARE\\ProcessGuardianAdmin\\Recovery, then start the application again.";
+
+    private static readonly string ResetTrayNotice =
+        $"{AppEdition.Name}: settings were reset to safe defaults — the previous configuration was untrusted and " +
+        "was quarantined. Monitoring is off and the target pin is cleared; select and re-pin the target to start.";
 
     private void InitializeApplication(StartupEventArgs e)
     {
@@ -104,17 +114,49 @@ public partial class App : System.Windows.Application
         statusReporter.StatusChanged += (_, status) =>
             Dispatcher.BeginInvoke(() => _tray.SetStatus(status));
 
-        // Resolve the VM (singleton) before starting the host so its status/log
-        // subscriptions exist before the orchestrator's first Report().
-        _host.Services.GetRequiredService<MainViewModel>();
-
-        // Do NOT block the UI thread on StartAsync: the orchestrator marshals status to
-        // the Dispatcher, so waiting on StartAsync here would deadlock. Fire-and-forget.
-        StartHostAsync();
-
-        // Background mode? Show the window immediately after host start, without
-        // waiting for the monitoring cycle to complete.
         var isBackground = e.Args.Any(a => a.Equals("--background", StringComparison.OrdinalIgnoreCase));
+
+        // Non-fatal config initialization, then boot: a refused store must NOT reach the
+        // fatal MessageBox, must NOT start the host or any monitoring, and surfaces an
+        // ordinary Error indicator (tray-only for --background). Initialization I/O runs
+        // off the UI thread; the rest of this method resumes on the dispatcher.
+        _ = RunBootAsync(isBackground);
+    }
+
+    private async Task RunBootAsync(bool isBackground)
+    {
+        ConfigurationInitializationStatus initStatus;
+        try
+        {
+            var store = _host!.Services.GetRequiredService<IConfigurationStore>();
+            initStatus = await Task.Run(() => store.InitializeAsync(CancellationToken.None));
+        }
+        catch (Exception ex)
+        {
+            CrashLog.Append("crash.log", $"[{DateTime.Now}] Config initialization fault: {ex}\n");
+            initStatus = ConfigurationInitializationStatus.Refused;
+        }
+
+        if (initStatus == ConfigurationInitializationStatus.Refused)
+        {
+            // Ordinary Error path: no host start, no monitoring, no fatal MessageBox.
+            _tray?.SetStatus(GuardianStatus.Error);
+            _tray?.SetNotice(RefusedTrayNotice);
+        }
+        else
+        {
+            var vm = _host!.Services.GetRequiredService<MainViewModel>();
+            vm.ApplyInitializationStatus(initStatus);
+            if (initStatus == ConfigurationInitializationStatus.ResetNoticePending)
+            {
+                _tray?.SetNotice(ResetTrayNotice);
+            }
+
+            // Resolve the VM (singleton) before starting the host so its status/log
+            // subscriptions exist before the orchestrator's first Report().
+            StartHostAsync();
+        }
+
         if (!isBackground)
         {
             ShowMainWindow();

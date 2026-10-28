@@ -8,6 +8,7 @@ using Microsoft.Win32;
 using ProcessGuardian.Domain.Entities;
 using ProcessGuardian.Domain.Enums;
 using ProcessGuardian.Domain.Interfaces;
+using ProcessGuardian.Infrastructure.Configuration;
 using ProcessGuardian.Infrastructure.Logging;
 
 namespace ProcessGuardian.Wpf.ViewModels;
@@ -35,6 +36,15 @@ public partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private string _logText = string.Empty;
+
+    // Persistent config-state indicators (A). Non-empty ConfigurationError means the store
+    // refused (unsafe location); Start/monitoring must stay disabled. Non-empty ResetNotice
+    // reports that untrusted settings were quarantined and replaced with fresh defaults.
+    [ObservableProperty]
+    private string _configurationError = string.Empty;
+
+    [ObservableProperty]
+    private string _resetNotice = string.Empty;
 
     private CancellationTokenSource? _saveCts;
 
@@ -159,10 +169,40 @@ public partial class MainViewModel : ObservableObject
             if (Settings.AutostartEnabled)
                 await Task.Run(() => _autostart.SetEnabledAsync(true, CancellationToken.None));
         }
+        catch (ConfigurationUnavailableException ex)
+        {
+            // A refused store is an ordinary Error path, never a fatal crash: no settings
+            // object exists, monitoring must not start, and the user is pointed to recovery.
+            _logger.LogError(ex, "Configuration store refused on load");
+            ConfigurationError = ex.Guidance ?? "Configuration is unavailable; apply the guidance and restart.";
+            Settings = new AppSettings();
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to load settings on startup");
             Settings = new AppSettings();
+        }
+    }
+
+    /// <summary>
+    /// Applies the non-fatal store-initialization outcome to the persistent indicators
+    /// (called by the boot path after <see cref="IConfigurationStore.InitializeAsync"/>).
+    /// </summary>
+    public void ApplyInitializationStatus(ConfigurationInitializationStatus status)
+    {
+        switch (status)
+        {
+            case ConfigurationInitializationStatus.Refused:
+                ConfigurationError =
+                    "The elevated configuration is unavailable. An administrator must inspect and repair the " +
+                    "elevated configuration (owner BUILTIN\\Administrators or SYSTEM; no reparse points) or the " +
+                    "recovery state at HKLM\\SOFTWARE\\ProcessGuardianAdmin\\Recovery, then start the application again.";
+                break;
+            case ConfigurationInitializationStatus.ResetNoticePending:
+                ResetNotice =
+                    "Settings were reset to safe defaults: the previous configuration was untrusted and has been " +
+                    "quarantined. Monitoring is off and the target pin is cleared — re-select and re-pin the target to start.";
+                break;
         }
     }
 
@@ -303,7 +343,9 @@ public partial class MainViewModel : ObservableObject
         return Task.Run(FlushSaveAsync);
     }
 
-    private bool CanStart => !_startStopInProgress && Status is GuardianStatus.Stopped or GuardianStatus.Error;
+    private bool CanStart => !_startStopInProgress
+        && string.IsNullOrEmpty(ConfigurationError)
+        && Status is GuardianStatus.Stopped or GuardianStatus.Error;
     private bool CanStop => !_startStopInProgress && Status is GuardianStatus.Monitoring or GuardianStatus.Waiting or GuardianStatus.Restarting;
 
     [RelayCommand]

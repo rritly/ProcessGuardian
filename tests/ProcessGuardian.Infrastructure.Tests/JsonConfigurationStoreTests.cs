@@ -21,7 +21,10 @@ public class JsonConfigurationStoreTests : IDisposable
         // test host could not even construct a store pointed at it).
         _dir = Path.Combine(Path.GetTempPath(), "ProcessGuardian.Tests", "config-" + Guid.NewGuid().ToString("N"));
         _path = Path.Combine(_dir, "settings.json");
-        _store = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir, hardenWhenElevated: false);
+        // The store's constructor performs no I/O; the directory is created up front so
+        // tests that write the file directly (corrupt/edge cases) have a target.
+        Directory.CreateDirectory(_dir);
+        _store = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir);
     }
 
     public void Dispose()
@@ -110,7 +113,7 @@ public class JsonConfigurationStoreTests : IDisposable
             }
             """);
 
-        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir, hardenWhenElevated: false);
+        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir);
         var loaded = await freshStore.LoadAsync();
 
         loaded.CheckIntervalSeconds.Should().Be(1);
@@ -138,7 +141,7 @@ public class JsonConfigurationStoreTests : IDisposable
             }
             """);
 
-        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir, hardenWhenElevated: false);
+        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir);
         var loaded = await freshStore.LoadAsync();
 
         loaded.CheckIntervalSeconds.Should().Be(999);
@@ -175,7 +178,7 @@ public class JsonConfigurationStoreTests : IDisposable
 
         await _store.SaveAsync(settings);
 
-        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir, hardenWhenElevated: false);
+        var freshStore = new JsonConfigurationStore(NullLogger<JsonConfigurationStore>.Instance, _dir);
         var loaded = await freshStore.LoadAsync();
 
         loaded.IsMonitoringEnabled.Should().BeTrue();

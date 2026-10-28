@@ -18,6 +18,7 @@
 
     <Window.Resources>
         <conv:StatusToDisplayConverter x:Key="StatusToDisplayConverter" />
+        <conv:StringIsEmptyToVisibilityConverter x:Key="StringIsEmptyToVisibilityConverter" />
 
         <SolidColorBrush x:Key="CardBgBrush" Color="#22303D" />
         <SolidColorBrush x:Key="CardBorderBrush" Color="#3E4854" />
@@ -758,6 +759,24 @@
                                HorizontalAlignment="Center"
                                VerticalAlignment="Center" />
                 </Border>
+
+                <TextBlock Text="{Binding ConfigurationError}"
+                           Margin="8,0,0,0"
+                           MaxWidth="300"
+                           TextWrapping="Wrap"
+                           FontSize="11"
+                           Foreground="#E5554F"
+                           VerticalAlignment="Center"
+                           Visibility="{Binding ConfigurationError, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
+
+                <TextBlock Text="{Binding ResetNotice}"
+                           Margin="8,0,0,0"
+                           MaxWidth="300"
+                           TextWrapping="Wrap"
+                           FontSize="11"
+                           Foreground="#E8A33D"
+                           VerticalAlignment="Center"
+                           Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
             </StackPanel>
         </Border>
 
