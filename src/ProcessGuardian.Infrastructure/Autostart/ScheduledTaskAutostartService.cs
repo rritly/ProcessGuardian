@@ -55,17 +55,27 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     internal static string BuildQueryArguments() =>
         $"/Query /TN \"{AppEdition.ScheduledTaskName}\"";
 
+    // Defeat a bare-name resolution that a hostile PATH entry could hijack: schtasks.exe
+    // is always invoked through its absolute %SystemRoot%\System32 path.
+    internal static string ResolveSchTasksPath() =>
+        Path.Combine(Environment.SystemDirectory, "schtasks.exe");
+
+    // Internal seam so tests can assert the launched FileName is the absolute System32
+    // path, not a bare "schtasks.exe" resolved through the process PATH.
+    internal static ProcessStartInfo BuildProcessStartInfo(string arguments) =>
+        new(ResolveSchTasksPath(), arguments)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
     private async Task<(int ExitCode, string Output)> RunSchTasksAsync(string arguments, CancellationToken ct)
     {
         try
         {
-            var psi = new ProcessStartInfo("schtasks.exe", arguments)
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-            };
+            var psi = BuildProcessStartInfo(arguments);
             using var process = Process.Start(psi);
             if (process is null)
             {
