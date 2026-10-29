@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Entities;
 using ProcessGuardian.Domain.Enums;
 using ProcessGuardian.Domain.Exceptions;
@@ -142,9 +143,23 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
             if (string.IsNullOrWhiteSpace(_latestPin))
             {
-                // [product, explicit] legacy empty pin: no silent refusal and no silent launch.
-                await DisablePersistedAsync(
-                    "Monitoring cannot start: the target has no recorded pin (target confirmation required).", ct);
+                if (AppEdition.IsElevated)
+                {
+                    // [product, explicit] Elevated: empty pin blocks automatic launch until an
+                    // explicit re-pin. No silent refusal and no silent launch — Error with
+                    // persistent "target confirmation required" guidance (independent of EnableToasts).
+                    await DisablePersistedAsync(
+                        "Monitoring cannot start: the target has no recorded pin (target confirmation required).", ct);
+                }
+                else
+                {
+                    // [preserve] Regular edition: an empty legacy pin keeps the compatibility
+                    // skip — monitoring may resume without a pin (VerifyTargetHashAsync skips the
+                    // hash for an empty pin). No pin is ever created automatically at boot.
+                    _logger.LogInformation("Regular edition: no recorded pin; resuming with the compatibility skip");
+                    BeginSession(CreateSessionSnapshot(target.FullPath, string.Empty, target));
+                    Publish(new MonitorState(GuardianStatus.Waiting, false, null, false));
+                }
                 return;
             }
 
@@ -208,12 +223,18 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             var canonicalPath = target.FullPath;
 
             // 2) The pin is computed by the controller (K), never supplied by the VM.
-            var pin = await _integrity.ComputeHashAsync(canonicalPath, ct).ConfigureAwait(false);
-            if (pin is null)
+            var hash = await _integrity.ComputeHashAsync(canonicalPath, ct).ConfigureAwait(false);
+            if (!hash.IsComputed)
             {
-                _logger.LogWarning("Start rejected: target {Path} could not be hashed", canonicalPath);
+                // A missing or unreadable target at Start rejects the request: no session.
+                // (Absence of the file is allowed only inside an already-running session, where
+                // the transient-missing rule applies.)
+                _logger.LogWarning("Start rejected: target {Path} {Reason}", canonicalPath,
+                    hash.Status == TargetHashStatus.Missing ? "is missing" : "could not be read");
                 return new StartResult(false, "the target file could not be hashed; monitoring not started");
             }
+
+            var pin = hash.Hash!;
 
             // 3) Persist canonical path + pin + enabled together BEFORE the session starts.
             // A failed save does not start monitoring: no session, no loop.
@@ -467,11 +488,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     {
         if (counters.InitialLaunchPending)
         {
-            counters.InitialLaunchPending = false;
             _logger.LogInformation("Initial start for {Target}", target.NameWithoutExtension);
             var outcome = await StartAndVerifyAsync(target, knobs, showRecoveryToast: false, ct).ConfigureAwait(false);
             if (outcome == StartOutcome.SessionEnded || outcome == StartOutcome.Blocked)
                 return SessionAction.EndSession;
+            // A degraded (missing/unreadable) free launch spends no budget and does not consume
+            // the free launch: keep initial-pending so the next cycle retries it.
+            if (outcome != StartOutcome.Degraded)
+                counters.InitialLaunchPending = false;
             return SessionAction.Continue;
         }
 
@@ -493,14 +517,21 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             return SessionAction.EndSession;
         }
 
-        counters.RestartAttempts++;
         Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
-        _logger.LogInformation("Restart attempt #{Attempt} for {Target}", counters.RestartAttempts, target.NameWithoutExtension);
+        _logger.LogInformation("Restart attempt for {Target}", target.NameWithoutExtension);
 
         var started = await StartAndVerifyAsync(target, knobs, showRecoveryToast: true, ct).ConfigureAwait(false);
         if (started == StartOutcome.SessionEnded || started == StartOutcome.Blocked)
             return SessionAction.EndSession;
+        if (started == StartOutcome.Degraded)
+        {
+            // A degraded (missing/unreadable) relaunch spends no budget and sleeps no restart
+            // delay; the session keeps polling. Only a genuine launch that ran and failed advances
+            // the consecutive counter (budget-charge rule, E).
+            return SessionAction.Continue;
+        }
 
+        counters.RestartAttempts++;
         var hasMoreAttempts = counters.RestartAttempts < knobs.MaxRestartAttempts || knobs.MaxRestartAttempts == 0;
         if (started == StartOutcome.NotStarted || (started == StartOutcome.VerifyFailed && hasMoreAttempts))
         {
@@ -517,17 +548,33 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         return SessionAction.Continue;
     }
 
-    private enum StartOutcome { NotStarted, Verified, VerifyFailed, Blocked, SessionEnded }
+    private enum StartOutcome { NotStarted, Verified, VerifyFailed, Blocked, Degraded, SessionEnded }
 
     private async Task<StartOutcome> StartAndVerifyAsync(
         ProcessTarget target, CommittedSettingsSnapshot knobs, bool showRecoveryToast, CancellationToken ct)
     {
-        if (!await VerifyTargetHashAsync(target, knobs, ct).ConfigureAwait(false))
+        var hash = await VerifyTargetHashAsync(target, knobs, ct).ConfigureAwait(false);
+        switch (hash)
         {
-            // Hash mismatch/read failure: fail closed, persist disabled, end the session.
-            await TryPersistDisabledBestEffortAsync(knobs).ConfigureAwait(false);
-            Publish(new MonitorState(GuardianStatus.Error, false, "the target binary no longer matches the recorded pin; monitoring stopped", false));
-            return StartOutcome.SessionEnded;
+            case HashVerifyResult.Cancelled:
+                return StartOutcome.SessionEnded;
+            case HashVerifyResult.Missing:
+                _logger.LogWarning("Target {Target} is missing before launch; skipping (degraded), no budget spent",
+                    target.NameWithoutExtension);
+                Publish(new MonitorState(CurrentState.Status, true, "the target file is missing; launch skipped", CurrentState.SaveFailed));
+                return StartOutcome.Degraded;
+            case HashVerifyResult.ReadError:
+                _logger.LogWarning("Target {Target} could not be read before launch; skipping (degraded), no budget spent",
+                    target.NameWithoutExtension);
+                Publish(new MonitorState(CurrentState.Status, true, "the target file could not be read; launch skipped", CurrentState.SaveFailed));
+                return StartOutcome.Degraded;
+            case HashVerifyResult.Mismatch:
+                // Fail closed (K keeping today's behavior until F): persist disabled, terminate the
+                // session, publish Error — even if that save fails, with the save-failure flag surfaced.
+                await TryPersistDisabledBestEffortAsync(knobs).ConfigureAwait(false);
+                Publish(new MonitorState(GuardianStatus.Error, false,
+                    "the target binary no longer matches the recorded pin; monitoring stopped", _lastPersistFailed));
+                return StartOutcome.SessionEnded;
         }
 
         // Linearized launch: the last session/gate check and the synchronous Process.Start
@@ -627,24 +674,40 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     private SessionSnapshot CurrentSessionOr(ProcessTarget target) =>
         _session ?? CreateSessionSnapshot(target.FullPath, _latestPin, target);
 
-    // Fail closed: an empty pin skips the check (legacy tolerance is boot-time only; the
-    // controller always writes a pin on Start, so a session pin is never empty after C+D).
-    private async Task<bool> VerifyTargetHashAsync(ProcessTarget target, CommittedSettingsSnapshot knobs, CancellationToken ct)
+    // Empty pin: the regular-edition compatibility skip verifies nothing (a session pin is
+    // only empty in the regular edition; elevated reconciliation refuses empty-pin
+    // auto-resume). A non-empty saved pin is always verified in both editions.
+    private async Task<HashVerifyResult> VerifyTargetHashAsync(ProcessTarget target, CommittedSettingsSnapshot knobs, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(_latestPin))
         {
             _logger.LogInformation("Target {Target} has no recorded pin; integrity check skipped", target.NameWithoutExtension);
-            return true;
+            return HashVerifyResult.Verified;
         }
 
-        var actual = await _integrity.ComputeHashAsync(target.FullPath, ct).ConfigureAwait(false);
-        if (actual is not null &&
-            string.Equals(actual, _latestPin, StringComparison.OrdinalIgnoreCase))
-            return true;
+        TargetHashResult read;
+        try
+        {
+            read = await _integrity.ComputeHashAsync(target.FullPath, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return HashVerifyResult.Cancelled;
+        }
+
+        // K distinguishes a clean "no file" and a permission/IO failure from a mismatch; only a
+        // successfully-read differing hash is Mismatch.
+        if (read.Status == TargetHashStatus.Missing)
+            return HashVerifyResult.Missing;
+        if (read.Status == TargetHashStatus.ReadError)
+            return HashVerifyResult.ReadError;
+
+        if (string.Equals(read.Hash, _latestPin, StringComparison.OrdinalIgnoreCase))
+            return HashVerifyResult.Verified;
 
         _logger.LogError(
             "Target binary hash mismatch for {Target} (expected {Expected}, got {Actual}); launch blocked",
-            target.NameWithoutExtension, _latestPin, actual ?? "<unreadable>");
+            target.NameWithoutExtension, _latestPin, read.Hash);
         try
         {
             if (knobs.EnableToasts)
@@ -655,7 +718,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             _logger.LogWarning(ex, "Failed to show target-changed toast");
         }
 
-        return false;
+        return HashVerifyResult.Mismatch;
     }
 
     // Fatal cause: exit the cycle loop first, then persist enabled=false best-effort and

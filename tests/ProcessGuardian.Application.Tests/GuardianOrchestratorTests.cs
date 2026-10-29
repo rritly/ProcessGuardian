@@ -4,6 +4,7 @@ using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using ProcessGuardian.Application.Services;
+using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Entities;
 using ProcessGuardian.Domain.Enums;
 using ProcessGuardian.Domain.Interfaces;
@@ -72,7 +73,7 @@ public class GuardianOrchestratorTests
             // Default: the pin always reads as the freshly computed value (K): Start
             // computes a pin and every launch re-verifies against it.
             Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
-                .Returns(Task.FromResult<string?>("PIN"));
+                .Returns(Task.FromResult(TargetHashResult.Computed("PIN")));
         }
 
         public IMonitoringController CreateController() =>
@@ -385,7 +386,7 @@ public class GuardianOrchestratorTests
         // differ, so the launch is blocked fail-closed.
         int hashCalls = 0;
         h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult<string?>(hashCalls++ == 0 ? "PIN" : "BB"));
+            .Returns(_ => Task.FromResult(TargetHashResult.Computed(hashCalls++ == 0 ? "PIN" : "BB")));
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
@@ -409,25 +410,66 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
-    public async Task HashReadFailure_BlocksLaunch_FailClosed()
+    public async Task HashMissingAtLaunch_Degraded_NoLaunch_NoBudget_SessionSurvives()
     {
         using var h = new Harness();
-        // Pin at Start is readable; at first launch the hash cannot be read (null).
+        // Pin at Start is readable; at first launch the file is cleanly missing.
         int hashCalls = 0;
         h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult<string?>(hashCalls++ == 0 ? "PIN" : null));
+            .Returns(_ => Task.FromResult(hashCalls++ == 0 ? TargetHashResult.Computed("PIN") : TargetHashResult.Missing()));
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request());
         start.Started.Should().BeTrue();
 
-        await WaitUntilAsync(() => h.ToastTitles.Contains("Target Changed"),
-            "Target Changed toast after unreadable hash");
+        // Missing is distinct from Mismatch: no launch, degraded, no budget, no Error and no
+        // disable — the session keeps polling and the free launch stays pending.
+        await WaitUntilAsync(() => h.CheckCount >= 3,
+            "the loop to keep polling after a transiently-missing target");
+        await controller.StopAsync();
 
         await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-        h.Statuses.Should().Contain(GuardianStatus.Error);
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "a clean 'no file' is not a fatal hash mismatch (K)");
+        h.Statuses.Should().NotContain(GuardianStatus.Monitoring);
+        // The degraded free launch stays pending: the session is alive (Waiting) and has not
+        // spent budget, so the free initial launch remains available for the next cycle.
+        h.Statuses.Should().Contain(GuardianStatus.Waiting,
+            "the free initial launch stays pending while the target is degraded (K)");
+    }
+
+    [Fact]
+    public async Task HashReadErrorAtLaunch_Degraded_NoLaunch_NoBudget_NoError()
+    {
+        using var h = new Harness();
+        // Pin at Start is readable; at first launch the file cannot be opened (permission/IO).
+        int hashCalls = 0;
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(hashCalls++ == 0 ? TargetHashResult.Computed("PIN") : TargetHashResult.ReadError()));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.CheckCount >= 3,
+            "the loop to keep polling after a read-error target");
+        await controller.StopAsync();
+
+        await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "a permission/IO read failure is ReadError, not Mismatch (K)");
     }
 
     [Fact]
@@ -437,7 +479,7 @@ public class GuardianOrchestratorTests
         // The controller computes a fresh pin at Start and re-verifies at launch; both
         // read the same value, so the re-check matches (case-insensitively).
         h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult<string?>("AA"));
+            .Returns(Task.FromResult(TargetHashResult.Computed("AA")));
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
@@ -624,28 +666,46 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
-    public async Task Reconcile_WeakConfig_EmptyPin_Error_TargetConfirmationRequired()
+    public async Task Reconcile_EmptyPin_EditionScoped()
     {
         using var h = new Harness();
-        // Persisted enabled=true with a valid path but legacy empty pin: boot must
-        // surface Error requesting target confirmation (independent of EnableToasts).
+        // Persisted enabled=true with a valid path but legacy empty pin: the behavior is
+        // edition-scoped (K). Elevated blocks auto-resume with Error + "target confirmation
+        // required" (independent of EnableToasts); regular preserves the compatibility skip
+        // and resumes without a pin.
         h.Config.LoadAsync(Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(new AppSettings
             {
                 IsMonitoringEnabled = true,
                 TargetProcessPath = h.TargetPath,
                 TargetHashSha256 = string.Empty,
+                CheckIntervalSeconds = 1,
                 EnableToasts = false,
             }));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
 
         var controller = h.CreateController();
         await controller.ReconcileAsync();
 
-        h.Statuses.Should().Contain(GuardianStatus.Error);
-        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
-        controller.CurrentState.IsDegraded.Should().BeTrue();
-        controller.CurrentState.Reason.Should().Contain("pin");
-        _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        if (AppEdition.IsElevated)
+        {
+            h.Statuses.Should().Contain(GuardianStatus.Error);
+            controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+            controller.CurrentState.IsDegraded.Should().BeTrue();
+            controller.CurrentState.Reason.Should().Contain("pin");
+            _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+            // No pin is ever created automatically at boot: no hash is read.
+            _ = h.Integrity.DidNotReceive().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        }
+        else
+        {
+            // [preserve] Regular edition: empty legacy pin keeps the compatibility skip.
+            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+                "regular edition auto-resumes without a pin (compatibility skip)");
+            await controller.StopAsync();
+            h.Statuses.Should().Contain(GuardianStatus.Monitoring);
+        }
     }
 
     [Fact]

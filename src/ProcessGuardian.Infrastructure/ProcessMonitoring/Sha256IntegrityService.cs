@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using ProcessGuardian.Domain.Interfaces;
+using ProcessGuardian.Domain.ValueObjects;
 
 namespace ProcessGuardian.Infrastructure.ProcessMonitoring;
 
@@ -13,22 +14,31 @@ public sealed class Sha256IntegrityService : ITargetIntegrityService
         _logger = logger;
     }
 
-    public async Task<string?> ComputeHashAsync(string filePath, CancellationToken ct = default)
+    public async Task<TargetHashResult> ComputeHashAsync(string filePath, CancellationToken ct = default)
     {
         try
         {
             await using var stream = File.OpenRead(filePath);
             var hash = await SHA256.HashDataAsync(stream, ct);
-            return Convert.ToHexString(hash);
+            return TargetHashResult.Computed(Convert.ToHexString(hash));
         }
         catch (OperationCanceledException)
         {
             throw;
         }
+        catch (FileNotFoundException)
+        {
+            // A clean "no file" result — distinct from a permission/IO failure (K/E).
+            return TargetHashResult.Missing();
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return TargetHashResult.Missing();
+        }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
         {
             _logger.LogError(ex, "Failed to hash target file {Path}", filePath);
-            return null;
+            return TargetHashResult.ReadError();
         }
     }
 }
