@@ -8,4 +8,9 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.14" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.14" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Test seams (launch-gate hooks) and internal helpers are exercised by the
+         Application unit-test assembly without weakening encapsulation publicly. -->
+    <InternalsVisibleTo Include="ProcessGuardian.Application.Tests" />
+  </ItemGroup>
 </Project>

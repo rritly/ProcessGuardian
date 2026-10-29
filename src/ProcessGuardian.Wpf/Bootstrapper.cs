@@ -62,6 +62,7 @@ public static class Bootstrapper
 
         // Application
         services.AddSingleton<GuardianOrchestrator>();
+        services.AddSingleton<IMonitoringController>(sp => sp.GetRequiredService<GuardianOrchestrator>());
         services.AddHostedService(sp => sp.GetRequiredService<GuardianOrchestrator>());
 
         // Presentation

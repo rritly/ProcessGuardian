@@ -5,6 +5,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Entities;
+using ProcessGuardian.Domain.Exceptions;
 using ProcessGuardian.Domain.Interfaces;
 using ProcessGuardian.Infrastructure.Recovery;
 using ProcessGuardian.Infrastructure.Security;
@@ -448,7 +449,7 @@ public sealed class JsonConfigurationStore : IConfigurationStore
         try
         {
             if (_current != null)
-                return _current;
+                return Clone(_current);
 
             if (_isElevated)
             {
@@ -461,7 +462,7 @@ public sealed class JsonConfigurationStore : IConfigurationStore
             {
                 _logger.LogInformation("Config file not found, returning defaults");
                 _current = new AppSettings();
-                return _current;
+                return Clone(_current);
             }
 
             try
@@ -472,28 +473,28 @@ public sealed class JsonConfigurationStore : IConfigurationStore
                 {
                     _logger.LogWarning("Config file deserialized to null, returning defaults");
                     _current = new AppSettings();
-                    return _current;
+                    return Clone(_current);
                 }
                 _current = settings;
-                return _current;
+                return Clone(_current);
             }
             catch (JsonException ex)
             {
                 _logger.LogError(ex, "Config file contains invalid JSON, returning defaults");
                 _current = new AppSettings();
-                return _current;
+                return Clone(_current);
             }
             catch (IOException ex)
             {
                 _logger.LogError(ex, "IO error reading config file, returning defaults");
                 _current = new AppSettings();
-                return _current;
+                return Clone(_current);
             }
             catch (UnauthorizedAccessException ex)
             {
                 _logger.LogError(ex, "Access denied reading config file, returning defaults");
                 _current = new AppSettings();
-                return _current;
+                return Clone(_current);
             }
         }
         finally
@@ -534,7 +535,7 @@ public sealed class JsonConfigurationStore : IConfigurationStore
                 if (_fs.Classify(_path, isDirectory: false) != ProtectionClassification.Trusted)
                     throw RefuseUnavailable("the replaced settings file did not verify as protected; refusing the save");
 
-                _current = settings;
+                _current = Clone(settings);
             }
             catch (ConfigurationUnavailableException)
             {
@@ -571,7 +572,7 @@ public sealed class JsonConfigurationStore : IConfigurationStore
             var json = JsonSerializer.Serialize(settings, _options);
             await File.WriteAllTextAsync(tmpPath, json, ct);
             File.Move(tmpPath, _path, overwrite: true);
-            _current = settings;
+            _current = Clone(settings);
         }
         catch (OperationCanceledException)
         {
@@ -608,6 +609,23 @@ public sealed class JsonConfigurationStore : IConfigurationStore
             // Best-effort; the stale quarantine path keeps the next save safe.
         }
     }
+
+    // Independent-copy contract (D): every LoadAsync returns a fresh object so no caller
+    // can mutate the store's cached document, and SaveAsync never keeps a mutable
+    // reference to a caller-supplied document.
+    private static AppSettings Clone(AppSettings s) => new()
+    {
+        TargetProcessPath = s.TargetProcessPath,
+        TargetHashSha256 = s.TargetHashSha256,
+        CheckIntervalSeconds = s.CheckIntervalSeconds,
+        InitialDelaySeconds = s.InitialDelaySeconds,
+        MaxRestartAttempts = s.MaxRestartAttempts,
+        RestartDelaySeconds = s.RestartDelaySeconds,
+        StartupVerificationTimeoutSeconds = s.StartupVerificationTimeoutSeconds,
+        AutostartEnabled = s.AutostartEnabled,
+        IsMonitoringEnabled = s.IsMonitoringEnabled,
+        EnableToasts = s.EnableToasts,
+    };
 
     private string ParentDirectory() =>
         Path.GetDirectoryName(_dir) ?? throw RefuseUnavailable("the config directory has no parent");

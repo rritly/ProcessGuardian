@@ -1,4 +1,4 @@
-namespace ProcessGuardian.Infrastructure.Configuration;
+namespace ProcessGuardian.Domain.Exceptions;
 
 /// <summary>
 /// Dedicated exception for the unsafe-location config state (reparse indirection,

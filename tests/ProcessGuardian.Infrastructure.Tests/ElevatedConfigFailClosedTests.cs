@@ -3,6 +3,7 @@ using System.Text.Json;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using ProcessGuardian.Domain.Entities;
+using ProcessGuardian.Domain.Exceptions;
 using ProcessGuardian.Domain.Interfaces;
 using ProcessGuardian.Infrastructure.Configuration;
 using ProcessGuardian.Infrastructure.Recovery;

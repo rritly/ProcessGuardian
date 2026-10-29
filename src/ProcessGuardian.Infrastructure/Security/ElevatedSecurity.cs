@@ -4,6 +4,7 @@ using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
+using ProcessGuardian.Domain.Exceptions;
 using ProcessGuardian.Infrastructure.Configuration;
 
 namespace ProcessGuardian.Infrastructure.Security;

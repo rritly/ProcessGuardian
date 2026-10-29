@@ -5,23 +5,28 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
+using ProcessGuardian.Application.Services;
 using ProcessGuardian.Domain.Entities;
 using ProcessGuardian.Domain.Enums;
+using ProcessGuardian.Domain.Exceptions;
 using ProcessGuardian.Domain.Interfaces;
-using ProcessGuardian.Infrastructure.Configuration;
 using ProcessGuardian.Infrastructure.Logging;
 
 namespace ProcessGuardian.Wpf.ViewModels;
 
+/// <summary>
+/// UI projection of the controller-owned monitoring state. All persistence — the
+/// debounced save, Start/Stop, and the exit path — flows through
+/// <see cref="IMonitoringController"/>; this ViewModel never writes the store or the
+/// autostart service directly (C+D). The target pin is computed and stored by the
+/// controller, not here.
+/// </summary>
 public partial class MainViewModel : ObservableObject
 {
-    private readonly IConfigurationStore _configStore;
-    private readonly IAutostartService _autostart;
-    private readonly IStatusReporter _statusReporter;
+    private readonly IMonitoringController _controller;
     private readonly INotificationService _notifications;
     private readonly ILogger<MainViewModel> _logger;
     private readonly InMemoryLogSink _logSink;
-    private readonly ITargetIntegrityService _integrity;
 
     // Track previous settings to unsubscribe from PropertyChanged on replacement.
     private AppSettings? _previousSettings;
@@ -33,6 +38,9 @@ public partial class MainViewModel : ObservableObject
     [NotifyCanExecuteChangedFor(nameof(StartCommand))]
     [NotifyCanExecuteChangedFor(nameof(StopCommand))]
     private GuardianStatus _status = GuardianStatus.Stopped;
+
+    [ObservableProperty]
+    private bool _isDegraded;
 
     [ObservableProperty]
     private string _logText = string.Empty;
@@ -49,7 +57,8 @@ public partial class MainViewModel : ObservableObject
     private CancellationTokenSource? _saveCts;
 
     // Busy gate for Start/Stop, shared by the window buttons and the tray menu: held
-    // until the orchestrator settles Status, so re-clicks are ignored, not queued.
+    // until the controller settles Status, so re-clicks are ignored, not queued. The
+    // controller serializes internally; this gate is a UX convenience, not the only guard.
     private bool _startStopInProgress;
 
     private enum PendingOperation { None, Start, Stop }
@@ -57,45 +66,43 @@ public partial class MainViewModel : ObservableObject
     private PendingOperation _pendingOperation = PendingOperation.None;
     private TaskCompletionSource<bool>? _statusReady;
 
-    // Failsafe: if Status never settles (orchestrator stuck or errored), the gate is
+    // Failsafe: if Status never settles (controller stuck or errored), the gate is
     // released after this timeout so the user can retry.
     private static readonly TimeSpan BusyFailsafeTimeout = TimeSpan.FromSeconds(10);
-
-    // Set during a user Exit: saves still persist JSON but must never re-sync the
-    // HKCU autostart key (that would re-add it when JSON AutostartEnabled is true).
-    private bool _suppressAutostartSync;
 
     // Set while the initial load assigns Settings: the subscription is wired, but the
     // debounced save must not rewrite settings.json right after it was loaded.
     private bool _suppressSave;
 
     public MainViewModel(
-        IConfigurationStore configStore,
-        IAutostartService autostart,
-        IStatusReporter statusReporter,
+        IMonitoringController controller,
         INotificationService notifications,
         ILogger<MainViewModel> logger,
-        InMemoryLogSink logSink,
-        ITargetIntegrityService integrity)
+        InMemoryLogSink logSink)
     {
-        _configStore = configStore;
-        _autostart = autostart;
-        _statusReporter = statusReporter;
+        _controller = controller;
         _notifications = notifications;
         _logger = logger;
         _logSink = logSink;
-        _integrity = integrity;
 
-        // Marshal status events to UI thread
-        _statusReporter.StatusChanged += (s, e) =>
-            OnDispatcher(() => Status = e);
+        // Project the controller state channel onto the bindings (C+D). The tray keeps
+        // its own subscription through IStatusReporter.
+        _controller.StateChanged += (s, state) =>
+            OnDispatcher(() =>
+            {
+                Status = state.Status;
+                IsDegraded = state.IsDegraded;
+                if (state.SaveFailed)
+                    _logger.LogError("Monitoring state: save failed ({Reason})", state.Reason);
+            });
 
         // Update log text when new entries arrive
         _logSink.LogUpdated += (_, __) =>
             OnDispatcher(() => LogText = _logSink.GetRecentLogs(200));
 
-        // Sync current state from background so a late-opened window is not stale.
-        Status = _statusReporter.Current;
+        // Sync current state from the controller so a late-opened window is not stale.
+        Status = _controller.CurrentState.Status;
+        IsDegraded = _controller.CurrentState.IsDegraded;
         LogText = _logSink.GetRecentLogs(200);
 
         _ = LoadSettingsAsync();
@@ -111,7 +118,7 @@ public partial class MainViewModel : ObservableObject
     }
 
     // Generated partial hook (CommunityToolkit.Mvvm): completes the in-flight
-    // readiness wait once the orchestrator settles the expected status.
+    // readiness wait once the controller settles the expected status.
     partial void OnStatusChanged(GuardianStatus value)
     {
         if (_statusReady is null)
@@ -121,7 +128,7 @@ public partial class MainViewModel : ObservableObject
             _statusReady.TrySetResult(true);
     }
 
-    // True when the orchestrator settled the status expected for the in-flight operation:
+    // True when the controller settled the status expected for the in-flight operation:
     // Start -> Monitoring/Waiting/Restarting/Error; Stop -> Stopped/Error.
     private bool IsSettled(GuardianStatus value)
     {
@@ -152,7 +159,7 @@ public partial class MainViewModel : ObservableObject
     {
         try
         {
-            var loaded = await _configStore.LoadAsync();
+            var loaded = await _controller.GetCurrentSettingsAsync();
             _suppressSave = true;
             try
             {
@@ -162,17 +169,11 @@ public partial class MainViewModel : ObservableObject
             {
                 _suppressSave = false;
             }
-
-            // settings.json AutostartEnabled is the source of truth (never overwrite it
-            // from the registry); (re)write the Run key so it survives a previous Exit.
-            // Off the dispatcher: the elevated edition spawns schtasks.exe here.
-            if (Settings.AutostartEnabled)
-                await Task.Run(() => _autostart.SetEnabledAsync(true, CancellationToken.None));
         }
         catch (ConfigurationUnavailableException ex)
         {
-            // A refused store is an ordinary Error path, never a fatal crash: no settings
-            // object exists, monitoring must not start, and the user is pointed to recovery.
+            // A refused store is an ordinary Error path, never a fatal crash: the user is
+            // pointed to recovery and monitoring must not start.
             _logger.LogError(ex, "Configuration store refused on load");
             ConfigurationError = ex.Guidance ?? "Configuration is unavailable; apply the guidance and restart.";
             Settings = new AppSettings();
@@ -213,6 +214,9 @@ public partial class MainViewModel : ObservableObject
         ScheduleSave();
     }
 
+    private CommittedSettingsSnapshot CommitSnapshot() =>
+        CommittedSettingsSnapshot.From(Settings);
+
     [RelayCommand(CanExecute = nameof(CanStart))]
     private async Task Start()
     {
@@ -220,54 +224,27 @@ public partial class MainViewModel : ObservableObject
             return;
         try
         {
-            // Pin the hash BEFORE enabling monitoring: the orchestrator polls the shared
-            // settings instance, so enabling first would expose the stale pin inside its
-            // config-poll window and could trigger a false "Target Changed" block.
-            if (!await PinTargetHashAsync())
+            // The controller validates the path, computes the pin, persists canonical path
+            // + pin + enabled together, and only then starts the session (C+D/K).
+            var request = new StartRequest(CommitSnapshot(), Settings.TargetProcessPath);
+            var result = await _controller.StartAsync(request);
+            if (!result.Started)
             {
-                _logger.LogWarning("Start aborted: target {Path} could not be hashed", Settings.TargetProcessPath);
+                _logger.LogWarning("Start rejected: {Reason}", result.Reason);
                 if (Settings.EnableToasts)
-                    _ = _notifications.ShowAsync("Target Unreadable", string.Empty);
-                return; // fail-closed: monitoring stays off, the previous pin is kept
+                    _ = _notifications.ShowAsync("Monitoring Not Started", result.Reason ?? string.Empty);
+                return; // fail-closed: no session, no loop
             }
 
-            Settings.IsMonitoringEnabled = true;
-            _logger.LogInformation("Start Monitoring: enabled={Enabled}, path={Path}", Settings.IsMonitoringEnabled, Settings.TargetProcessPath);
+            _logger.LogInformation("Start Monitoring: path={Path}", Settings.TargetProcessPath);
             if (Settings.EnableToasts)
                 _ = _notifications.ShowAsync("Monitoring Started", string.Empty);
-            await FlushNowAsync();
             await WaitUntilReadyAsync();
         }
         finally
         {
             EndOperation();
         }
-    }
-
-    // Records (or re-records) the target hash on every Start: recovery restarts are
-    // verified against this pin, so re-enabling monitoring is the explicit
-    // re-confirmation after a "Target Changed" block. Returns false when the target
-    // cannot be read: Start must then fail closed (no monitoring without a pin).
-    private async Task<bool> PinTargetHashAsync()
-    {
-        if (string.IsNullOrWhiteSpace(Settings.TargetProcessPath))
-        {
-            Settings.TargetHashSha256 = string.Empty;
-            return true;
-        }
-
-        var hash = await _integrity.ComputeHashAsync(Settings.TargetProcessPath);
-        if (hash is null)
-        {
-            // Fail-closed: without a fresh hash there is no pin to verify restarts
-            // against. Keep the previous pin untouched; monitoring stays off.
-            _logger.LogWarning("Failed to hash target {Path}; Start aborted", Settings.TargetProcessPath);
-            return false;
-        }
-
-        if (!string.Equals(Settings.TargetHashSha256, hash, StringComparison.OrdinalIgnoreCase))
-            Settings.TargetHashSha256 = hash; // PropertyChanged -> debounced save; Start also flushes immediately.
-        return true;
     }
 
     [RelayCommand(CanExecute = nameof(CanStop))]
@@ -277,11 +254,16 @@ public partial class MainViewModel : ObservableObject
             return;
         try
         {
-            Settings.IsMonitoringEnabled = false;
-            _logger.LogInformation("Stop Monitoring: enabled={Enabled}, path={Path}", Settings.IsMonitoringEnabled, Settings.TargetProcessPath);
+            _logger.LogInformation("Stop Monitoring: path={Path}", Settings.TargetProcessPath);
             if (Settings.EnableToasts)
                 _ = _notifications.ShowAsync("Monitoring Stopped", string.Empty);
-            await FlushNowAsync();
+            var result = await _controller.StopAsync(CommitSnapshot());
+            if (result.RuntimeStopped && !result.SettingsSaved)
+            {
+                // No durably persisted off-state; the runtime is stopped but the UI must
+                // not present an unqualified success (C+D/F).
+                _logger.LogError(result.PersistenceError, "Stop: runtime stopped but enabled=false was not persisted");
+            }
             await WaitUntilReadyAsync();
         }
         finally
@@ -317,12 +299,12 @@ public partial class MainViewModel : ObservableObject
         StopCommand.NotifyCanExecuteChanged();
     }
 
-    // Waits asynchronously until the orchestrator settles Status for the accepted
+    // Waits asynchronously until the controller settles Status for the accepted
     // operation, or until the failsafe timeout releases the busy gate.
     private async Task WaitUntilReadyAsync()
     {
-        // Status may already be settled (e.g. a direct ExecuteAsync call); check
-        // first so we do not wait for a change that will never arrive.
+        // Status may already be settled; check first so we do not wait for a change
+        // that will never arrive.
         if (IsSettled(Status))
             return;
 
@@ -332,15 +314,6 @@ public partial class MainViewModel : ObservableObject
         {
             _logger.LogWarning("Start/Stop readiness not reached within {Timeout}; releasing busy gate", BusyFailsafeTimeout);
         }
-    }
-
-    // Cancel the pending debounce and persist immediately so the orchestrator sees the
-    // flag without waiting; the returned task is awaited to keep the busy gate held.
-    private Task FlushNowAsync()
-    {
-        _saveCts?.Cancel();
-        _saveCts = new CancellationTokenSource();
-        return Task.Run(FlushSaveAsync);
     }
 
     private bool CanStart => !_startStopInProgress
@@ -361,6 +334,9 @@ public partial class MainViewModel : ObservableObject
             if (dialog.ShowDialog() == true)
             {
                 Settings.TargetProcessPath = dialog.FileName;
+                // A committed path change in the stopped state clears the pin through the
+                // controller; keystrokes (uncommitted draft) do not.
+                _ = CommitNowAsync();
             }
         }
         catch (Exception ex)
@@ -408,7 +384,9 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    // Debounced persist: save 500 ms after the last settings change.
+    // Debounced persist: commit 500 ms after the last settings change, through the
+    // controller (single writer). The controller rejects a target-path change while a
+    // session is active, so a late debounced save can never retarget a running session.
     private void ScheduleSave()
     {
         _saveCts?.Cancel();
@@ -419,41 +397,50 @@ public partial class MainViewModel : ObservableObject
             try
             {
                 await Task.Delay(500, token);
-                await FlushSaveAsync();
+                await CommitNowAsync();
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Background save failed");
+                _logger.LogError(ex, "Background commit failed");
             }
         }, token);
     }
 
-    private async Task FlushSaveAsync()
+    // Cancel the pending debounce and commit immediately so the controller persists the
+    // latest committed fields; the returned task is awaited to keep the busy gate held.
+    private Task CommitNowAsync()
+    {
+        _saveCts?.Cancel();
+        _saveCts = new CancellationTokenSource();
+        return Task.Run(CommitAsync);
+    }
+
+    private async Task CommitAsync()
     {
         try
         {
-            await _configStore.SaveAsync(Settings, CancellationToken.None);
-            if (!_suppressAutostartSync && Settings.AutostartEnabled != await _autostart.IsEnabledAsync(CancellationToken.None))
-                await _autostart.SetEnabledAsync(Settings.AutostartEnabled, CancellationToken.None);
+            await _controller.CommitSettingsAsync(CommitSnapshot(), Settings.TargetProcessPath);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Background save failed");
+            _logger.LogError(ex, "Settings commit failed");
         }
     }
 
-    // Stop monitoring and persist before the process exits; on a user Exit also remove
-    // the HKCU autostart key. JSON AutostartEnabled is intentionally NOT changed.
+    // Stop monitoring and persist before the process exits; on a user Exit the target is
+    // stopped through the controller (which also removes the autostart registration
+    // following the persisted AutostartEnabled flag).
     public async Task StopMonitoringAndSaveAsync()
     {
         try
         {
-            _suppressAutostartSync = true;
-            Settings.IsMonitoringEnabled = false;
             _saveCts?.Cancel();
-            await _configStore.SaveAsync(Settings, CancellationToken.None);
-            await _autostart.SetEnabledAsync(false, CancellationToken.None);
+            await _controller.StopAsync(CommitSnapshot());
         }
         catch (Exception ex)
         {
@@ -469,16 +456,12 @@ public partial class MainViewModel : ObservableObject
             _previousSettings.PropertyChanged -= OnSettingsPropertyChanged;
         try
         {
-            await _configStore.SaveAsync(Settings);
+            _logSink.Flush();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Final save on dispose failed");
+            _logger.LogError(ex, "Log flush on dispose failed");
         }
-        finally
-        {
-            // Write pending (throttled) log entries before the process exits.
-            _logSink.Flush();
-        }
+        await Task.CompletedTask;
     }
 }

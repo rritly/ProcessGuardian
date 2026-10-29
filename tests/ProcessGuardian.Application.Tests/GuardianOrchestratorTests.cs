@@ -12,6 +12,10 @@ using Xunit;
 
 namespace ProcessGuardian.Application.Tests;
 
+// Controller-driven orchestration tests (C+D). The monitoring session is started and
+// stopped exclusively through IMonitoringController; the orchestrator's hosted
+// lifecycle (Reconcile + idle) is exercised by the reconcile/boot tests, while the
+// check-loop behaviour is driven through StartAsync(StartRequest).
 public class GuardianOrchestratorTests
 {
     private const int TimeoutMs = 10000;
@@ -22,18 +26,21 @@ public class GuardianOrchestratorTests
         // paths whose file does not exist before any monitor call happens.
         public string TargetPath { get; }
 
-        public AppSettings Settings { get; }
-
         public IProcessMonitor Monitor { get; } = Substitute.For<IProcessMonitor>();
         public IConfigurationStore Config { get; } = Substitute.For<IConfigurationStore>();
         public INotificationService Notifications { get; } = Substitute.For<INotificationService>();
         public IStatusReporter Status { get; } = Substitute.For<IStatusReporter>();
         public ITargetIntegrityService Integrity { get; } = Substitute.For<ITargetIntegrityService>();
+        public IAutostartService Autostart { get; } = Substitute.For<IAutostartService>();
 
         public ConcurrentBag<GuardianStatus> Statuses { get; } = new();
         public ConcurrentBag<string> ToastTitles { get; } = new();
         public int LoadCount { get; set; }
         public int CheckCount { get; set; }
+        public int StartCallCount { get; set; }
+
+        // Set when the first launch critical section is entered (used by launch-gate tests).
+        public bool MonitorInitialLaunchCalled { get; set; }
 
         public Harness()
         {
@@ -42,24 +49,18 @@ public class GuardianOrchestratorTests
             TargetPath = Path.Combine(dir, "target.exe");
             File.WriteAllText(TargetPath, string.Empty);
 
-            Settings = new AppSettings
-            {
-                IsMonitoringEnabled = true,
-                TargetProcessPath = TargetPath,
-                InitialDelaySeconds = 0,
-                CheckIntervalSeconds = 1,
-                RestartDelaySeconds = 1,
-                StartupVerificationTimeoutSeconds = 1,
-                MaxRestartAttempts = 5,
-            };
-
             Config.LoadAsync(Arg.Any<CancellationToken>())
                 .Returns(_ =>
                 {
                     LoadCount++;
-                    return Task.FromResult(Settings);
+                    return Task.FromResult(new AppSettings());
                 });
-
+            Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+                .Returns(Task.CompletedTask);
+            Autostart.IsEnabledAsync(Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult(false));
+            Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
+                .Returns(Task.CompletedTask);
             Status.Report(Arg.Do<GuardianStatus>(s => Statuses.Add(s)));
 
             Notifications.ShowAsync(
@@ -67,24 +68,36 @@ public class GuardianOrchestratorTests
                     Arg.Any<string>(),
                     Arg.Any<CancellationToken>())
                 .Returns(Task.CompletedTask);
+
+            // Default: the pin always reads as the freshly computed value (K): Start
+            // computes a pin and every launch re-verifies against it.
+            Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult<string?>("PIN"));
         }
 
-        public GuardianOrchestrator CreateOrchestrator() =>
-            new(Monitor, Config, Notifications, NullLogger<GuardianOrchestrator>.Instance, Status, Integrity);
+        public IMonitoringController CreateController() =>
+            new GuardianOrchestrator(
+                Monitor, Config, Notifications, NullLogger<GuardianOrchestrator>.Instance,
+                Status, Integrity, Autostart);
 
-        public static async Task RunAsync(GuardianOrchestrator orchestrator, CancellationTokenSource cts, Func<Task> body)
+        public StartRequest Request(
+            int maxRestarts = 5,
+            int checkInterval = 1,
+            int restartDelay = 1,
+            int startupTimeout = 1,
+            int initialDelay = 0,
+            bool enableToasts = true)
         {
-            await orchestrator.StartAsync(cts.Token);
-            try
+            var s = new AppSettings
             {
-                await body();
-            }
-            finally
-            {
-                cts.Cancel();
-                await orchestrator.StopAsync(CancellationToken.None);
-                orchestrator.Dispose();
-            }
+                MaxRestartAttempts = maxRestarts,
+                CheckIntervalSeconds = checkInterval,
+                RestartDelaySeconds = restartDelay,
+                StartupVerificationTimeoutSeconds = startupTimeout,
+                InitialDelaySeconds = initialDelay,
+                EnableToasts = enableToasts,
+            };
+            return new StartRequest(CommittedSettingsSnapshot.From(s), TargetPath);
         }
 
         public void Dispose()
@@ -113,28 +126,33 @@ public class GuardianOrchestratorTests
         throw new Xunit.Sdk.XunitException($"Timed out waiting for: {failureMessage}");
     }
 
+    private static async Task StartSessionAsync(IMonitoringController controller, Harness h)
+    {
+        var result = await controller.StartAsync(h.Request());
+        result.Started.Should().BeTrue("the session must start in this harness");
+    }
+
     [Fact]
     public async Task Stop_DuringInitialDelay_ExitsPromptly_DoesNotWaitFullDelay()
     {
         using var h = new Harness();
-        h.Settings.InitialDelaySeconds = 999; // would pin the orchestrator in Waiting for ~16 min
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Waiting),
-                "Status Waiting to be reported during the initial delay");
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(initialDelay: 999));
+        start.Started.Should().BeTrue();
 
-            // User stops monitoring mid-delay: the sliced wait must notice quickly.
-            h.Settings.IsMonitoringEnabled = false;
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Stopped),
-                "Status Stopped to be reported shortly after Stop");
-        });
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Waiting),
+            "Status Waiting to be reported during the initial delay");
 
-        // The cycle must have exited long before the 999 s delay elapsed.
+        // User stops monitoring mid-delay: the session is cancelled promptly.
+        var stop = await controller.StopAsync();
+        stop.RuntimeStopped.Should().BeTrue();
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Stopped),
+            "Status Stopped to be reported shortly after Stop");
+
+        // The session must have exited long before the 999 s delay elapsed.
         _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
 
@@ -142,38 +160,37 @@ public class GuardianOrchestratorTests
     public async Task FailedLaunch_HonorsRestartDelay_BetweenAttempts()
     {
         using var h = new Harness();
-        h.Settings.MaxRestartAttempts = 0; // infinite attempts
-        h.Settings.RestartDelaySeconds = 2;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(false));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Restarting),
-                "first budgeted restart to begin");
-            await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Count(c =>
-                    c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)) >= 2,
-                "free launch plus first budgeted attempt to have run");
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 0, restartDelay: 2));
+        start.Started.Should().BeTrue();
 
-            await Task.Delay(1200);
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Restarting),
+            "first budgeted restart to begin");
+        await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Count(c =>
+                c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)) >= 2,
+            "free launch plus first budgeted attempt to have run");
 
-            // RestartDelaySeconds (2 s) has not elapsed since the failed launch, so no
-            // further attempt is allowed; the old behavior re-attempted every
-            // CheckInterval (1 s) and would already have made a third launch.
-            h.Monitor.ReceivedCalls().Count(c =>
-                    c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync))
-                .Should().Be(2, "RestartDelaySeconds must be honored between failed launches");
-        });
+        await Task.Delay(1200);
+
+        // RestartDelaySeconds (2 s) has not elapsed since the failed launch, so no
+        // further attempt is allowed; the old behavior re-attempted every
+        // CheckInterval (1 s) and would already have made a third launch.
+        h.Monitor.ReceivedCalls().Count(c =>
+                c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync))
+            .Should().Be(2, "RestartDelaySeconds must be honored between failed launches");
+
+        await controller.StopAsync();
     }
 
     [Fact]
     public async Task UnknownCheck_SkipsCycle_NoRestart_NoStatusFlip()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
@@ -181,25 +198,25 @@ public class GuardianOrchestratorTests
                 return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
             });
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.CheckCount >= 3,
-                "the loop to keep polling after Unknown results");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
 
-        // Unknown must never look like "dead": no restart, no status flip.
+        await WaitUntilAsync(() => h.CheckCount >= 3,
+            "the loop to keep polling after Unknown results");
+        await controller.StopAsync();
+
+        // Unknown must never look like "dead": no restart, no status flip, no disable.
         _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         h.Statuses.Should().NotContain(GuardianStatus.Monitoring);
         h.Statuses.Should().NotContain(GuardianStatus.Error);
-        h.Settings.IsMonitoringEnabled.Should().BeTrue("an unknown check must not disable monitoring");
+        h.Statuses.Should().NotContain(GuardianStatus.Restarting);
     }
 
     [Fact]
     public async Task UnknownThenRunning_RecoversNormally_NoRestart()
     {
-        var h = new Harness();
+        using var h = new Harness();
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
@@ -208,13 +225,13 @@ public class GuardianOrchestratorTests
                     h.CheckCount <= 2 ? ProcessOutcome.Unknown : ProcessOutcome.Running, 42));
             });
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-                "Monitoring status once the state is determinable again");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Monitoring status once the state is determinable again");
+        await controller.StopAsync();
 
         // Transient enumeration failures must not consume the restart budget or
         // trigger launches: the target was likely running all along.
@@ -229,13 +246,13 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-                "Status Monitoring to be reported");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Status Monitoring to be reported");
+        await controller.StopAsync();
 
         await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         h.Statuses.Should().Contain(GuardianStatus.Monitoring);
@@ -245,8 +262,6 @@ public class GuardianOrchestratorTests
     public async Task TargetMissing_RestartTriggered_RecoveryToast_StatusMonitoring()
     {
         using var h = new Harness();
-        // Target is running initially, then goes missing: the recovery is a real
-        // budgeted restart (not the free initial launch), so a Recovered toast fires.
         bool running = true;
         int checkCount = 0;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
@@ -261,17 +276,17 @@ public class GuardianOrchestratorTests
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            // Let the first check see the target running (monitoring established).
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring) && checkCount >= 1,
-                "Initial Monitoring status");
-            running = false;
-            await WaitUntilAsync(() => h.ToastTitles.Any(t => t.Contains("Recovered")),
-                "Recovered toast to be shown");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        // Let the first check see the target running (monitoring established).
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring) && checkCount >= 1,
+            "Initial Monitoring status");
+        running = false;
+        await WaitUntilAsync(() => h.ToastTitles.Any(t => t.Contains("Recovered")),
+            "Recovered toast to be shown");
+        await controller.StopAsync();
 
         await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         await h.Monitor.Received(1).VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
@@ -285,28 +300,25 @@ public class GuardianOrchestratorTests
     public async Task Exhaustion_SetsError_DisablesMonitoring_NoAutoRestart()
     {
         using var h = new Harness();
-        h.Settings.MaxRestartAttempts = 3;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(false));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error),
-                "Status Error to be reported");
-            await WaitUntilAsync(() => h.ToastTitles.Any(t => t.Contains("Failed") || t.Contains("attempt")),
-                "Failed/exhaustion toast to be shown");
-            await WaitUntilAsync(() => h.Config.ReceivedCalls().Any(c =>
-                c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync)),
-                "SaveAsync to be called to persist disabled state");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 3));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error),
+            "Status Error to be reported");
+        await WaitUntilAsync(() => h.ToastTitles.Any(t => t.Contains("Failed") || t.Contains("attempt")),
+            "Failed/exhaustion toast to be shown");
+        await WaitUntilAsync(() => h.Config.ReceivedCalls().Any(c =>
+            c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync)),
+            "SaveAsync to be called to persist disabled state");
 
         h.Statuses.Should().Contain(GuardianStatus.Error);
         h.ToastTitles.Should().Contain(t => t.Contains("Failed") || t.Contains("attempt"));
-        h.Settings.IsMonitoringEnabled.Should().BeFalse();
         // First Start is the free initial launch; then Max=3 budgeted attempts, then exhaustion.
         await h.Monitor.Received(4).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
@@ -315,41 +327,34 @@ public class GuardianOrchestratorTests
     public async Task NewStartAfterError_RestoresFullAttemptBudget()
     {
         using var h = new Harness();
-        h.Settings.MaxRestartAttempts = 1;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(false));
+            .Returns(_ => { h.StartCallCount++; return Task.FromResult(false); });
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            // First session: one free initial launch + one budgeted attempt (Max=1), then Error.
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error) && !h.Settings.IsMonitoringEnabled,
-                "First session to exhaust and disable monitoring");
-            await h.Monitor.Received(2).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1));
+        start.Started.Should().BeTrue();
 
-            // User Start again: full budget restored -> one free launch + one attempt (Max=1).
-            // Wait for the exhausted cycle to fully exit and the outer loop to observe
-            // the disabled flag, so the next Start grants a free launch.
-            var loadsAfterExhaustion = h.LoadCount;
-            await WaitUntilAsync(() => h.LoadCount >= loadsAfterExhaustion + 2,
-                "exhausted cycle to exit (two config loads: slice + outer loop)");
-            h.Monitor.ClearReceivedCalls();
-            h.Settings.IsMonitoringEnabled = true;
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error) && !h.Settings.IsMonitoringEnabled,
-                "Second session to exhaust and disable monitoring");
+        // First session: one free initial launch + one budgeted attempt (Max=1), then Error.
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error),
+            "First session to exhaust");
+        await WaitUntilAsync(() => h.StartCallCount == 2, "first session launches (free + budgeted)");
 
-            await h.Monitor.Received(2).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-        });
+        // A brand-new Start restores the full budget: one free launch + attempt (Max=1),
+        // then Error again. The counter must not leak from the previous session.
+        h.Monitor.ClearReceivedCalls();
+        h.StartCallCount = 0;
+        var start2 = await controller.StartAsync(h.Request(maxRestarts: 1));
+        start2.Started.Should().BeTrue();
+        await WaitUntilAsync(() => h.StartCallCount == 2, "second session launches (free + budgeted)");
+        await h.Monitor.Received(2).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
     public async Task FirstStart_ConsumesNoAttempts_StatusMonitoring_NoExhaustion()
     {
         using var h = new Harness();
-        h.Settings.MaxRestartAttempts = 1;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
@@ -357,156 +362,125 @@ public class GuardianOrchestratorTests
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Any(c =>
-                    c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)),
-                "First StartAsync to be called");
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-                "Monitoring status after initial launch");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Any(c =>
+                c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)),
+            "First StartAsync to be called");
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Monitoring status after initial launch");
+        await controller.StopAsync();
 
         await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-        h.Settings.IsMonitoringEnabled.Should().BeTrue();
         h.Statuses.Should().NotContain(GuardianStatus.Error);
     }
 
     [Fact]
-    public async Task FirstStart_Free_ThenBudgetConsumed_Error()
+    public async Task HashMismatch_LaunchBlocked_MonitoringDisabled_TargetChangedToast()
     {
         using var h = new Harness();
-        h.Settings.MaxRestartAttempts = 1;
+        // The pin captured at Start ("PIN") and the value read at first launch ("BB")
+        // differ, so the launch is blocked fail-closed.
+        int hashCalls = 0;
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<string?>(hashCalls++ == 0 ? "PIN" : "BB"));
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(false));
+            .Returns(Task.FromResult(true));
+        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error) && !h.Settings.IsMonitoringEnabled,
-                "Exhaustion after free initial launch plus one budgeted attempt");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
 
-        // Exactly one free initial launch + one budgeted attempt (Max=1), then Error; no third StartAsync.
-        await h.Monitor.Received(2).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        await WaitUntilAsync(() => h.ToastTitles.Contains("Target Changed"),
+            "Target Changed toast to be shown");
+        await WaitUntilAsync(() => h.Config.ReceivedCalls().Any(c =>
+            c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync)),
+            "SaveAsync to persist the disabled state");
+
+        await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().Contain(GuardianStatus.Error);
+        h.ToastTitles.Should().Contain("Target Changed");
+    }
+
+    [Fact]
+    public async Task HashReadFailure_BlocksLaunch_FailClosed()
+    {
+        using var h = new Harness();
+        // Pin at Start is readable; at first launch the hash cannot be read (null).
+        int hashCalls = 0;
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<string?>(hashCalls++ == 0 ? "PIN" : null));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.ToastTitles.Contains("Target Changed"),
+            "Target Changed toast after unreadable hash");
+
+        await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         h.Statuses.Should().Contain(GuardianStatus.Error);
     }
 
     [Fact]
-    public async Task ProtectedProcess_TargetNotRunning_RestartTriggered()
+    public async Task HashMatches_LaunchProceeds_StatusMonitoring()
     {
         using var h = new Harness();
-        // Target is running initially, then goes missing: recovery is a real budgeted
-        // restart (not the free initial launch), so a Recovered toast fires.
-        bool running = true;
-        int checkCount = 0;
+        // The controller computes a fresh pin at Start and re-verifies at launch; both
+        // read the same value, so the re-check matches (case-insensitively).
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<string?>("AA"));
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ =>
-            {
-                checkCount++;
-                if (checkCount == 1) return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42));
-                return Task.FromResult(new ProcessCheckResult(running ? ProcessOutcome.Running : ProcessOutcome.NotRunning));
-            });
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => { running = true; return Task.FromResult(true); });
+            .Returns(Task.FromResult(true));
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring) && checkCount >= 1,
-                "Initial Monitoring status");
-            running = false;
-            await WaitUntilAsync(() => h.ToastTitles.Any(t => t.Contains("Recovered")),
-                "Recovered toast to be shown");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
 
-        await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-    }
-
-    [Fact]
-    public async Task SettingsChangeDuringCycle_NewSettingsPickedUpNextIteration()
-    {
-        using var h = new Harness();
-        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ =>
-            {
-                h.CheckCount++;
-                if (h.CheckCount == 1)
-                {
-                    h.Settings.IsMonitoringEnabled = false;
-                }
-                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running));
-            });
-
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Stopped),
-                "Status Stopped to be reported after monitoring disabled");
-        });
-
-        h.LoadCount.Should().BeGreaterThan(1);
-        h.Statuses.Should().Contain(GuardianStatus.Stopped);
-    }
-
-    [Fact]
-    public async Task StartAsyncThrows_LoopStaysAlive()
-    {
-        using var h = new Harness();
-        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ =>
-            {
-                h.CheckCount++;
-                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
-            });
-        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromException<bool>(new InvalidOperationException("boom")));
-
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.CheckCount >= 3,
-                "CheckAsync to be called multiple times after StartAsync threw");
-        });
-
-        h.CheckCount.Should().BeGreaterThanOrEqualTo(3);
-    }
-
-    [Fact]
-    public async Task ShowAsyncThrows_RestartStillSucceeds_StatusMonitoring()
-    {
-        using var h = new Harness();
-        bool started = false;
-        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(started ? ProcessOutcome.Running : ProcessOutcome.NotRunning)));
-        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => { started = true; return Task.FromResult(true); });
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
-        h.Notifications.ClearReceivedCalls();
-        h.Notifications.ShowAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromException(new InvalidOperationException("toast fail")));
-
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring)
-                && h.Monitor.ReceivedCalls().Any(c => c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)),
-                "Monitoring status after restart despite toast failure");
-        });
+        await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Any(c =>
+                c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)),
+            "StartAsync to be called when the hash matches");
+        await controller.StopAsync();
 
         await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         h.Statuses.Should().Contain(GuardianStatus.Monitoring);
+    }
+
+    [Fact]
+    public async Task ControllerAlwaysComputesAndPersistsPin_OnStart()
+    {
+        using var h = new Harness();
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
+
+        AppSettings? saved = null;
+        h.Config.SaveAsync(Arg.Do<AppSettings>(s => saved = s), Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        // The controller computed the pin (K) and persisted it together with the path
+        // and enabled flag BEFORE the session began; the ViewModel never supplies one.
+        saved.Should().NotBeNull();
+        saved!.TargetHashSha256.Should().Be("PIN");
+        saved!.TargetProcessPath.Should().Be(h.TargetPath);
+        saved!.IsMonitoringEnabled.Should().BeTrue();
+
+        await controller.StopAsync();
     }
 
     [Fact]
@@ -515,7 +489,6 @@ public class GuardianOrchestratorTests
         using var h = new Harness();
         // Upper bound is intentionally unclamped at the entity level. Before the wait cap,
         // the int cast overflowed and CheckAsync was invoked thousands of times per second.
-        h.Settings.CheckIntervalSeconds = int.MaxValue;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
@@ -523,21 +496,20 @@ public class GuardianOrchestratorTests
                 return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42));
             });
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-                "Monitoring status after the first check");
-            await Task.Delay(700);
-            h.CheckCount.Should().Be(1);
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(checkInterval: int.MaxValue));
+        start.Started.Should().BeTrue();
 
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Monitoring status after the first check");
+        await Task.Delay(700);
         h.CheckCount.Should().Be(1);
+
+        await controller.StopAsync();
     }
 
     [Fact]
-    public async Task CheckAsyncThrows_StatusError_LoopContinues()
+    public async Task CheckAsyncThrows_StatusError_EndsSession()
     {
         using var h = new Harness();
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
@@ -547,121 +519,189 @@ public class GuardianOrchestratorTests
                 return Task.FromException<ProcessCheckResult>(new InvalidOperationException("check boom"));
             });
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error),
-                "Status Error to be reported");
-            await WaitUntilAsync(() => h.CheckCount >= 3,
-                "CheckAsync to be called again after error");
-        });
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error),
+            "Status Error to be reported after CheckAsync throws");
 
         h.Statuses.Should().Contain(GuardianStatus.Error);
-        h.CheckCount.Should().BeGreaterThanOrEqualTo(3);
+        // A thrown check is a fatal cycle condition: the session ends, not an infinite loop.
+        h.CheckCount.Should().Be(1);
     }
 
     [Fact]
-    public async Task HashMismatch_LaunchBlocked_MonitoringDisabled_TargetChangedToast()
+    public async Task SecondStart_WhileSessionActive_Rejected()
     {
         using var h = new Harness();
-        h.Settings.TargetHashSha256 = "AA11";
-        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult<string?>("BB"));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        var duplicate = await controller.StartAsync(h.Request());
+        duplicate.Started.Should().BeFalse("a second Start while a session is active must be rejected");
+        duplicate.Reason.Should().NotBeNullOrWhiteSpace();
+
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task Stop_WhilePreSessionStartInFlight_CancelsSession_NoLaunchAfter()
+    {
+        using var h = new Harness();
+        // The first post-delay cycle is a free launch; hold its launch inside the gate so
+        // we can prove a completed Stop releases no launch afterwards.
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
+            .Returns(_ => { h.MonitorInitialLaunchCalled = true; return Task.FromResult(true); });
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.ToastTitles.Contains("Target Changed"),
-                "Target Changed toast to be shown");
-            await WaitUntilAsync(() => h.Config.ReceivedCalls().Any(c =>
-                c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync)),
-                "SaveAsync to persist the disabled state");
-        });
+        var controller = (GuardianOrchestrator)h.CreateController();
+        var start = await controller.StartAsync(h.Request(initialDelay: 1));
+        start.Started.Should().BeTrue();
 
-        await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-        h.Settings.IsMonitoringEnabled.Should().BeFalse();
+        // Pause inside the launch critical section so Stop must wait for the in-flight
+        // launch to settle (making RuntimeStopped honest) before it can cancel.
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        controller.InsideLaunchGateHook = async () =>
+        {
+            h.MonitorInitialLaunchCalled = true;
+            await release.Task;
+        };
+
+        await WaitUntilAsync(() => h.MonitorInitialLaunchCalled,
+            "initial launch critical section to be entered");
+
+        // Stop is now pending: it waits on the launch gate (an in-flight launch holds it).
+        var stop = controller.StopAsync();
+        await Task.Delay(300);
+        h.Statuses.Should().NotContain(GuardianStatus.Stopped,
+            "Stop must wait for the in-flight launch before settling");
+
+        // Release the launch; Stop then cancels the session and settles.
+        release.TrySetResult(true);
+        var stopResult = await stop;
+        stopResult.RuntimeStopped.Should().BeTrue();
+        stopResult.SettingsSaved.Should().BeTrue();
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Stopped),
+            "Status Stopped once the session settles");
+
+        await Task.Delay(600);
+        h.Monitor.ReceivedCalls().Count(c =>
+                c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync))
+            .Should().Be(1, "no launch may occur after a completed Stop");
+    }
+
+    [Fact]
+    public async Task Reconcile_WeakConfig_EmptyTarget_Error_NoAutoStart()
+    {
+        using var h = new Harness();
+        // Persisted enabled=true but no target selected: boot must surface Error +
+        // target-confirmation guidance, and must never auto-launch monitoring.
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings
+            {
+                IsMonitoringEnabled = true,
+                TargetProcessPath = string.Empty,
+            }));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
         h.Statuses.Should().Contain(GuardianStatus.Error);
-        h.ToastTitles.Should().Contain("Target Changed");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeTrue();
+        controller.CurrentState.Reason.Should().Contain("target");
+
+        _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
-    public async Task HashReadFailure_BlocksLaunch_FailClosed()
+    public async Task Reconcile_WeakConfig_EmptyPin_Error_TargetConfirmationRequired()
     {
         using var h = new Harness();
-        h.Settings.TargetHashSha256 = "AA";
-        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult<string?>(null));
-        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        // Persisted enabled=true with a valid path but legacy empty pin: boot must
+        // surface Error requesting target confirmation (independent of EnableToasts).
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings
+            {
+                IsMonitoringEnabled = true,
+                TargetProcessPath = h.TargetPath,
+                TargetHashSha256 = string.Empty,
+                EnableToasts = false,
+            }));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.ToastTitles.Contains("Target Changed"),
-                "Target Changed toast after unreadable hash");
-        });
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
 
-        await h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-        h.Settings.IsMonitoringEnabled.Should().BeFalse();
+        h.Statuses.Should().Contain(GuardianStatus.Error);
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeTrue();
+        controller.CurrentState.Reason.Should().Contain("pin");
+        _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
-    public async Task HashMatches_LaunchProceeds_StatusMonitoring()
+    public async Task Reconcile_HealthyConfig_AutoStarts_SessionBegins()
     {
         using var h = new Harness();
-        h.Settings.TargetHashSha256 = "AA";
-        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult<string?>("aa"));
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings
+            {
+                IsMonitoringEnabled = true,
+                TargetProcessPath = h.TargetPath,
+                TargetHashSha256 = "PIN",
+                CheckIntervalSeconds = 1,
+            }));
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
-        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
-        {
-            await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Any(c =>
-                    c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)),
-                "StartAsync to be called when the hash matches");
-        });
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
 
-        await h.Integrity.Received().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
-        await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "auto-started session to reach Monitoring");
+        await controller.StopAsync();
         h.Statuses.Should().Contain(GuardianStatus.Monitoring);
     }
 
     [Fact]
-    public async Task EmptyHash_CheckSkipped_LaunchProceeds()
+    public async Task CommitSettings_StoppedPathChange_ClearsPin_PersistsViaController()
     {
         using var h = new Harness();
-        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
-        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
+        AppSettings? saved = null;
+        h.Config.SaveAsync(Arg.Do<AppSettings>(s => saved = s), Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings { TargetProcessPath = h.TargetPath }));
 
-        using var cts = new CancellationTokenSource();
-        var orchestrator = h.CreateOrchestrator();
-        await Harness.RunAsync(orchestrator, cts, async () =>
+        var controller = h.CreateController();
+        await controller.ReconcileAsync(); // loads committed path + empty pin
+
+        // Change the committed target while stopped -> the controller clears the pin.
+        var otherDir = Directory.CreateDirectory(Path.Combine(Path.GetDirectoryName(h.TargetPath)!, "sub")).FullName;
+        var otherPath = Path.Combine(otherDir, "other.exe");
+        File.WriteAllText(otherPath, string.Empty);
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings
         {
-            await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-                "Monitoring status after initial launch without a pin");
+            TargetProcessPath = otherPath,
+            MaxRestartAttempts = 5,
+            CheckIntervalSeconds = 1,
         });
+        var committed = await controller.CommitSettingsAsync(snapshot, otherPath);
+        committed.Should().BeTrue();
 
-        await h.Integrity.DidNotReceive().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
-        await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        saved.Should().NotBeNull();
+        saved!.TargetProcessPath.Should().Be(otherPath);
+        saved!.TargetHashSha256.Should().BeEmpty("a committed path change in the stopped state must clear the pin");
+        saved!.IsMonitoringEnabled.Should().BeFalse();
     }
 }

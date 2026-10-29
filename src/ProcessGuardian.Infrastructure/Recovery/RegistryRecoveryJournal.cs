@@ -1,6 +1,7 @@
 using System.Security.AccessControl;
 using System.Security.Principal;
 using Microsoft.Win32;
+using ProcessGuardian.Domain.Exceptions;
 using ProcessGuardian.Infrastructure.Configuration;
 
 namespace ProcessGuardian.Infrastructure.Recovery;

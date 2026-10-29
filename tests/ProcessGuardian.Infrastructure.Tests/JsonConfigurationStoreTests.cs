@@ -184,4 +184,50 @@ public class JsonConfigurationStoreTests : IDisposable
         loaded.IsMonitoringEnabled.Should().BeTrue();
         loaded.TargetProcessPath.Should().Be(@"C:\App\persisted.exe");
     }
+
+    [Fact]
+    public async Task LoadAsync_ReturnsIndependentCopy_MutatingOneDoesNotAffectTheNext()
+    {
+        await _store.SaveAsync(CreateFullSettings());
+
+        var first = await _store.LoadAsync();
+        first.IsMonitoringEnabled = false;
+        first.TargetProcessPath = @"C:\Changed\other.exe";
+
+        // The store's cached document must be isolated: the next load reflects the saved
+        // values, not the mutation applied through the first returned copy.
+        var second = await _store.LoadAsync();
+        second.Should().NotBeSameAs(first);
+        second.IsMonitoringEnabled.Should().BeTrue();
+        second.TargetProcessPath.Should().Be(@"C:\App\target.exe");
+    }
+
+    [Fact]
+    public async Task SaveAsync_DoesNotRetainCallerDocument_MutatingAfterSaveIsNotPersisted()
+    {
+        var settings = CreateFullSettings();
+        await _store.SaveAsync(settings);
+
+        // Mutate the caller's document after the save: the store must not keep a reference
+        // to it, so this mutation cannot leak back into a later load.
+        settings.IsMonitoringEnabled = false;
+        settings.TargetProcessPath = @"C:\Changed\other.exe";
+
+        var loaded = await _store.LoadAsync();
+        loaded.IsMonitoringEnabled.Should().BeTrue();
+        loaded.TargetProcessPath.Should().Be(@"C:\App\target.exe");
+    }
+
+    [Fact]
+    public async Task LoadCalledTwice_ReturnsIndependentObjects()
+    {
+        await _store.SaveAsync(CreateFullSettings());
+
+        var first = await _store.LoadAsync();
+        var second = await _store.LoadAsync();
+
+        first.Should().NotBeSameAs(second);
+        second.Should().NotBeSameAs(first);
+        first.CheckIntervalSeconds.Should().Be(second.CheckIntervalSeconds);
+    }
 }

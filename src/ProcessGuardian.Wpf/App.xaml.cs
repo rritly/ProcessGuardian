@@ -18,7 +18,6 @@ public partial class App : System.Windows.Application
     private MainWindow? _mainWindow;
     private ITrayService? _tray;
     private SingleInstanceManager? _singleInstance;
-    private bool _userRequestedExit;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -89,7 +88,6 @@ public partial class App : System.Windows.Application
         });
         _tray.ExitRequested += (_, __) => Dispatcher.BeginInvoke(async () =>
         {
-            _userRequestedExit = true;
             if (_host != null)
             {
                 try
@@ -254,19 +252,9 @@ public partial class App : System.Windows.Application
     protected override async void OnExit(ExitEventArgs e)
     {
         // User-initiated Exit disables monitoring so it does not auto-start on reboot.
-        // Reboot/logoff (non-user exit) leaves the flag untouched.
-        if (_userRequestedExit && _host != null)
-        {
-            try
-            {
-                var vm = _host.Services.GetRequiredService<MainViewModel>();
-                vm.Settings.IsMonitoringEnabled = false;
-            }
-            catch (Exception ex)
-            {
-                CrashLog.Append("shutdown-error.log", $"[{DateTime.Now}] Disable monitoring on exit: {ex}\n");
-            }
-        }
+        // Reboot/logoff (non-user exit) leaves the flag untouched. The ExitRequested
+        // handler already stopped the session through the controller (single writer); the
+        // persisted AutostartEnabled is followed by the controller's autostart sync.
 
         // Dispose ViewModel explicitly since WPF does not call DisposeAsync on DataContext.
         try

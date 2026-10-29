@@ -1,5 +1,6 @@
 using System.IO;
 using System.Security.AccessControl;
+using ProcessGuardian.Domain.Exceptions;
 using ProcessGuardian.Infrastructure.Configuration;
 using ProcessGuardian.Infrastructure.Security;
 

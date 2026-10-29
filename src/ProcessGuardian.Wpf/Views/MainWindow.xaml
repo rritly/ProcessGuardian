@@ -19,6 +19,7 @@
     <Window.Resources>
         <conv:StatusToDisplayConverter x:Key="StatusToDisplayConverter" />
         <conv:StringIsEmptyToVisibilityConverter x:Key="StringIsEmptyToVisibilityConverter" />
+        <BooleanToVisibilityConverter x:Key="BoolToVisibilityConverter" />
 
         <SolidColorBrush x:Key="CardBgBrush" Color="#22303D" />
         <SolidColorBrush x:Key="CardBorderBrush" Color="#3E4854" />
@@ -777,6 +778,15 @@
                            Foreground="#E8A33D"
                            VerticalAlignment="Center"
                            Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
+
+                <TextBlock Text="DEGRADED"
+                           Margin="8,0,0,0"
+                           FontSize="11"
+                           FontWeight="Bold"
+                           Foreground="#E5554F"
+                           VerticalAlignment="Center"
+                           ToolTip="Monitoring is degraded; see the logs for details."
+                           Visibility="{Binding IsDegraded, Converter={StaticResource BoolToVisibilityConverter}}" />
             </StackPanel>
         </Border>
 
