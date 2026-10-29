@@ -32,6 +32,12 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     private readonly IStatusReporter _status;
     private readonly ITargetIntegrityService _integrity;
     private readonly IAutostartService _autostart;
+    private readonly TimeProvider _time;
+
+    // Degraded-indicator threshold (E): the persistent IsDegraded indicator turns on only
+    // when elapsed time >= T AND >= N consecutive degraded checks (poll-bound evaluation).
+    private static readonly TimeSpan DegradedRequiredDuration = TimeSpan.FromSeconds(120);
+    private const int DegradedRequiredConsecutive = 2;
 
     // Serializes every controller entry point; the UI busy gate is no longer the only guard.
     private readonly SemaphoreSlim _operationLock = new(1, 1);
@@ -68,7 +74,8 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         ILogger<GuardianOrchestrator> logger,
         IStatusReporter status,
         ITargetIntegrityService integrity,
-        IAutostartService autostart)
+        IAutostartService autostart,
+        TimeProvider? timeProvider = null)
     {
         _monitor = monitor;
         _config = config;
@@ -77,6 +84,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         _status = status;
         _integrity = integrity;
         _autostart = autostart;
+        _time = timeProvider ?? TimeProvider.System;
     }
 
     public MonitorState CurrentState => _state;
@@ -409,6 +417,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     private async Task RunSessionAsync(SessionSnapshot session, CancellationToken ct)
     {
         var counters = new SessionCounters();
+        // Path form is fixed for the whole session (validated at Start/Reconcile); the monitor
+        // checks existence/readability at runtime per E — the loop never re-runs form validation.
+        var target = new ProcessTarget(session.TargetProcessPath, session.TargetNameWithoutExtension, session.WorkingDirectory);
         try
         {
             if (_committed.InitialDelaySeconds > 0)
@@ -422,13 +433,6 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             {
                 var knobs = _committed; // numeric knobs re-read each cycle; path+pin stay fixed
 
-                if (!ProcessTarget.TryCreate(session.TargetProcessPath, out var target, out var pathError))
-                {
-                    _logger.LogError("Target path became invalid mid-session: {Reason}; ending session", pathError);
-                    await EndWithFatalAsync($"{pathError}.", knobs, ct).ConfigureAwait(false);
-                    return;
-                }
-
                 try
                 {
                     var result = await _monitor.CheckAsync(target, ct).ConfigureAwait(false);
@@ -436,12 +440,16 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                     {
                         counters.RestartAttempts = 0;
                         counters.InitialLaunchPending = false;
+                        ResetDegraded(counters);
                         Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
                     }
                     else if (result.Outcome == ProcessOutcome.Unknown)
                     {
+                        // Prolonged-Unknown discipline (E): each Unknown cycle skips silently and
+                        // feeds the degraded indicator (threshold-driven, never Error).
                         _logger.LogWarning("Process state for {Target} could not be determined; skipping this cycle",
                             target.NameWithoutExtension);
+                        MarkDegraded(counters);
                     }
                     else
                     {
@@ -479,6 +487,40 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     {
         public int RestartAttempts;
         public bool InitialLaunchPending = true;
+
+        // Degraded-indicator tracking (E): consecutive degraded checks and the monotonic
+        // timestamp of the first one in the current run. -1 = not yet set (a real GetTimestamp
+        // may legitimately be 0, e.g. a manual clock starting at the epoch).
+        public int ConsecutiveDegraded;
+        public long FirstDegradedTimestamp = -1;
+    }
+
+    private void MarkDegraded(SessionCounters counters)
+    {
+        if (counters.ConsecutiveDegraded == 0)
+            counters.FirstDegradedTimestamp = _time.GetTimestamp();
+        counters.ConsecutiveDegraded++;
+        PublishDegradedIfThreshold(counters);
+    }
+
+    private void ResetDegraded(SessionCounters counters)
+    {
+        counters.ConsecutiveDegraded = 0;
+        counters.FirstDegradedTimestamp = -1;
+        if (CurrentState.IsDegraded)
+            Publish(new MonitorState(CurrentState.Status, false, null, CurrentState.SaveFailed));
+    }
+
+    // Time-based threshold, evaluated on the next poll (E): the persistent indicator turns on
+    // only after >= N consecutive degraded checks AND >= T elapsed. Below threshold the session
+    // keeps its normal status (IsDegraded=false) — a single glitch never flags.
+    private void PublishDegradedIfThreshold(SessionCounters counters)
+    {
+        var enoughChecks = counters.ConsecutiveDegraded >= DegradedRequiredConsecutive;
+        var enoughTime = counters.FirstDegradedTimestamp >= 0
+            && _time.GetElapsedTime(counters.FirstDegradedTimestamp) >= DegradedRequiredDuration;
+        if (enoughChecks && enoughTime && !CurrentState.IsDegraded)
+            Publish(new MonitorState(CurrentState.Status, true, "the target identity or reachability cannot be verified", CurrentState.SaveFailed));
     }
 
     private async Task<SessionAction> HandleMissingAsync(
@@ -492,10 +534,16 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             var outcome = await StartAndVerifyAsync(target, knobs, showRecoveryToast: false, ct).ConfigureAwait(false);
             if (outcome == StartOutcome.SessionEnded || outcome == StartOutcome.Blocked)
                 return SessionAction.EndSession;
-            // A degraded (missing/unreadable) free launch spends no budget and does not consume
-            // the free launch: keep initial-pending so the next cycle retries it.
-            if (outcome != StartOutcome.Degraded)
-                counters.InitialLaunchPending = false;
+            // A degraded (missing/unreadable) free launch spends no budget, does not consume the
+            // free launch, and feeds the degraded indicator (E): keep initial-pending, mark degraded.
+            if (outcome == StartOutcome.Degraded)
+            {
+                MarkDegraded(counters);
+                return SessionAction.Continue;
+            }
+            counters.InitialLaunchPending = false;
+            if (outcome == StartOutcome.Verified)
+                ResetDegraded(counters);
             return SessionAction.Continue;
         }
 
@@ -526,12 +574,15 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         if (started == StartOutcome.Degraded)
         {
             // A degraded (missing/unreadable) relaunch spends no budget and sleeps no restart
-            // delay; the session keeps polling. Only a genuine launch that ran and failed advances
-            // the consecutive counter (budget-charge rule, E).
+            // delay; the session keeps polling and feeds the degraded indicator. Only a genuine
+            // launch that ran and failed advances the consecutive counter (budget-charge rule, E).
+            MarkDegraded(counters);
             return SessionAction.Continue;
         }
 
         counters.RestartAttempts++;
+        if (started == StartOutcome.Verified)
+            ResetDegraded(counters); // a genuinely-restarted target clears the degraded indicator
         var hasMoreAttempts = counters.RestartAttempts < knobs.MaxRestartAttempts || knobs.MaxRestartAttempts == 0;
         if (started == StartOutcome.NotStarted || (started == StartOutcome.VerifyFailed && hasMoreAttempts))
         {
@@ -561,12 +612,10 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             case HashVerifyResult.Missing:
                 _logger.LogWarning("Target {Target} is missing before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                Publish(new MonitorState(CurrentState.Status, true, "the target file is missing; launch skipped", CurrentState.SaveFailed));
                 return StartOutcome.Degraded;
             case HashVerifyResult.ReadError:
                 _logger.LogWarning("Target {Target} could not be read before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                Publish(new MonitorState(CurrentState.Status, true, "the target file could not be read; launch skipped", CurrentState.SaveFailed));
                 return StartOutcome.Degraded;
             case HashVerifyResult.Mismatch:
                 // Fail closed (K keeping today's behavior until F): persist disabled, terminate the

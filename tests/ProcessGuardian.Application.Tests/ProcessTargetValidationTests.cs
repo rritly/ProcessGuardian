@@ -90,14 +90,33 @@ public class ProcessTargetValidationTests : IDisposable
     }
 
     [Fact]
-    public void MissingFile_Rejected()
+    public void MissingFile_NotAFormError_PassesFormValidation()
     {
+        // E split: form validation is deterministic and does NOT touch the filesystem.
+        // Existence/readability is evaluated at runtime by the integrity service (hashing).
         var path = Path.Combine(_dir, "missing.exe");
 
         var ok = ProcessTarget.TryCreate(path, out var target, out var error);
 
-        ok.Should().BeFalse();
-        error.Should().Contain("does not exist");
+        ok.Should().BeTrue();
+        error.Should().BeNull();
+        target!.FullPath.Should().Be(path);
+    }
+
+    [Fact]
+    public void ValidPath_NormalizesDotAndParentSegments()
+    {
+        // E: Path.GetFullPath normalizes ".", ".." and separators so C:\Apps\.\target.exe maps
+        // to the same identity as the resolved path (no duplicate launch for alias spellings).
+        var resolved = Path.Combine(_dir, "sub", "target.exe");
+        Directory.CreateDirectory(Path.Combine(_dir, "sub"));
+        var alias = Path.Combine(_dir, "sub", ".", "target.exe");
+
+        var ok = ProcessTarget.TryCreate(alias, out var target, out var error);
+
+        ok.Should().BeTrue();
+        error.Should().BeNull();
+        target!.FullPath.Should().Be(resolved);
     }
 
     [Fact]

@@ -20,34 +20,28 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
         try
         {
             var processes = Process.GetProcessesByName(target.NameWithoutExtension);
-
-            // MainModule can be unreadable for other users' processes; skip those.
+            var candidates = new List<ProcessCandidate>(processes.Length);
             foreach (var p in processes)
             {
                 using (p)
                 {
                     try
                     {
-                        var path = p.MainModule?.FileName;
-                        if (!string.IsNullOrEmpty(path) &&
-                            path.Equals(target.FullPath, StringComparison.OrdinalIgnoreCase))
-                        {
-                            return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, p.Id));
-                        }
+                        candidates.Add(new ProcessCandidate(p.Id, p.MainModule?.FileName, Unreadable: false));
                     }
                     catch (Win32Exception ex)
                     {
                         _logger.LogWarning(ex, "Access denied inspecting process {Pid}", p.Id);
-                        continue;
+                        candidates.Add(new ProcessCandidate(p.Id, null, Unreadable: true));
                     }
                     catch (InvalidOperationException)
                     {
-                        continue;
+                        candidates.Add(new ProcessCandidate(p.Id, null, Unreadable: true));
                     }
                 }
             }
 
-            return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            return Task.FromResult(EvaluateCandidates(target.FullPath, candidates));
         }
         catch (Exception ex)
         {
@@ -57,6 +51,32 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
             return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
         }
     }
+
+    // Unknown discipline (E), deterministic unit-test seam: Running only on a readable module
+    // match; Unknown only when no readable match exists and at least one candidate is unreadable;
+    // NotRunning only when every candidate was readable and none matched. A single unreadable
+    // module never downgrades a readable match.
+    internal static ProcessCheckResult EvaluateCandidates(string targetFullPath, IReadOnlyList<ProcessCandidate> candidates)
+    {
+        bool anyUnreadable = false;
+        foreach (var c in candidates)
+        {
+            if (c.Unreadable)
+            {
+                anyUnreadable = true;
+                continue;
+            }
+            if (c.ModulePath is not null &&
+                c.ModulePath.Equals(targetFullPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return new ProcessCheckResult(ProcessOutcome.Running, c.ProcessId);
+            }
+        }
+        return new ProcessCheckResult(anyUnreadable ? ProcessOutcome.Unknown : ProcessOutcome.NotRunning);
+    }
+
+    // A synthetic per-process snapshot for the EvaluateCandidates seam (tests).
+    internal readonly record struct ProcessCandidate(int ProcessId, string? ModulePath, bool Unreadable);
 
     public Task<bool> StartAsync(ProcessTarget target, CancellationToken ct)
     {

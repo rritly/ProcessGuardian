@@ -40,6 +40,9 @@ public class GuardianOrchestratorTests
         public int CheckCount { get; set; }
         public int StartCallCount { get; set; }
 
+        // Deterministic clock for the degraded-threshold tests (E); TimeProvider.System by default.
+        public TimeProvider Time { get; set; } = TimeProvider.System;
+
         // Set when the first launch critical section is entered (used by launch-gate tests).
         public bool MonitorInitialLaunchCalled { get; set; }
 
@@ -79,7 +82,7 @@ public class GuardianOrchestratorTests
         public IMonitoringController CreateController() =>
             new GuardianOrchestrator(
                 Monitor, Config, Notifications, NullLogger<GuardianOrchestrator>.Instance,
-                Status, Integrity, Autostart);
+                Status, Integrity, Autostart, Time);
 
         public StartRequest Request(
             int maxRestarts = 5,
@@ -763,5 +766,111 @@ public class GuardianOrchestratorTests
         saved!.TargetProcessPath.Should().Be(otherPath);
         saved!.TargetHashSha256.Should().BeEmpty("a committed path change in the stopped state must clear the pin");
         saved!.IsMonitoringEnabled.Should().BeFalse();
+    }
+
+    // Deterministic clock for the E degraded-threshold tests.
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private TimeSpan _elapsed;
+
+        public override DateTimeOffset GetUtcNow() => DateTimeOffset.UnixEpoch + _elapsed;
+
+        public void Advance(TimeSpan t) => _elapsed += t;
+
+        public override long GetTimestamp() => _elapsed.Ticks;
+
+        // Make GetTimestamp's ticks the TimeSpan tick scale so the base (non-virtual)
+        // GetElapsedTime(long) arithmetic is exact on every platform.
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+    }
+
+    [Fact]
+    public async Task InvalidForm_StartRejected_NoSession_NoBudget()
+    {
+        using var h = new Harness();
+        var controller = h.CreateController();
+
+        // A relative path is form-invalid: the Start request is rejected before any session or
+        // budget is engaged (E) — no hash read, no persistence as Error.
+        var request = new StartRequest(
+            CommittedSettingsSnapshot.From(new AppSettings { MaxRestartAttempts = 5, CheckIntervalSeconds = 1 }),
+            "App\\target.exe");
+        var result = await controller.StartAsync(request);
+
+        result.Started.Should().BeFalse();
+        result.Reason.Should().NotBeNullOrWhiteSpace();
+        _ = h.Integrity.DidNotReceive().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Start_MissingTargetFile_Rejected_NoSession()
+    {
+        using var h = new Harness();
+        // The file is unhashable at Start (clean missing): Start requires an existing readable
+        // file, so the request is rejected and no session is engaged (E).
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(TargetHashResult.Missing()));
+
+        var controller = h.CreateController();
+        var result = await controller.StartAsync(h.Request());
+
+        result.Started.Should().BeFalse();
+        _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Reconcile_SavedInvalidPath_Error_NoSession()
+    {
+        using var h = new Harness();
+        // Persisted enabled=true with a syntactically-invalid (relative) path: boot reconciliation
+        // must report Error and never engage a session (E) — no silent monitoring attempt.
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings
+            {
+                IsMonitoringEnabled = true,
+                TargetProcessPath = @"App\target.exe",
+                TargetHashSha256 = "PIN",
+            }));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeTrue();
+        controller.CurrentState.Reason.Should().Contain("path");
+        _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ProlongedUnknown_BeforeThreshold_NotDegraded_AfterThreshold_Degraded_NoError()
+    {
+        using var h = new Harness();
+        var time = new ManualTimeProvider();
+        h.Time = time;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
+            });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(checkInterval: 1));
+        start.Started.Should().BeTrue();
+
+        // Two Unknown cycles below the time threshold must NOT flag degraded (no single-glitch false alarm).
+        await WaitUntilAsync(() => h.CheckCount >= 2, "two unknown cycles to run");
+        controller.CurrentState.IsDegraded.Should().BeFalse("below the time threshold no degraded indicator");
+
+        // Only after >= N checks AND >= T elapsed (poll-bound) does the persistent indicator appear.
+        time.Advance(TimeSpan.FromSeconds(120));
+        await WaitUntilAsync(() => h.CheckCount >= 3, "a third unknown cycle to run after time elapsed");
+        await WaitUntilAsync(() => controller.CurrentState.IsDegraded, "degraded indicator after the time threshold");
+
+        await controller.StopAsync();
+        controller.CurrentState.Status.Should().NotBe(GuardianStatus.Error, "Unknown never escalates to Error");
+        h.Statuses.Should().NotContain(GuardianStatus.Error);
     }
 }

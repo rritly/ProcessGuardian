@@ -134,4 +134,64 @@ public class WindowsProcessMonitorTests : IDisposable
         var result = await act.Should().NotThrowAsync();
         result.Which.Should().BeFalse();
     }
+
+    [Fact]
+    public void EvaluateCandidates_ReadableMatch_IsRunning()
+    {
+        var candidates = new[]
+        {
+            new WindowsProcessMonitor.ProcessCandidate(101, @"C:\App\other.exe", Unreadable: false),
+            new WindowsProcessMonitor.ProcessCandidate(202, @"C:\App\target.exe", Unreadable: false),
+        };
+
+        var result = WindowsProcessMonitor.EvaluateCandidates(@"C:\app\target.exe", candidates);
+
+        result.Outcome.Should().Be(ProcessOutcome.Running);
+        result.ProcessId.Should().Be(202);
+    }
+
+    [Fact]
+    public void EvaluateCandidates_AllReadableNoMatch_IsNotRunning()
+    {
+        var candidates = new[]
+        {
+            new WindowsProcessMonitor.ProcessCandidate(101, @"C:\App\other.exe", Unreadable: false),
+            new WindowsProcessMonitor.ProcessCandidate(202, @"C:\App\another.exe", Unreadable: false),
+        };
+
+        var result = WindowsProcessMonitor.EvaluateCandidates(@"C:\App\target.exe", candidates);
+
+        result.Outcome.Should().Be(ProcessOutcome.NotRunning);
+    }
+
+    [Fact]
+    public void EvaluateCandidates_UnreadableNoReadableMatch_IsUnknown_NotNotRunning()
+    {
+        // E discipline: at least one unreadable candidate with no readable match is Unknown,
+        // never NotRunning (which would trigger a duplicate relaunch of a possibly-running target).
+        var candidates = new[]
+        {
+            new WindowsProcessMonitor.ProcessCandidate(101, null, Unreadable: true),
+        };
+
+        var result = WindowsProcessMonitor.EvaluateCandidates(@"C:\App\target.exe", candidates);
+
+        result.Outcome.Should().Be(ProcessOutcome.Unknown);
+    }
+
+    [Fact]
+    public void EvaluateCandidates_UnreadablePlusReadableMatch_IsRunning_NotDowngraded()
+    {
+        // A single unreadable module must never downgrade a readable match (E).
+        var candidates = new[]
+        {
+            new WindowsProcessMonitor.ProcessCandidate(101, null, Unreadable: true),
+            new WindowsProcessMonitor.ProcessCandidate(202, @"C:\App\target.exe", Unreadable: false),
+        };
+
+        var result = WindowsProcessMonitor.EvaluateCandidates(@"C:\App\target.exe", candidates);
+
+        result.Outcome.Should().Be(ProcessOutcome.Running);
+        result.ProcessId.Should().Be(202);
+    }
 }
