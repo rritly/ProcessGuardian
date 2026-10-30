@@ -465,9 +465,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "CheckAsync failed for {Target}; ending session", target.NameWithoutExtension);
-                    await EndWithFatalAsync("a monitoring check failed.", knobs, ct).ConfigureAwait(false);
-                    return;
+                    // F (SPEC §7.2.1/EH-02): a throwing check behaves like Unknown — the session
+                    // stays alive and only feeds the degraded indicator; it never escalates to
+                    // Error on its own. The loop simply keeps checking.
+                    _logger.LogWarning(ex, "CheckAsync failed for {Target}; treating the cycle as unknown", target.NameWithoutExtension);
+                    MarkDegraded(counters);
                 }
 
                 if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(knobs.CheckIntervalSeconds), ct).ConfigureAwait(false))
@@ -770,14 +772,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         return HashVerifyResult.Mismatch;
     }
 
-    // Fatal cause: exit the cycle loop first, then persist enabled=false best-effort and
-    // report Error even if that save fails (SaveFailed is surfaced separately).
-    private async Task EndWithFatalAsync(string reason, CommittedSettingsSnapshot knobs, CancellationToken ct)
-    {
-        await TryPersistDisabledBestEffortAsync(knobs).ConfigureAwait(false);
-        var saveFailed = _lastPersistFailed;
-        Publish(new MonitorState(GuardianStatus.Error, true, reason, saveFailed));
-    }
+    // Fatal cause: the caller exits the cycle loop, then persists enabled=false best-effort
+    // (TryPersistDisabledBestEffortAsync) and reports Error even if that save fails (SaveFailed
+    // is surfaced separately) — each fatal branch inlines these two steps.
 
     // ---------------------------------------------------------------------
     // Persistence and autostart

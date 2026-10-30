@@ -554,9 +554,11 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
-    public async Task CheckAsyncThrows_StatusError_EndsSession()
+    public async Task CheckAsyncThrows_SetsDegraded_NoSessionTermination()
     {
         using var h = new Harness();
+        var time = new ManualTimeProvider();
+        h.Time = time;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
@@ -565,15 +567,23 @@ public class GuardianOrchestratorTests
             });
 
         var controller = h.CreateController();
-        var start = await controller.StartAsync(h.Request());
+        var start = await controller.StartAsync(h.Request(checkInterval: 1));
         start.Started.Should().BeTrue();
 
-        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Error),
-            "Status Error to be reported after CheckAsync throws");
+        // A throwing check behaves like Unknown (F, SPEC §7.2.1/EH-02): the session stays alive.
+        await WaitUntilAsync(() => h.CheckCount >= 2, "two throwing checks to run");
+        h.Statuses.Should().NotContain(GuardianStatus.Error, "a throwing check alone must never terminate or Error the session");
 
-        h.Statuses.Should().Contain(GuardianStatus.Error);
-        // A thrown check is a fatal cycle condition: the session ends, not an infinite loop.
-        h.CheckCount.Should().Be(1);
+        // After the time threshold the degraded indicator appears, but never Error.
+        time.Advance(TimeSpan.FromSeconds(120));
+        await WaitUntilAsync(() => h.CheckCount >= 3, "a third throwing check to run after time elapsed");
+        await WaitUntilAsync(() => controller.CurrentState.IsDegraded, "degraded indicator after prolonged throwing checks");
+
+        // The loop keeps polling: still no Error, still alive.
+        await WaitUntilAsync(() => h.CheckCount >= 5, "the loop to keep polling after repeated throwing checks");
+        h.Statuses.Should().NotContain(GuardianStatus.Error);
+        controller.CurrentState.Status.Should().NotBe(GuardianStatus.Error);
+        await controller.StopAsync();
     }
 
     [Fact]
@@ -872,5 +882,107 @@ public class GuardianOrchestratorTests
         await controller.StopAsync();
         controller.CurrentState.Status.Should().NotBe(GuardianStatus.Error, "Unknown never escalates to Error");
         h.Statuses.Should().NotContain(GuardianStatus.Error);
+    }
+
+    [Fact]
+    public async Task PersistSaveThrows_OnStart_NotStarted_NoSession()
+    {
+        using var h = new Harness();
+        // A failing settings write must not start monitoring (F): the session is never engaged.
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ => throw new IOException("disk failed"));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
+
+        var controller = h.CreateController();
+        var result = await controller.StartAsync(h.Request());
+
+        result.Started.Should().BeFalse("a failed persistence write must not start monitoring");
+        result.Reason.Should().Contain("persist");
+        _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task PersistSaveThrows_OnStop_RuntimeStoppedTrue_SettingsSavedFalse()
+    {
+        using var h = new Harness();
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring), "session to reach Monitoring");
+
+        // From now on the store rejects writes: Stop must still guarantee RuntimeStopped
+        // (the session is cancelled) while surfacing SettingsSaved=false (best-effort save).
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ => throw new IOException("disk failed"));
+
+        var stop = await controller.StopAsync();
+
+        stop.RuntimeStopped.Should().BeTrue("Stop always guarantees the runtime session is over (F)");
+        stop.SettingsSaved.Should().BeFalse("a failed final save is surfaced, not reported as success");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        controller.CurrentState.SaveFailed.Should().BeTrue("the SaveFailed flag is surfaced on the state channel");
+    }
+
+    [Fact]
+    public async Task PersistSaveThrows_OnFatalMismatch_ErrorStillPublished_WithSaveFailedFlag()
+    {
+        using var h = new Harness();
+        // Pin at Start is "PIN"; at the launch re-verify the target reads "BB" -> fatal Mismatch.
+        int hashCalls = 0;
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(TargetHashResult.Computed(hashCalls++ == 0 ? "PIN" : "BB")));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+
+        var controller = h.CreateController();
+        // Start's own persist must succeed first (a failed Start write is a separate test);
+        // only the fatal-path Save(false) is forced to fail.
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        // From now on the store rejects writes: the fatal Mismatch path cannot persist
+        // enabled=false, but Error must still be published with the SaveFailed flag (F).
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ => throw new IOException("disk failed"));
+
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
+            "Error to be published after the fatal mismatch");
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.SaveFailed.Should().BeTrue(
+            "a failed Save(false) must not suppress the Error publication (F)");
+        _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Reconcile_StaleEnabledTrue_StillValidTarget_ReengagesMonitoring()
+    {
+        using var h = new Harness();
+        // Accepted no-durable-latch limitation (F), documented: a stale persisted enabled=true
+        // with a still-valid target+pin re-engages monitoring at the next boot — that is the
+        // normal resume path, not a bypass (the controller never auto-starts from the flag ALONE).
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings
+            {
+                IsMonitoringEnabled = true,
+                TargetProcessPath = h.TargetPath,
+                TargetHashSha256 = "PIN",
+                CheckIntervalSeconds = 1,
+            }));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "a still-valid retained target+pin with stale enabled=true resumes monitoring at boot");
+        await controller.StopAsync();
     }
 }
