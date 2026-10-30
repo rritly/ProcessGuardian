@@ -137,7 +137,11 @@ public partial class App : System.Windows.Application
 
         if (initStatus == ConfigurationInitializationStatus.Refused)
         {
-            // Ordinary Error path: no host start, no monitoring, no fatal MessageBox.
+            // Ordinary Error path: no host start, no monitoring, no fatal MessageBox. The window
+            // (when shown) must project the same Error state as the tray — never STOPPED with a
+            // hidden refusal (R-A). For --background the tray-only notice still shows first.
+            var vm = _host!.Services.GetRequiredService<MainViewModel>();
+            vm.ApplyInitializationStatus(ConfigurationInitializationStatus.Refused);
             _tray?.SetStatus(GuardianStatus.Error);
             _tray?.SetNotice(RefusedTrayNotice);
         }

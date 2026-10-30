@@ -39,7 +39,7 @@ public class MainViewModelInitIndicatorTests
     }
 
     [Fact]
-    public void Refused_SetsErrorIndicator_GatesStartOff()
+    public void Refused_SetsErrorIndicator_ProjectsErrorState_GatesStartOff()
     {
         var vm = new Harness().CreateVm();
 
@@ -47,6 +47,9 @@ public class MainViewModelInitIndicatorTests
 
         vm.ConfigurationError.Should().NotBeEmpty();
         vm.ResetNotice.Should().BeEmpty();
+        vm.Status.Should().Be(GuardianStatus.Error,
+            "a config refusal must produce one coherent ordinary Error state in the window (R-A)");
+        vm.IsDegraded.Should().BeFalse("IsDegraded is reserved for active session states, never a refusal");
         vm.StartCommand.CanExecute(null).Should().BeFalse("monitoring must not start while config is refused");
         vm.StopCommand.CanExecute(null).Should().BeFalse();
     }
@@ -76,7 +79,31 @@ public class MainViewModelInitIndicatorTests
         await WaitUntilAsync(() => vm.ConfigurationError.Length > 0, "the refused-load error indicator to be set");
 
         vm.ConfigurationError.Should().NotBeEmpty();
+        vm.Status.Should().Be(GuardianStatus.Error, "the refused load must project Error, not plain STOPPED (R-A)");
+        vm.IsDegraded.Should().BeFalse();
         vm.StartCommand.CanExecute(null).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task RefusedLoad_FallbackAssignment_SchedulesNoDebouncedCommit_NoSecondPersistenceError()
+    {
+        var h = new Harness();
+        h.Controller.GetCurrentSettingsAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<AppSettings>(new ConfigurationUnavailableException(
+                "refused",
+                "An administrator must repair HKLM\\SOFTWARE\\ProcessGuardianAdmin\\Recovery")));
+
+        var vm = h.CreateVm();
+        await WaitUntilAsync(() => vm.ConfigurationError.Length > 0, "the refused-load error indicator to be set");
+
+        // Give the (buggy) 500 ms debounce window room to fire: the fallback AppSettings assignment
+        // must not schedule a commit against a refused store (R-A), so no CommitSettingsAsync may run.
+        await Task.Delay(700);
+
+        await h.Controller.Received(0)
+            .CommitSettingsAsync(Arg.Any<CommittedSettingsSnapshot>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+
+        vm.Settings.Should().NotBeNull("a fallback instance remains installed for bindings");
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, string failureMessage)

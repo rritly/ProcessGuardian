@@ -606,7 +606,7 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="118" />
             <RowDefinition Height="15" />
-            <RowDefinition Height="60" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="15" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
@@ -720,7 +720,13 @@
                 BorderBrush="{StaticResource CardBorderBrush}"
                 BorderThickness="1"
                 CornerRadius="12">
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
 
                 <Grid Width="151" Height="30" Margin="15,0,0,0">
                     <Button Content="Start monitoring"
@@ -761,24 +767,6 @@
                                VerticalAlignment="Center" />
                 </Border>
 
-                <TextBlock Text="{Binding ConfigurationError}"
-                           Margin="8,0,0,0"
-                           MaxWidth="300"
-                           TextWrapping="Wrap"
-                           FontSize="11"
-                           Foreground="#E5554F"
-                           VerticalAlignment="Center"
-                           Visibility="{Binding ConfigurationError, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
-
-                <TextBlock Text="{Binding ResetNotice}"
-                           Margin="8,0,0,0"
-                           MaxWidth="300"
-                           TextWrapping="Wrap"
-                           FontSize="11"
-                           Foreground="#E8A33D"
-                           VerticalAlignment="Center"
-                           Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
-
                 <TextBlock Text="DEGRADED"
                            Margin="8,0,0,0"
                            FontSize="11"
@@ -787,7 +775,28 @@
                            VerticalAlignment="Center"
                            ToolTip="Monitoring is degraded; see the logs for details."
                            Visibility="{Binding IsDegraded, Converter={StaticResource BoolToVisibilityConverter}}" />
-            </StackPanel>
+                </StackPanel>
+
+                <!-- Full-width guidance row below the monitoring controls/status row (R-A): long
+                     refusal/reset guidance wraps and stays readable at normal window width instead of
+                     being squeezed into the horizontal controls row or a fixed-height row. Each panel
+                     collapses when its message is empty. -->
+                <StackPanel Grid.Row="1" Margin="15,10,15,12" HorizontalAlignment="Stretch">
+                    <TextBlock Text="{Binding ConfigurationError}"
+                               TextWrapping="Wrap"
+                               HorizontalAlignment="Stretch"
+                               FontSize="11"
+                               Foreground="#E5554F"
+                               Visibility="{Binding ConfigurationError, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
+                    <TextBlock Text="{Binding ResetNotice}"
+                               Margin="0,6,0,0"
+                               TextWrapping="Wrap"
+                               HorizontalAlignment="Stretch"
+                               FontSize="11"
+                               Foreground="#E8A33D"
+                               Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
+                </StackPanel>
+            </Grid>
         </Border>
 
         <!-- ===== CARD 3: LOG ===== -->

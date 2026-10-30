@@ -49,6 +49,7 @@ public partial class MainViewModel : ObservableObject
     // refused (unsafe location); Start/monitoring must stay disabled. Non-empty ResetNotice
     // reports that untrusted settings were quarantined and replaced with fresh defaults.
     [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(StartCommand))]
     private string _configurationError = string.Empty;
 
     [ObservableProperty]
@@ -173,15 +174,38 @@ public partial class MainViewModel : ObservableObject
         catch (ConfigurationUnavailableException ex)
         {
             // A refused store is an ordinary Error path, never a fatal crash: the user is
-            // pointed to recovery and monitoring must not start.
+            // pointed to recovery and monitoring must not start. The window projects the same
+            // Error state as the tray (Status=Error, IsDegraded=false) so a refusal is never
+            // shown as a plain STOPPED window (R-A).
             _logger.LogError(ex, "Configuration store refused on load");
             ConfigurationError = ex.Guidance ?? "Configuration is unavailable; apply the guidance and restart.";
-            Settings = new AppSettings();
+            Status = GuardianStatus.Error;
+            IsDegraded = false;
+            // Install a fallback settings instance for bindings ONLY — never schedule a normal
+            // persistence debounce against a refused store (R-A). No CommitSettingsAsync /
+            // PersistEnabledAsync / store write may run until initialization succeeds.
+            _suppressSave = true;
+            try
+            {
+                Settings = new AppSettings();
+            }
+            finally
+            {
+                _suppressSave = false;
+            }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to load settings on startup");
-            Settings = new AppSettings();
+            _suppressSave = true;
+            try
+            {
+                Settings = new AppSettings();
+            }
+            finally
+            {
+                _suppressSave = false;
+            }
         }
     }
 
@@ -198,6 +222,11 @@ public partial class MainViewModel : ObservableObject
                     "The elevated configuration is unavailable. An administrator must inspect and repair the " +
                     "elevated configuration (owner BUILTIN\\Administrators or SYSTEM; no reparse points) or the " +
                     "recovery state at HKLM\\SOFTWARE\\ProcessGuardianAdmin\\Recovery, then start the application again.";
+                // One coherent ordinary Error state in both the window and the tray: the refusal is an
+                // Error, not a plain stopped monitoring session (R-A). IsDegraded is meaningful only in
+                // active session states, so a refusal leaves it false.
+                Status = GuardianStatus.Error;
+                IsDegraded = false;
                 break;
             case ConfigurationInitializationStatus.ResetNoticePending:
                 ResetNotice =

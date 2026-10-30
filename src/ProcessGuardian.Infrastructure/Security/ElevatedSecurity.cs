@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
+using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 using ProcessGuardian.Domain.Exceptions;
 using ProcessGuardian.Infrastructure.Configuration;
@@ -66,6 +67,28 @@ public static class ElevatedSecurity
             SystemSid, FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
     }
 
+    /// <summary>
+    /// Born-hardened HKLM recovery-key descriptor: inheritance disabled, Administrators + SYSTEM
+    /// FullControl, owner = Administrators (trusted owner, never the creating user). Mirrors the
+    /// file/directory protected descriptors so the journal and the config tree share one model (A).
+    /// The caller must enable <see cref="EnableRestorePrivilege"/> around the create (a non-caller
+    /// owner may require it) and verify the created key afterwards — a created key whose owner is
+    /// still the caller's user SID is not trusted.
+    /// </summary>
+    public static RegistrySecurity CreateProtectedRegistrySecurity()
+    {
+        var security = new RegistrySecurity();
+        security.SetAccessRuleProtection(true, false);
+        security.AddAccessRule(new RegistryAccessRule(
+            AdminsSid, RegistryRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        security.AddAccessRule(new RegistryAccessRule(
+            SystemSid, RegistryRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        security.SetOwner(AdminsSid);
+        return security;
+    }
+
     public static bool IsTrustedOwner(SecurityIdentifier? owner) =>
         owner is not null && (owner.Equals(AdminsSid) || owner.Equals(SystemSid));
 
@@ -114,6 +137,59 @@ public static class ElevatedSecurity
             if (isAdmins && rule.FileSystemRights.HasFlag(FileSystemRights.FullControl))
                 adminsAllow = true;
             if (isSystem && rule.FileSystemRights.HasFlag(FileSystemRights.FullControl))
+                systemAllow = true;
+        }
+
+        if (!adminsAllow || !systemAllow || foreignAllow || hasDeny)
+            return ProtectionClassification.Untrusted;
+
+        return ProtectionClassification.Trusted;
+    }
+
+    /// <summary>
+    /// Normalized known-template check for an HKLM recovery journal key — the same trust rules as A
+    /// for files/directories: owner is exactly <see cref="AdminsSid"/> or <see cref="SystemSid"/>,
+    /// inheritance disabled, required Administrators/SYSTEM FullControl present, no foreign allow for
+    /// any other SID, and no unexpected deny ACEs. A caller/user-owned key never passes. A
+    /// READ_CONTROL failure surfaces as <see cref="ProtectionClassification.UnsafeLocation"/> in the
+    /// caller, not "unknown → proceed". CI tests feed fabricated <see cref="RegistrySecurity"/>
+    /// instances; a live ACL/owner is the manual elevated checklist.
+    /// </summary>
+    public static ProtectionClassification ClassifyRegistrySecurity(RegistrySecurity security)
+    {
+        var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+        if (owner is null || !IsTrustedOwner(owner))
+            return ProtectionClassification.Untrusted;
+
+        if (!security.AreAccessRulesProtected)
+            return ProtectionClassification.Untrusted;
+
+        var rules = security.GetAccessRules(true, true, typeof(SecurityIdentifier))
+                            .Cast<RegistryAccessRule>().ToList();
+
+        var adminsAllow = false;
+        var systemAllow = false;
+        var foreignAllow = false;
+        var hasDeny = false;
+
+        foreach (var rule in rules)
+        {
+            if (rule.AccessControlType == AccessControlType.Deny)
+            {
+                hasDeny = true;
+                continue;
+            }
+
+            var sid = rule.IdentityReference as SecurityIdentifier;
+            var isAdmins = sid is not null && sid.Equals(AdminsSid);
+            var isSystem = sid is not null && sid.Equals(SystemSid);
+
+            if (!isAdmins && !isSystem)
+                foreignAllow = true;
+
+            if (isAdmins && rule.RegistryRights.HasFlag(RegistryRights.FullControl))
+                adminsAllow = true;
+            if (isSystem && rule.RegistryRights.HasFlag(RegistryRights.FullControl))
                 systemAllow = true;
         }
 

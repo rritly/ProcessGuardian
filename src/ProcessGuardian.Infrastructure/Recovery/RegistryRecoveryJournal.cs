@@ -1,36 +1,55 @@
 using System.Security.AccessControl;
-using System.Security.Principal;
 using Microsoft.Win32;
 using ProcessGuardian.Domain.Exceptions;
-using ProcessGuardian.Infrastructure.Configuration;
+using ProcessGuardian.Infrastructure.Security;
 
 namespace ProcessGuardian.Infrastructure.Recovery;
 
 /// <summary>
 /// HKLM-backed recovery/notice journal. Fixed key: <c>HKLM\SOFTWARE\ProcessGuardianAdmin\Recovery</c>,
 /// value <c>State</c> (<c>REG_SZ</c>) = <c>RecoveryInProgress</c> or <c>ResetNoticePending</c>;
-/// absent means complete. The key is created with a restrictive ACL (owner BUILTIN\Administrators
-/// or LOCAL SYSTEM, inheritance disabled, FullControl only for those two SIDs); a pre-existing
-/// weak or unverifiable key is refused, never silently accepted.
+/// absent means complete. The key is created with a restrictive descriptor (owner BUILTIN\Administrators
+/// or LOCAL SYSTEM, inheritance disabled, FullControl only for those two SIDs) and verified
+/// immediately after creation with the same trust rules as A
+/// (<see cref="ElevatedSecurity.ClassifyRegistrySecurity"/>); a pre-existing weak or unverifiable key
+/// is refused, never silently accepted or repaired in place.
 ///
-/// This runs only in the elevated edition; CI exercises the logic through the in-memory fake,
-/// and the live ACL is covered by the manual elevated checklist.
+/// This runs only in the elevated edition; CI exercises the decision logic through fabricated
+/// <see cref="RegistrySecurity"/> instances plus the absent-key read path, and the live ACL is
+/// covered by the manual elevated checklist.
 /// </summary>
 public sealed class RegistryRecoveryJournal : IElevatedRecoveryJournal
 {
     private const string RootPath = @"SOFTWARE\ProcessGuardianAdmin\Recovery";
     private const string StateValue = "State";
 
-    private static readonly SecurityIdentifier AdminsSid = new(WellKnownSidType.BuiltinAdministratorsSid, null);
-    private static readonly SecurityIdentifier SystemSid = new(WellKnownSidType.LocalSystemSid, null);
+    /// <summary>
+    /// Minimum rights to open an existing key for a write: <c>SetValue</c> covers both
+    /// <c>SetValue</c> and <c>DeleteValue</c> (<c>RegDeleteValue</c> requires KEY_SET_VALUE),
+    /// <c>ReadPermissions</c> (READ_CONTROL) covers the owner/DACL verification, and
+    /// <c>QueryValues</c> covers reading the current <c>State</c> before clearing it.
+    /// <c>ChangePermissions</c> is deliberately not requested — it is not a substitute for
+    /// <c>SetValue</c>.
+    /// </summary>
+    internal const RegistryRights WriteRights =
+        RegistryRights.QueryValues | RegistryRights.ReadPermissions | RegistryRights.SetValue;
 
     public Task<RecoveryState> ReadAsync(CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
         using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
-        using var key = baseKey.OpenSubKey(RootPath, RegistryKeyPermissionCheck.ReadSubTree, RegistryRights.ReadKey | RegistryRights.QueryValues)
-            ?? throw Refuse($"the recovery key '{RootDisplayPath()}' cannot be opened (access denied or missing while a state was expected)");
-        VerifyKeySecurity(key);
+        using var key = baseKey.OpenSubKey(RootPath, RegistryKeyPermissionCheck.ReadSubTree,
+            RegistryRights.ReadKey | RegistryRights.QueryValues);
+        if (key is null)
+        {
+            // "Absent key = complete" (the plan's absent = complete state). A missing key is not an
+            // ACL failure — it is the normal clean first run, so it reports None and initialization
+            // proceeds to the normal create/verify path. An existing-but-inaccessible key throws
+            // above and is a refusal. The journal never bypasses the independent parent/config
+            // protection checks (it is one stage of InitializeElevatedAsync, not a trust gate).
+            return Task.FromResult(RecoveryState.None);
+        }
+        VerifyKeySecurity(key, "read");
         return Task.FromResult(ReadState(key));
     }
 
@@ -39,7 +58,9 @@ public sealed class RegistryRecoveryJournal : IElevatedRecoveryJournal
         ct.ThrowIfCancellationRequested();
         using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
         using var key = OpenOrCreateKey(baseKey);
-        VerifyKeySecurity(key);
+        // Post-create verification happens before any State write: a created key whose owner is the
+        // caller's user SID (or whose descriptor did not take) is refused, never used.
+        VerifyKeySecurity(key, "write");
         if (state == RecoveryState.None)
         {
             if (key.GetValue(StateValue, null) is not null)
@@ -54,13 +75,24 @@ public sealed class RegistryRecoveryJournal : IElevatedRecoveryJournal
 
     private static RegistryKey OpenOrCreateKey(RegistryKey baseKey)
     {
-        // An existing key must be verified as-is; a weak pre-existing key is a refusal,
-        // never a silent accept or an in-place ACL overwrite.
-        var existing = baseKey.OpenSubKey(RootPath, RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.ReadKey | RegistryRights.ChangePermissions);
+        // An existing key must be verified as-is; a weak pre-existing key is a refusal, never a
+        // silent accept or an in-place ACL overwrite. Open with the minimum write rights so the
+        // later SetValue/DeleteValue/GetValue succeed on a trusted key.
+        var existing = baseKey.OpenSubKey(RootPath, RegistryKeyPermissionCheck.ReadWriteSubTree, WriteRights);
         if (existing is not null)
             return existing;
 
-        var created = baseKey.CreateSubKey(RootPath, RegistryKeyPermissionCheck.ReadWriteSubTree, CreateProtectedRegistrySecurity());
+        // Create with a descriptor that sets the trusted owner at creation. Setting a non-caller
+        // owner may require SeRestorePrivilege; enable it only for this create and revert it
+        // immediately (the scoped handle disables it in Dispose). SeTakeOwnershipPrivilege is never
+        // used against an existing key or an untrusted config object. If the privilege is not held,
+        // post-create verification is the fail-closed backstop (a user-owned key never passes).
+        RegistryKey? created;
+        using (ElevatedSecurity.EnableRestorePrivilege())
+        {
+            created = baseKey.CreateSubKey(RootPath, RegistryKeyPermissionCheck.ReadWriteSubTree,
+                ElevatedSecurity.CreateProtectedRegistrySecurity());
+        }
         if (created is null)
             throw Refuse($"the recovery key '{RootDisplayPath()}' could not be created");
         return created;
@@ -76,7 +108,7 @@ public sealed class RegistryRecoveryJournal : IElevatedRecoveryJournal
             : throw Refuse($"the recovery key '{RootDisplayPath()}' holds an unrecognized State value '{raw}'");
     }
 
-    private static void VerifyKeySecurity(RegistryKey key)
+    private static void VerifyKeySecurity(RegistryKey key, string operation)
     {
         RegistrySecurity security;
         try
@@ -85,56 +117,13 @@ public sealed class RegistryRecoveryJournal : IElevatedRecoveryJournal
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException)
         {
-            throw Refuse($"the recovery key '{RootDisplayPath()}' cannot be read (READ_CONTROL denied)", ex);
+            // READ_CONTROL denied → fail closed, never "unknown → proceed".
+            throw Refuse($"the recovery key '{RootDisplayPath()}' cannot be read for {operation} (READ_CONTROL denied)", ex);
         }
 
-        var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
-        if (owner is null || (!owner.Equals(AdminsSid) && !owner.Equals(SystemSid)))
-            throw Refuse($"the recovery key '{RootDisplayPath()}' has an untrusted owner");
-
-        if (!security.AreAccessRulesProtected)
-            throw Refuse($"the recovery key '{RootDisplayPath()}' is not inheritance-protected");
-
-        var adminsFull = false;
-        var systemFull = false;
-        var foreignAllow = false;
-        var denyPresent = false;
-        foreach (RegistryAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
-        {
-            if (rule.AccessControlType == AccessControlType.Deny)
-            {
-                denyPresent = true;
-                continue;
-            }
-            var sid = rule.IdentityReference as SecurityIdentifier;
-            if (sid is null)
-                throw Refuse($"the recovery key '{RootDisplayPath()}' has an unmappable ACE");
-
-            var isAdmins = sid.Equals(AdminsSid);
-            var isSystem = sid.Equals(SystemSid);
-            if (!isAdmins && !isSystem)
-                foreignAllow = true;
-            if (isAdmins && rule.RegistryRights.HasFlag(RegistryRights.FullControl))
-                adminsFull = true;
-            if (isSystem && rule.RegistryRights.HasFlag(RegistryRights.FullControl))
-                systemFull = true;
-        }
-
-        if (!adminsFull || !systemFull || foreignAllow || denyPresent)
-            throw Refuse($"the recovery key '{RootDisplayPath()}' has an unexpected DACL shape");
-    }
-
-    private static RegistrySecurity CreateProtectedRegistrySecurity()
-    {
-        var security = new RegistrySecurity();
-        security.SetAccessRuleProtection(true, false);
-        security.AddAccessRule(new RegistryAccessRule(
-            AdminsSid, RegistryRights.FullControl,
-            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-        security.AddAccessRule(new RegistryAccessRule(
-            SystemSid, RegistryRights.FullControl,
-            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-        return security;
+        // Same trust rules as A: a caller/user-owned key is never trusted.
+        if (ElevatedSecurity.ClassifyRegistrySecurity(security) != ProtectionClassification.Trusted)
+            throw Refuse($"the recovery key '{RootDisplayPath()}' is not trusted (foreign owner or unexpected DACL)");
     }
 
     private static string RootDisplayPath() => @"HKLM\" + RootPath;
