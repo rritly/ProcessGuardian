@@ -985,4 +985,60 @@ public class GuardianOrchestratorTests
             "a still-valid retained target+pin with stale enabled=true resumes monitoring at boot");
         await controller.StopAsync();
     }
+
+    [Fact]
+    public async Task SuccessfulRelaunch_DoesNotAdvanceConsecutiveBudget_NoPrematureError()
+    {
+        using var h = new Harness();
+        // Every launch genuinely runs and verifies (Verified). Under the E budget-charge rule a
+        // successful automatic relaunch must NOT consume the consecutive budget (MaxRestartAttempts),
+        // so a fast-crash-then-successfully-relaunched target must not trip premature exhaustion.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; return Task.FromResult(true); });
+        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1));
+        start.Started.Should().BeTrue();
+
+        // Free initial launch + two budgeted successful relaunches (MaxRestartAttempts=1 would have
+        // exhausted already if a successful relaunch wrongly consumed the consecutive budget).
+        await WaitUntilAsync(() => h.StartCallCount >= 3, "the free launch plus two successful relaunches to run");
+
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "a successful automatic relaunch must not advance the consecutive budget (E)");
+        h.StartCallCount.Should().BeGreaterThanOrEqualTo(3);
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task Exhaustion_SaveThrows_ErrorStillPublished_WithSaveFailedFlag()
+    {
+        using var h = new Harness();
+        // Every launch fails (NotStarted): the free initial + MaxRestartAttempts=1 budgeted attempt
+        // exhaust the consecutive budget, and the final Save(false) fails on the fatal path.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(false));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1));
+        start.Started.Should().BeTrue();
+
+        // From now on the store rejects writes: the fatal exhaustion path cannot persist
+        // enabled=false, but Error must still be published with SaveFailed surfaced (F).
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ => throw new IOException("disk failed"));
+
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
+            "the consecutive-budget exhaustion path to publish Error");
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.SaveFailed.Should().BeTrue(
+            "a failed Save(false) on the exhaustion fatal path must surface SaveFailed (F)");
+    }
 }

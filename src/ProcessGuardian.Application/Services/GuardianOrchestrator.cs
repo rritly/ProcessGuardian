@@ -563,7 +563,8 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             }
 
             await TryPersistDisabledBestEffortAsync(knobs).ConfigureAwait(false);
-            Publish(new MonitorState(GuardianStatus.Error, false, "monitoring stopped after repeated failed recovery attempts", false));
+            Publish(new MonitorState(GuardianStatus.Error, false,
+                "monitoring stopped after repeated failed recovery attempts", _lastPersistFailed));
             return SessionAction.EndSession;
         }
 
@@ -582,7 +583,12 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             return SessionAction.Continue;
         }
 
-        counters.RestartAttempts++;
+        // Budget-charge rule (E): only a genuine launched-but-failed attempt advances the
+        // consecutive counter; a successful automatic relaunch counts only toward the window
+        // (I, not in Stage 1) and is reset when the target is observed Running. So Verified
+        // must not consume the consecutive budget.
+        if (started == StartOutcome.NotStarted || started == StartOutcome.VerifyFailed)
+            counters.RestartAttempts++;
         if (started == StartOutcome.Verified)
             ResetDegraded(counters); // a genuinely-restarted target clears the degraded indicator
         var hasMoreAttempts = counters.RestartAttempts < knobs.MaxRestartAttempts || knobs.MaxRestartAttempts == 0;
