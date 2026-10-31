@@ -167,4 +167,98 @@ public class MainViewModelRecoveryTests
             "an autostart failure from a settings commit to surface in the UI");
         vm.AutostartError.Should().Contain("exit 1");
     }
+
+    // ------------------------------------------------------------------
+    // 2.1 — checkbox locked while a reset notice is pending.
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void ResetNoticePending_LocksAutostartCheckbox_ShowsNoVerifiedState()
+    {
+        var vm = new Harness(hasPin: false).CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+
+        vm.IsAutostartEditable.Should().BeFalse("the checkbox is locked until the recovery resolution completes");
+        vm.AutostartEffective.Should().BeFalse("no verified autostart state may be displayed while pending");
+    }
+
+    // ------------------------------------------------------------------
+    // 2.5 — checkbox follows the controller's verified actual state; Unknown/Error is
+    // never shown as verified-off, and a failed enable reverts the checkbox without loops.
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void AutostartStateChanged_Enabled_ChecksCheckbox()
+    {
+        var h = new Harness();
+        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
+        var vm = h.CreateVm();
+
+        h.Controller.AutostartStateChanged += Raise.Event();
+
+        vm.AutostartEffective.Should().BeTrue("the checkbox reflects the verified enabled registration");
+        vm.AutostartError.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void AutostartStateChanged_Unknown_NeverShowsVerifiedOffAndSurfacesError()
+    {
+        var h = new Harness();
+        h.Controller.AutostartActualState.Returns(AutostartState.Unknown);
+        h.Controller.AutostartSyncError.Returns(
+            "the autostart registration state could not be verified; no change was made");
+        var vm = h.CreateVm();
+
+        h.Controller.AutostartStateChanged += Raise.Event();
+
+        vm.AutostartEffective.Should().BeFalse("Unknown must not be displayed as a verified-off checkbox");
+        vm.AutostartError.Should().NotBeEmpty("the startup-sync error must be surfaced in the UI");
+        h.Notifications.Received(1).ShowAsync(
+            Arg.Is<string>(t => t == "Autostart Error"),
+            Arg.Is<string>(m => m.Contains("could not be verified")),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public void AutostartStateChanged_Enabled_AfterSync_ClearsStartupSyncError()
+    {
+        var h = new Harness();
+        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
+        h.Controller.AutostartSyncError.Returns((string?)null);
+        var vm = h.CreateVm();
+
+        // First a failure was published; then a verified state resets the error.
+        h.Controller.AutostartSyncError.Returns("previous error");
+        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
+        h.Controller.AutostartStateChanged += Raise.Event();
+        vm.AutostartError.Should().Contain("previous error");
+
+        // Re-publish with no error.
+        h.Controller.AutostartSyncError.Returns((string?)null);
+        h.Controller.AutostartStateChanged += Raise.Event();
+        vm.AutostartError.Should().BeEmpty("a verified state clears the stale startup-sync error");
+    }
+
+    [Fact]
+    public async Task Commit_AutostartFailure_RevertsCheckboxAndIntent_NoSaveLoop()
+    {
+        var h = new Harness();
+        h.Controller.CommitSettingsAsync(
+                Arg.Any<CommittedSettingsSnapshot>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new CommitSettingsResult(true,
+                AutostartResult.Failure("not registered", AutostartState.Absent))));
+
+        var vm = h.CreateVm();
+        await Task.Delay(100);
+
+        // User toggles the checkbox on; the commit fails; the checkbox must revert to off
+        // and the persisted intent must not stay true (no false "on", no loop).
+        vm.AutostartEffective = true;
+
+        await WaitUntilAsync(() => !vm.AutostartEffective && vm.AutostartError.Length > 0,
+            "the checkbox to revert after a failed autostart enable");
+        vm.Settings.AutostartEnabled.Should().BeFalse("persisted intent must match the verified actual state");
+    }
 }

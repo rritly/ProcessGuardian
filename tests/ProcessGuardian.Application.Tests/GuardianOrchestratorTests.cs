@@ -61,10 +61,10 @@ public class GuardianOrchestratorTests
                 });
             Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
                 .Returns(Task.CompletedTask);
-            Autostart.IsEnabledAsync(Arg.Any<CancellationToken>())
-                .Returns(Task.FromResult(false));
+            Autostart.ReadStateAsync(Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult(AutostartState.Absent));
             Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
-                .Returns(Task.FromResult(AutostartResult.Success(true)));
+                .Returns(Task.FromResult(AutostartResult.Success(AutostartState.Enabled)));
             Status.Report(Arg.Do<GuardianStatus>(s => Statuses.Add(s)));
 
             Notifications.ShowAsync(

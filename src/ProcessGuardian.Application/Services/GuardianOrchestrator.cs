@@ -61,6 +61,21 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
     private MonitorState _state = new(GuardianStatus.Stopped, false, null, false);
 
+    // Recovery pending flag: set when initialization reports ResetNoticePending and cleared only
+    // by an explicit, fully-verified A/B resolution. While pending, ordinary autostart sync is
+    // blocked (a pre-existing scheduler task is never touched by plain settings commits or a
+    // start), the checkbox is locked, and the persisted AutostartEnabled is preserved.
+    private bool _recoveryPending;
+
+    // Latest verified actual autostart registration state + startup-sync error, published to the
+    // presentation layer so a failed boot-time autostart sync is never lost to logs (2.4/2.5).
+    public AutostartState? AutostartActualState { get; private set; }
+
+    public string? AutostartSyncError { get; private set; }
+
+    /// <summary>Raised whenever <see cref="AutostartActualState"/> / <see cref="AutostartSyncError"/> change.</summary>
+    public event EventHandler? AutostartStateChanged;
+
     // --- Test seams ------------------------------------------------------------
     // Pause hooks placed at the two linearization boundaries so the launch-gate race
     // tests are deterministic: before entering the launch critical section, and inside
@@ -93,6 +108,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     public MonitorState CurrentState => _state;
 
     public event EventHandler<MonitorState>? StateChanged;
+
+    /// <summary>True while a reset notice is pending and ordinary autostart sync is blocked.</summary>
+    public bool RecoveryPending => _recoveryPending;
 
     public async Task<AppSettings> GetCurrentSettingsAsync(CancellationToken ct = default)
         => await _config.LoadAsync(ct).ConfigureAwait(false);
@@ -143,6 +161,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 // stay stopped until the user chooses A or B: no SyncAutostartAsync(false)
                 // from the fresh defaults, no automatic session. The notice latch is cleared
                 // only by an explicit resolution (ResolveRecoveryAsync), never here.
+                _recoveryPending = true;
                 _logger.LogWarning("Reset notice pending; autostart task left untouched, monitoring not started");
                 Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
                 return;
@@ -166,7 +185,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
             // Keeps the autostart registration in sync with the persisted flag on every
             // startup (moved with the persistence path; the ViewModel never writes it).
-            await SyncAutostartAsync(_committed.AutostartEnabled, ct).ConfigureAwait(false);
+            // The result is published to the presentation layer so a failed boot-time sync
+            // (or a state we could not verify) is surfaced to the user, not only logged.
+            var autostart = await SyncAutostartAsync(_committed.AutostartEnabled, ct).ConfigureAwait(false);
+            PublishAutostartState(autostart?.ActualState,
+                autostart is { Succeeded: false } ? autostart.Value.ErrorMessage : null);
 
             if (!doc.IsMonitoringEnabled)
             {
@@ -228,6 +251,36 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         try
         {
             var sessionActive = SessionActive;
+
+            if (_recoveryPending)
+            {
+                // [recovery policy] While a reset notice is pending, an ordinary settings commit
+                // must NOT enable/disable autostart (the pre-existing task is never touched by a
+                // plain save) and must NOT overwrite the persisted AutostartEnabled with a value
+                // from a UI snapshot: only an explicit A/B resolution may change the flag. Other
+                // settings are still saved normally, and a committed path change still clears the
+                // pin (which is exactly what re-selecting the target must do).
+                _committed = snapshot;
+                var pendingNewTarget = string.IsNullOrWhiteSpace(targetPath) ? string.Empty : targetPath;
+                var pendingPathChanged =
+                    !string.Equals(pendingNewTarget, _committedTargetPath, StringComparison.OrdinalIgnoreCase);
+                if (!sessionActive && pendingPathChanged)
+                {
+                    _committedTargetPath = pendingNewTarget;
+                    _latestPin = string.Empty;
+                }
+
+                var pendingSaved = await PersistEnabledAsync(enabled: sessionActive, ct, applyAutostart: false)
+                    .ConfigureAwait(false);
+                if (!sessionActive && pendingSaved)
+                    Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
+
+                // Autostart was intentionally not attempted while the notice is pending.
+                return pendingSaved
+                    ? CommitSettingsResult.Persisted(autostart: null)
+                    : CommitSettingsResult.SaveFailed();
+            }
+
             _committed = snapshot;
 
             // Path change is effective only in the stopped state; a stale UI save during an
@@ -322,10 +375,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         var enabled = await SyncAutostartAsync(true, ct).ConfigureAwait(false);
         if (enabled is null || !enabled.Value.Succeeded)
         {
-            _logger.LogError("Keep-autostart: autostart could not be enabled: {Error}", enabled?.ErrorMessage ?? "not attempted");
+            _logger.LogError("Recovery resolution (Keep autostart) failed: autostart could not be enabled: {Error}",
+                enabled?.ErrorMessage ?? "not attempted");
             return RecoveryResolutionResult.Failed(
                 $"autostart could not be enabled: {enabled?.ErrorMessage ?? "unknown reason"}");
         }
+
+        PublishAutostartState(AutostartState.Enabled, null);
 
         // 2) Persist the committed settings with AutostartEnabled = true.
         _committed = snapshot with { AutostartEnabled = true };
@@ -352,7 +408,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
         // 3) Only a fully-verified operation clears the notice; a failure anywhere above leaves
         // it pending so the user can retry.
-        return await TryClearResetNoticeAsync().ConfigureAwait(false);
+        return await TryClearResetNoticeAsync("Keep autostart").ConfigureAwait(false);
     }
 
     // Option B: remove the (possibly pre-existing) task and keep AutostartEnabled = false.
@@ -363,10 +419,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         var disabled = await SyncAutostartAsync(false, ct).ConfigureAwait(false);
         if (disabled is null || !disabled.Value.Succeeded)
         {
-            _logger.LogError("Remove-autostart: autostart could not be disabled: {Error}", disabled?.ErrorMessage ?? "not attempted");
+            _logger.LogError("Recovery resolution (Remove autostart) failed: autostart could not be removed: {Error}",
+                disabled?.ErrorMessage ?? "not attempted");
             return RecoveryResolutionResult.Failed(
                 $"autostart could not be removed: {disabled?.ErrorMessage ?? "unknown reason"}");
         }
+
+        PublishAutostartState(AutostartState.Absent, null);
 
         // 2) Persist AutostartEnabled = false. Monitoring state is untouched by option B.
         if (snapshot is not null)
@@ -393,29 +452,32 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         }
 
         // 3) Only a fully-verified operation clears the notice.
-        return await TryClearResetNoticeAsync().ConfigureAwait(false);
+        return await TryClearResetNoticeAsync("Remove autostart").ConfigureAwait(false);
     }
 
-    private async Task<RecoveryResolutionResult> TryClearResetNoticeAsync()
+    private async Task<RecoveryResolutionResult> TryClearResetNoticeAsync(string variant)
     {
         if (_resetNoticeAck is null)
         {
-            _logger.LogError("Reset-notice acknowledgement is unavailable; recovery cannot be finalized");
+            _logger.LogError("Recovery resolution ({Variant}) failed: reset-notice acknowledgement is unavailable", variant);
             return RecoveryResolutionResult.Failed("the recovery could not be finalized; try again later.");
         }
 
         try
         {
             await _resetNoticeAck.ClearAsync(CancellationToken.None).ConfigureAwait(false);
-            _logger.LogInformation("Recovery resolution succeeded; reset notice cleared");
+            _logger.LogInformation("Recovery resolution ({Variant}) completed; reset notice cleared", variant);
+            // The notice is gone: ordinary autostart sync is allowed again.
+            _recoveryPending = false;
             Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
             return RecoveryResolutionResult.Succeeded();
         }
         catch (Exception ex)
         {
             // The latch could not be cleared, so the recovery is not complete: leave the notice
-            // pending and let the user retry rather than reporting a false success.
-            _logger.LogError(ex, "Failed to clear the reset notice after a successful resolution");
+            // pending (and ordinary sync blocked) and let the user retry rather than reporting a
+            // false success.
+            _logger.LogError(ex, "Recovery resolution ({Variant}) could not finalize the reset notice", variant);
             return RecoveryResolutionResult.Failed("the recovery could not be finalized; try again.");
         }
     }
@@ -456,7 +518,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             _committed = request.Settings;
             _committedTargetPath = canonicalPath;
             _latestPin = pin;
-            if (!await PersistEnabledAsync(enabled: true, ct).ConfigureAwait(false))
+            if (!await PersistEnabledAsync(enabled: true, ct, applyAutostart: !_recoveryPending).ConfigureAwait(false))
             {
                 Publish(new MonitorState(GuardianStatus.Stopped, true, "settings could not be persisted; monitoring not started", true));
                 return new StartResult(false, "settings could not be persisted; monitoring not started");
@@ -487,7 +549,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             if (cts is null || task is { IsCompleted: true })
             {
                 // No live session: persist the desired off-state (best-effort) and report stopped.
-                var saved = await PersistEnabledAsync(enabled: false, ct).ConfigureAwait(false);
+                var saved = await PersistEnabledAsync(enabled: false, ct, applyAutostart: !_recoveryPending).ConfigureAwait(false);
                 Publish(new MonitorState(GuardianStatus.Stopped, !saved, null, !saved));
                 return saved ? StopResult.AlreadyStopped() : StopResult.RuntimeStopped_SaveFailed(new Exception("persisting the disabled state failed"));
             }
@@ -522,7 +584,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             _sessionTask = null;
 
             // One final store save merging committed fields with controller-owned state.
-            var settingsSaved = await PersistEnabledAsync(enabled: false, ct).ConfigureAwait(false);
+            var settingsSaved = await PersistEnabledAsync(enabled: false, ct, applyAutostart: !_recoveryPending).ConfigureAwait(false);
             Publish(new MonitorState(GuardianStatus.Stopped, !settingsSaved, null, !settingsSaved));
             if (!settingsSaved)
             {
@@ -995,15 +1057,18 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
     private bool _lastPersistFailed;
 
-    private async Task<bool> PersistEnabledAsync(bool enabled, CancellationToken ct)
+    private async Task<bool> PersistEnabledAsync(bool enabled, CancellationToken ct, bool applyAutostart = true)
     {
         try
         {
             var doc = await _config.LoadAsync(ct).ConfigureAwait(false);
+            var preservedAutostart = doc.AutostartEnabled;
             ApplyCommitted(doc, _committed);
             doc.TargetProcessPath = _committedTargetPath;
             doc.TargetHashSha256 = _latestPin;
             doc.IsMonitoringEnabled = enabled;
+            if (!applyAutostart)
+                doc.AutostartEnabled = preservedAutostart; // never overwrite the flag outside an explicit A/B resolution
             await _config.SaveAsync(doc, ct).ConfigureAwait(false);
             _lastPersistFailed = false;
             return true;
@@ -1062,11 +1127,26 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     {
         try
         {
-            // The service reports a verified result (actual state checked after the operation);
-            // the controller surfaces it instead of swallowing it so the UI can show the failure.
-            var current = await _autostart.IsEnabledAsync(ct).ConfigureAwait(false);
-            if (current == desiredEnabled)
-                return AutostartResult.Success(current); // idempotent: already in the desired state
+            // The service reports a typed, verified state; the controller surfaces it instead of
+            // swallowing it so the UI can show the failure and the checkbox reflects reality.
+            var state = await _autostart.ReadStateAsync(ct).ConfigureAwait(false);
+            if (state == AutostartState.Unknown)
+            {
+                // A reliable read failure must never be treated as "off" (2.4/2.5): mutating on
+                // the back of an unknown state could destroy a mis-detected registration or claim
+                // a verified state we do not have. Surface the uncertainty and make no change —
+                // an Unknown state is never a trigger for a potentially destructive disable.
+                _logger.LogWarning("Autostart state could not be read reliably; no change was made");
+                return AutostartResult.Failure(
+                    "the autostart registration state could not be verified; no change was made",
+                    AutostartState.Unknown);
+            }
+
+            // Verified idempotent fast path.
+            if (desiredEnabled && state == AutostartState.Enabled)
+                return AutostartResult.Success(state);
+            if (!desiredEnabled && state == AutostartState.Absent)
+                return AutostartResult.Success(state);
 
             return await _autostart.SetEnabledAsync(desiredEnabled, ct).ConfigureAwait(false);
         }
@@ -1079,6 +1159,22 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             // A service-side exception is surfaced as a failure result with diagnostics, never lost.
             _logger.LogError(ex, "Autostart sync failed");
             return AutostartResult.Failure($"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // Publishes the verified autostart state + the latest sync error to the presentation layer
+    // (the checkbox is driven by the actual state; a startup-sync failure is surfaced, not logged).
+    private void PublishAutostartState(AutostartState? state, string? error)
+    {
+        AutostartActualState = state;
+        AutostartSyncError = error;
+        try
+        {
+            AutostartStateChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "AutostartStateChanged subscriber threw");
         }
     }
 

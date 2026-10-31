@@ -61,6 +61,21 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _autostartError = string.Empty;
 
+    // Checkbox display state: the verified ACTUAL registration (checked only when the controller
+    // confirmed an Enabled registration). The persisted intent lives in Settings.AutostartEnabled;
+    // this property decouples them so a failed enable never leaves a checked box (2.5).
+    [ObservableProperty]
+    private bool _autostartEffective;
+
+    // False while a reset notice is pending: ordinary autostart edits are locked until the user
+    // resolves the recovery explicitly (2.1).
+    [ObservableProperty]
+    private bool _isAutostartEditable = true;
+
+    // Guards programmatic AutostartEffective updates so they never look like a user toggle
+    // (a programmatic set must not re-schedule a save and loop on an error state).
+    private bool _updatingAutostartEffective;
+
     // Serializes the two recovery resolutions so Keep/Remove cannot run concurrently.
     private bool _resolutionInProgress;
 
@@ -105,6 +120,10 @@ public partial class MainViewModel : ObservableObject
                 if (state.SaveFailed)
                     _logger.LogError("Monitoring state: save failed ({Reason})", state.Reason);
             });
+
+        // Autostart actual-state channel: the controller is the single writer; the checkbox and
+        // the startup-sync error are driven from the verified registration state (2.4/2.5).
+        _controller.AutostartStateChanged += (_, __) => OnDispatcher(ApplyAutostartStateFromController);
 
         // Update log text when new entries arrive
         _logSink.LogUpdated += (_, __) =>
@@ -240,7 +259,20 @@ public partial class MainViewModel : ObservableObject
             case ConfigurationInitializationStatus.ResetNoticePending:
                 ResetNotice =
                     "Settings were reset to safe defaults: the previous configuration was untrusted and has been " +
-                    "quarantined. Monitoring is off and the target pin is cleared — re-select and re-pin the target to start.";
+                    "quarantined. Monitoring is off and the target pin is cleared — start monitoring once to " +
+                    "re-select and re-pin the target, then choose how to resolve autostart below.";
+                // Until the user resolves the recovery explicitly, autostart edits are locked and the
+                // checkbox must not show a verified state (2.1/2.5).
+                IsAutostartEditable = false;
+                _updatingAutostartEffective = true;
+                try
+                {
+                    AutostartEffective = false;
+                }
+                finally
+                {
+                    _updatingAutostartEffective = false;
+                }
                 NotifyRecoveryCanExecuteChanged();
                 break;
         }
@@ -257,6 +289,58 @@ public partial class MainViewModel : ObservableObject
     private bool CanRemoveAutostart =>
         !_resolutionInProgress && !string.IsNullOrEmpty(ResetNotice);
 
+    // The checkbox toggles the DESIRED intent; the controller verifies the actual registration
+    // and corrects AutostartEffective on the result / autostart-state channel. A programmatic
+    // update (guarded by _updatingAutostartEffective) never re-enters this path.
+    partial void OnAutostartEffectiveChanged(bool value)
+    {
+        if (_updatingAutostartEffective)
+            return;
+        _suppressSave = true;
+        try
+        {
+            Settings.AutostartEnabled = value;
+        }
+        finally
+        {
+            _suppressSave = false;
+        }
+        _ = CommitNowAsync();
+    }
+
+    // Applies the controller's verified autostart state to the checkbox and surfaces a
+    // startup-sync failure. Commit-time autostart errors are surfaced by CommitAsync directly
+    // (no duplicate toast here); this handler toasts only for the reconciliation-time error.
+    private void ApplyAutostartStateFromController()
+    {
+        if (_controller.AutostartActualState is { } state)
+        {
+            _updatingAutostartEffective = true;
+            try
+            {
+                AutostartEffective = state == AutostartState.Enabled;
+            }
+            finally
+            {
+                _updatingAutostartEffective = false;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(_controller.AutostartSyncError))
+        {
+            AutostartError = _controller.AutostartSyncError!;
+            _logger.LogWarning("Autostart sync error surfaced: {Error}", _controller.AutostartSyncError);
+            if (Settings.EnableToasts)
+                _ = _notifications.ShowAsync("Autostart Error", AutostartError);
+        }
+        else if (_controller.AutostartActualState is not null)
+        {
+            // A newer, successfully synchronized state supersedes a stale sync error: a one-off
+            // startup failure must not linger once the registration is verified again.
+            AutostartError = string.Empty;
+        }
+    }
+
     [RelayCommand(CanExecute = nameof(CanKeepAutostart))]
     private async Task KeepAutostart()
     {
@@ -269,7 +353,7 @@ public partial class MainViewModel : ObservableObject
                 RecoveryResolutionChoice.KeepAutostart,
                 CommitSnapshot(),
                 Settings.TargetProcessPath);
-            await HandleRecoveryResultAsync(result);
+            await HandleRecoveryResultAsync(RecoveryResolutionChoice.KeepAutostart, result);
         }
         catch (Exception ex)
         {
@@ -295,7 +379,7 @@ public partial class MainViewModel : ObservableObject
             var result = await _controller.ResolveRecoveryAsync(
                 RecoveryResolutionChoice.RemoveAutostart,
                 CommitSnapshot());
-            await HandleRecoveryResultAsync(result);
+            await HandleRecoveryResultAsync(RecoveryResolutionChoice.RemoveAutostart, result);
         }
         catch (Exception ex)
         {
@@ -332,23 +416,33 @@ public partial class MainViewModel : ObservableObject
         RemoveAutostartCommand.NotifyCanExecuteChanged();
     }
 
-    private async Task HandleRecoveryResultAsync(RecoveryResolutionResult result)
+    private async Task HandleRecoveryResultAsync(RecoveryResolutionChoice choice, RecoveryResolutionResult result)
     {
+        NotifyRecoveryCanExecuteChanged();
         if (result.Resolved)
         {
-            // A fully-verified resolution clears the notice; the recovery is complete.
+            // A fully-verified resolution clears the notice and unlocks autostart editing; the
+            // recovery is complete only after the operations AND the journal clear succeeded.
             ResetNotice = string.Empty;
             AutostartError = string.Empty;
-            _logger.LogInformation("Recovery resolution completed");
+            IsAutostartEditable = true;
+            var (title, body) = choice == RecoveryResolutionChoice.KeepAutostart
+                ? ("Autostart Kept",
+                   "The scheduled task is enabled and the recovery is complete. The app will start " +
+                   "automatically at the next logon.")
+                : ("Autostart Removed",
+                   "The scheduled task was removed and the recovery is complete. The app will not " +
+                   "start automatically at the next logon.");
+            _logger.LogInformation("Recovery resolution ({Variant}) completed; reset notice cleared", choice);
             NotifyRecoveryCanExecuteChanged();
             if (Settings.EnableToasts)
-                _ = _notifications.ShowAsync("Recovery Complete", string.Empty);
+                _ = _notifications.ShowAsync(title, body);
         }
         else
         {
             // The notice stays pending; the user can retry the same or the other option.
             AutostartError = result.ErrorMessage ?? "The recovery could not be completed; try again.";
-            _logger.LogWarning("Recovery not completed: {Error}", AutostartError);
+            _logger.LogWarning("Recovery not completed ({Variant}): {Error}", choice, AutostartError);
             NotifyRecoveryCanExecuteChanged();
             if (Settings.EnableToasts)
                 _ = _notifications.ShowAsync("Recovery Not Complete", AutostartError);
@@ -586,13 +680,48 @@ public partial class MainViewModel : ObservableObject
                 // the explicit error so the checkbox never reads "on" without real registration.
                 AutostartError = autostart.ErrorMessage ?? "Autostart update failed";
                 _logger.LogError("Settings commit: autostart failed: {Error}", AutostartError);
+                if (autostart.ActualState != AutostartState.Enabled)
+                {
+                    // Revert the displayed + persisted intent to the verified actual state so the
+                    // checkbox never reads "on" and saved settings stay consistent — programmatic,
+                    // so no debounce/save loop is scheduled (2.5).
+                    _updatingAutostartEffective = true;
+                    try
+                    {
+                        AutostartEffective = false;
+                    }
+                    finally
+                    {
+                        _updatingAutostartEffective = false;
+                    }
+                    _suppressSave = true;
+                    try
+                    {
+                        if (Settings.AutostartEnabled)
+                            Settings.AutostartEnabled = false;
+                    }
+                    finally
+                    {
+                        _suppressSave = false;
+                    }
+                }
                 if (Settings.EnableToasts)
                     _ = _notifications.ShowAsync("Autostart Error", AutostartError);
             }
-            else if (result.Autostart is { Succeeded: true })
+            else if (result.Autostart is { Succeeded: true } autostartOk)
             {
-                // A verified autostart success clears any earlier stale error.
+                // A verified autostart success clears any earlier stale error and confirms the
+                // checkbox against the actual registration state.
                 AutostartError = string.Empty;
+                _updatingAutostartEffective = true;
+                try
+                {
+                    AutostartEffective = autostartOk.ActualState == AutostartState.Enabled;
+                }
+                finally
+                {
+                    _updatingAutostartEffective = false;
+                }
             }
         }
         catch (OperationCanceledException)

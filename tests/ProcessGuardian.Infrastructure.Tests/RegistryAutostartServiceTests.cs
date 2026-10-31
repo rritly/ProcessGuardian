@@ -2,6 +2,7 @@ using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Win32;
 using ProcessGuardian.Domain;
+using ProcessGuardian.Domain.Enums;
 using ProcessGuardian.Infrastructure.Autostart;
 using Xunit;
 
@@ -35,13 +36,13 @@ public class RegistryAutostartServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SetEnabledTrue_ReportsVerifiedSucceeded()
+    public async Task SetEnabledTrue_ReportsVerifiedSucceeded_AndReadsEnabled()
     {
         var result = await _service.SetEnabledAsync(true);
 
         result.Succeeded.Should().BeTrue();
-        result.ActualState.Should().BeTrue();
-        (await _service.IsEnabledAsync()).Should().BeTrue();
+        result.ActualState.Should().Be(AutostartState.Enabled);
+        (await _service.ReadStateAsync()).Should().Be(AutostartState.Enabled);
     }
 
     [Fact]
@@ -59,14 +60,14 @@ public class RegistryAutostartServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SetEnabledFalse_IsEnabledReturnsFalse()
+    public async Task SetEnabledFalse_RemovesValue_AndReadsAbsent()
     {
         await _service.SetEnabledAsync(true);
         var result = await _service.SetEnabledAsync(false);
 
         result.Succeeded.Should().BeTrue();
-        result.ActualState.Should().BeFalse();
-        (await _service.IsEnabledAsync()).Should().BeFalse();
+        result.ActualState.Should().Be(AutostartState.Absent);
+        (await _service.ReadStateAsync()).Should().Be(AutostartState.Absent);
         using var key = Registry.CurrentUser.OpenSubKey(_scratchPath, false);
         var value = key?.GetValue(KeyName);
         value.Should().BeNull();
@@ -78,8 +79,24 @@ public class RegistryAutostartServiceTests : IDisposable
         var result = await _service.SetEnabledAsync(false);
 
         result.Succeeded.Should().BeTrue();
-        result.ActualState.Should().BeFalse();
+        result.ActualState.Should().Be(AutostartState.Absent);
         Func<Task> act = () => _service.SetEnabledAsync(false);
         await act.Should().NotThrowAsync();
+    }
+
+    [Fact]
+    public async Task ReadState_WhenNoValue_IsAbsent_NotUnknown()
+    {
+        (await _service.ReadStateAsync()).Should().Be(AutostartState.Absent);
+    }
+
+    [Fact]
+    public async Task ReadState_WhenValueIsNotTheExpectedBackgroundEntry_IsMisconfigured()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(_scratchPath, true)
+                        ?? Registry.CurrentUser.CreateSubKey(_scratchPath);
+        key.SetValue(KeyName, "\"C:\\Other\\app.exe\" --background");
+
+        (await _service.ReadStateAsync()).Should().Be(AutostartState.Misconfigured);
     }
 }

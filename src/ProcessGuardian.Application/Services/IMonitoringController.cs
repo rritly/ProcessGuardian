@@ -2,7 +2,6 @@ using ProcessGuardian.Domain.Entities;
 using ProcessGuardian.Domain.Enums;
 
 namespace ProcessGuardian.Application.Services;
-
 /// <summary>
 /// Single writer for monitoring state and persistence. The controller serializes
 /// Start/Stop/Suspend internally (the UI busy gate is no longer the only guard),
@@ -24,6 +23,18 @@ public interface IMonitoringController
     /// execution until the user has re-selected and re-pinned the target.
     /// </summary>
     bool HasRecordedPin { get; }
+
+    /// <summary>True while a reset notice is pending; ordinary autostart sync is blocked (recovery A/B).</summary>
+    bool RecoveryPending { get; }
+
+    /// <summary>Latest verified actual autostart registration state (drives the checkbox display).</summary>
+    AutostartState? AutostartActualState { get; }
+
+    /// <summary>Error from the most recent autostart sync (startup reconciliation included).</summary>
+    string? AutostartSyncError { get; }
+
+    /// <summary>Raised whenever the autostart actual state / sync error changes.</summary>
+    event EventHandler? AutostartStateChanged;
 
     /// <summary>State channel; raised for every observable transition (including degraded/save-failed flags).</summary>
     event EventHandler<MonitorState>? StateChanged;
