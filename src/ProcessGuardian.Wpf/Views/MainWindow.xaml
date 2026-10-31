@@ -785,9 +785,11 @@
 
                 <!-- Full-width guidance row below the monitoring controls/status row (R-A): long
                      refusal/reset guidance wraps and stays readable at normal window width instead of
-                     being squeezed into the horizontal controls row or a fixed-height row. Each panel
-                     collapses when its message is empty. -->
-                <StackPanel Grid.Row="1" Margin="15,10,15,12" HorizontalAlignment="Stretch">
+                     being squeezed into the horizontal controls row or a fixed-height row. The whole
+                     container is Collapsed when no message and no recovery indication exists, so an
+                     empty row reserves no vertical space (each child also collapses individually). -->
+                <StackPanel Grid.Row="1" Margin="15,10,15,12" HorizontalAlignment="Stretch"
+                            Visibility="{Binding HasStatusGuidance, Converter={StaticResource BoolToVisibilityConverter}}">
                     <TextBlock Text="{Binding ConfigurationError}"
                                TextWrapping="Wrap"
                                HorizontalAlignment="Stretch"

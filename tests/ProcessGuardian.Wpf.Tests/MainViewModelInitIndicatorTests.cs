@@ -66,6 +66,38 @@ public class MainViewModelInitIndicatorTests
         vm.StartCommand.CanExecute(null).Should().BeTrue("after a reset the user must be able to re-select/re-pin the target");
     }
 
+    // Monitoring Card layout: the guidance row must be fully collapsed (HasStatusGuidance ==
+    // false) when no message and no recovery indication exists, and visible whenever any of the
+    // three source messages is present.
+    [Fact]
+    public void FreshStart_NoGuidance_HasStatusGuidanceFalse_ContainerCollapses()
+    {
+        var vm = new Harness().CreateVm();
+
+        vm.ConfigurationError.Should().BeEmpty();
+        vm.ResetNotice.Should().BeEmpty();
+        vm.AutostartError.Should().BeEmpty();
+        vm.HasStatusGuidance.Should().BeFalse("an empty guidance state must collapse the row so no vertical space is reserved");
+    }
+
+    [Theory]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(false, false, true)]
+    [InlineData(true, true, true)]
+    public void HasStatusGuidance_IsTrueWhenAnyMessagePresent(bool config, bool reset, bool autostart)
+    {
+        var vm = new Harness().CreateVm();
+        if (config)
+            vm.ConfigurationError = "config refused";
+        if (reset)
+            vm.ResetNotice = "reset pending";
+        if (autostart)
+            vm.AutostartError = "autostart failed";
+
+        vm.HasStatusGuidance.Should().BeTrue("any guidance message must keep the guidance row visible");
+    }
+
     [Fact]
     public async Task GetCurrentSettings_ThrowsConfigurationUnavailable_SetsErrorIndicatorAndGatesStartOff()
     {

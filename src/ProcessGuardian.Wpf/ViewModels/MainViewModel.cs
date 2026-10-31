@@ -50,15 +50,18 @@ public partial class MainViewModel : ObservableObject
     // reports that untrusted settings were quarantined and replaced with fresh defaults.
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(StartCommand))]
+    [NotifyPropertyChangedFor(nameof(HasStatusGuidance))]
     private string _configurationError = string.Empty;
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasStatusGuidance))]
     private string _resetNotice = string.Empty;
 
     // Autostart/recovery error surfaced to the user when a settings commit's autostart step
     // failed or a recovery resolution (A/B) could not be completed. The checkbox never reports
     // "on" while registration is absent; this message explains why explicitly.
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasStatusGuidance))]
     private string _autostartError = string.Empty;
 
     // Checkbox display state: the verified ACTUAL registration (checked only when the controller
@@ -277,6 +280,15 @@ public partial class MainViewModel : ObservableObject
                 break;
         }
     }
+
+    // True when any persistent status-guidance message is present (refused configuration,
+    // pending reset notice, or an autostart/recovery error). The Status card guidance row is
+    // fully collapsed when nothing needs to be shown (Monitoring Card layout fix), so an empty
+    // state reserves no extra vertical space in either edition.
+    public bool HasStatusGuidance =>
+        !string.IsNullOrEmpty(ConfigurationError)
+        || !string.IsNullOrEmpty(ResetNotice)
+        || !string.IsNullOrEmpty(AutostartError);
 
     // Exposes the two explicit recovery resolutions. Both require a pending notice; option A
     // (keep autostart) additionally requires a recorded pin so the user must first re-select,
