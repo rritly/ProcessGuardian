@@ -722,7 +722,11 @@
                 CornerRadius="12">
             <Grid>
                 <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
+                    <!-- Fixed 60 DIP control row: the monitoring controls keep their intended
+                         geometry and are vertically centered (the controls StackPanel uses
+                         VerticalAlignment=Center). The message row below stays Auto so long
+                         refusal/reset guidance wraps and grows the card without ever clipping. -->
+                    <RowDefinition Height="60" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
