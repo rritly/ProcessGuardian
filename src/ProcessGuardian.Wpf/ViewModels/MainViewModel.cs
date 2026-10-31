@@ -55,6 +55,15 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _resetNotice = string.Empty;
 
+    // Autostart/recovery error surfaced to the user when a settings commit's autostart step
+    // failed or a recovery resolution (A/B) could not be completed. The checkbox never reports
+    // "on" while registration is absent; this message explains why explicitly.
+    [ObservableProperty]
+    private string _autostartError = string.Empty;
+
+    // Serializes the two recovery resolutions so Keep/Remove cannot run concurrently.
+    private bool _resolutionInProgress;
+
     private CancellationTokenSource? _saveCts;
 
     // Busy gate for Start/Stop, shared by the window buttons and the tray menu: held
@@ -232,7 +241,117 @@ public partial class MainViewModel : ObservableObject
                 ResetNotice =
                     "Settings were reset to safe defaults: the previous configuration was untrusted and has been " +
                     "quarantined. Monitoring is off and the target pin is cleared — re-select and re-pin the target to start.";
+                NotifyRecoveryCanExecuteChanged();
                 break;
+        }
+    }
+
+    // Exposes the two explicit recovery resolutions. Both require a pending notice; option A
+    // (keep autostart) additionally requires a recorded pin so the user must first re-select,
+    // re-pin and save the target through the controller.
+    private bool CanKeepAutostart =>
+        !_resolutionInProgress
+        && !string.IsNullOrEmpty(ResetNotice)
+        && _controller.HasRecordedPin;
+
+    private bool CanRemoveAutostart =>
+        !_resolutionInProgress && !string.IsNullOrEmpty(ResetNotice);
+
+    [RelayCommand(CanExecute = nameof(CanKeepAutostart))]
+    private async Task KeepAutostart()
+    {
+        if (!BeginResolution())
+            return;
+        try
+        {
+            AutostartError = string.Empty;
+            var result = await _controller.ResolveRecoveryAsync(
+                RecoveryResolutionChoice.KeepAutostart,
+                CommitSnapshot(),
+                Settings.TargetProcessPath);
+            await HandleRecoveryResultAsync(result);
+        }
+        catch (Exception ex)
+        {
+            AutostartError = $"Keep-autostart failed: {ex.Message}";
+            _logger.LogError(ex, "Keep-autostart resolution failed");
+            if (Settings.EnableToasts)
+                _ = _notifications.ShowAsync("Recovery Not Complete", AutostartError);
+        }
+        finally
+        {
+            EndResolution();
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRemoveAutostart))]
+    private async Task RemoveAutostart()
+    {
+        if (!BeginResolution())
+            return;
+        try
+        {
+            AutostartError = string.Empty;
+            var result = await _controller.ResolveRecoveryAsync(
+                RecoveryResolutionChoice.RemoveAutostart,
+                CommitSnapshot());
+            await HandleRecoveryResultAsync(result);
+        }
+        catch (Exception ex)
+        {
+            AutostartError = $"Remove-autostart failed: {ex.Message}";
+            _logger.LogError(ex, "Remove-autostart resolution failed");
+            if (Settings.EnableToasts)
+                _ = _notifications.ShowAsync("Recovery Not Complete", AutostartError);
+        }
+        finally
+        {
+            EndResolution();
+        }
+    }
+
+    // Claims the recovery gate; returns false when a resolution is already in flight.
+    private bool BeginResolution()
+    {
+        if (_resolutionInProgress)
+            return false;
+        _resolutionInProgress = true;
+        NotifyRecoveryCanExecuteChanged();
+        return true;
+    }
+
+    private void EndResolution()
+    {
+        _resolutionInProgress = false;
+        NotifyRecoveryCanExecuteChanged();
+    }
+
+    private void NotifyRecoveryCanExecuteChanged()
+    {
+        KeepAutostartCommand.NotifyCanExecuteChanged();
+        RemoveAutostartCommand.NotifyCanExecuteChanged();
+    }
+
+    private async Task HandleRecoveryResultAsync(RecoveryResolutionResult result)
+    {
+        if (result.Resolved)
+        {
+            // A fully-verified resolution clears the notice; the recovery is complete.
+            ResetNotice = string.Empty;
+            AutostartError = string.Empty;
+            _logger.LogInformation("Recovery resolution completed");
+            NotifyRecoveryCanExecuteChanged();
+            if (Settings.EnableToasts)
+                _ = _notifications.ShowAsync("Recovery Complete", string.Empty);
+        }
+        else
+        {
+            // The notice stays pending; the user can retry the same or the other option.
+            AutostartError = result.ErrorMessage ?? "The recovery could not be completed; try again.";
+            _logger.LogWarning("Recovery not completed: {Error}", AutostartError);
+            NotifyRecoveryCanExecuteChanged();
+            if (Settings.EnableToasts)
+                _ = _notifications.ShowAsync("Recovery Not Complete", AutostartError);
         }
     }
 
@@ -269,6 +388,8 @@ public partial class MainViewModel : ObservableObject
             if (Settings.EnableToasts)
                 _ = _notifications.ShowAsync("Monitoring Started", string.Empty);
             await WaitUntilReadyAsync();
+            // A Start records the target pin, which may enable the keep-autostart recovery option.
+            NotifyRecoveryCanExecuteChanged();
         }
         finally
         {
@@ -366,6 +487,8 @@ public partial class MainViewModel : ObservableObject
                 // A committed path change in the stopped state clears the pin through the
                 // controller; keystrokes (uncommitted draft) do not.
                 _ = CommitNowAsync();
+                // A path re-selection clears the recorded pin, possibly disabling keep-autostart.
+                NotifyRecoveryCanExecuteChanged();
             }
         }
         catch (Exception ex)
@@ -449,7 +572,28 @@ public partial class MainViewModel : ObservableObject
     {
         try
         {
-            await _controller.CommitSettingsAsync(CommitSnapshot(), Settings.TargetProcessPath);
+            var result = await _controller.CommitSettingsAsync(CommitSnapshot(), Settings.TargetProcessPath);
+            if (!result.Saved)
+            {
+                // The persistence step itself failed; the failure is already surfaced through the
+                // controller's StateChanged (SaveFailed). Log it here too.
+                _logger.LogError("Settings commit: settings save failed");
+            }
+
+            if (result.Autostart is { Succeeded: false } autostart)
+            {
+                // A failed autostart step is never masked by a successful settings save: surface
+                // the explicit error so the checkbox never reads "on" without real registration.
+                AutostartError = autostart.ErrorMessage ?? "Autostart update failed";
+                _logger.LogError("Settings commit: autostart failed: {Error}", AutostartError);
+                if (Settings.EnableToasts)
+                    _ = _notifications.ShowAsync("Autostart Error", AutostartError);
+            }
+            else if (result.Autostart is { Succeeded: true })
+            {
+                // A verified autostart success clears any earlier stale error.
+                AutostartError = string.Empty;
+            }
         }
         catch (OperationCanceledException)
         {

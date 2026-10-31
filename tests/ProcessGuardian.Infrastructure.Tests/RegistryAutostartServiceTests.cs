@@ -35,10 +35,12 @@ public class RegistryAutostartServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SetEnabledTrue_IsEnabledReturnsTrue()
+    public async Task SetEnabledTrue_ReportsVerifiedSucceeded()
     {
-        await _service.SetEnabledAsync(true);
+        var result = await _service.SetEnabledAsync(true);
 
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().BeTrue();
         (await _service.IsEnabledAsync()).Should().BeTrue();
     }
 
@@ -60,18 +62,23 @@ public class RegistryAutostartServiceTests : IDisposable
     public async Task SetEnabledFalse_IsEnabledReturnsFalse()
     {
         await _service.SetEnabledAsync(true);
-        await _service.SetEnabledAsync(false);
+        var result = await _service.SetEnabledAsync(false);
 
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().BeFalse();
         (await _service.IsEnabledAsync()).Should().BeFalse();
         using var key = Registry.CurrentUser.OpenSubKey(_scratchPath, false);
-        key?.GetValue(KeyName).Should().BeNull();
+        var value = key?.GetValue(KeyName);
+        value.Should().BeNull();
     }
 
     [Fact]
-    public async Task SetEnabledFalseWhenNotSet_DoesNotThrow()
+    public async Task SetEnabledFalseWhenNotSet_IsIdempotentAndSucceeds()
     {
-        await _service.SetEnabledAsync(false);
+        var result = await _service.SetEnabledAsync(false);
 
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().BeFalse();
         Func<Task> act = () => _service.SetEnabledAsync(false);
         await act.Should().NotThrowAsync();
     }

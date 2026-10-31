@@ -6,6 +6,12 @@ using System.Security;
 
 namespace ProcessGuardian.Infrastructure.Autostart;
 
+/// <summary>
+/// HKCU Run-based autostart for the regular (non-elevated) edition. Semantically the
+/// user-scoped counterpart of the scheduled-task service used by the admin edition. It
+/// reports a verified <see cref="AutostartResult"/> so a failed write or a state that did
+/// not take effect is never lost.
+/// </summary>
 public sealed class RegistryAutostartService : IAutostartService
 {
     private static readonly string KeyName = AppEdition.AutostartValueName;
@@ -45,8 +51,12 @@ public sealed class RegistryAutostartService : IAutostartService
         }
     }
 
-    public Task SetEnabledAsync(bool enabled, CancellationToken ct = default)
+    public async Task<AutostartResult> SetEnabledAsync(bool enabled, CancellationToken ct = default)
     {
+        var current = await IsEnabledAsync(ct).ConfigureAwait(false);
+        if (current == enabled)
+            return AutostartResult.Success(current); // idempotent: already in the desired state
+
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(_registryPath, true)
@@ -60,7 +70,7 @@ public sealed class RegistryAutostartService : IAutostartService
                 if (string.IsNullOrWhiteSpace(exePath))
                 {
                     _logger.LogError("Cannot enable autostart: current executable path is unavailable");
-                    return Task.CompletedTask;
+                    return AutostartResult.Failure("the current executable path is unavailable for autostart", current);
                 }
                 key.SetValue(KeyName, $"\"{exePath}\" --background");
             }
@@ -68,22 +78,31 @@ public sealed class RegistryAutostartService : IAutostartService
             {
                 key.DeleteValue(KeyName, false);
             }
-            return Task.CompletedTask;
         }
         catch (UnauthorizedAccessException ex)
         {
             _logger.LogError(ex, "Access denied modifying autostart registry");
-            return Task.CompletedTask;
+            return AutostartResult.Failure("access was denied while modifying the autostart registry", current);
         }
         catch (SecurityException ex)
         {
             _logger.LogError(ex, "Security exception modifying autostart registry");
-            return Task.CompletedTask;
+            return AutostartResult.Failure("a security exception occurred while modifying the autostart registry", current);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error modifying autostart registry");
-            return Task.CompletedTask;
+            return AutostartResult.Failure($"an unexpected error occurred while modifying the autostart registry: {ex.Message}", current);
         }
+
+        // Verify the actual registry value rather than trusting the write call alone.
+        var actual = await IsEnabledAsync(ct).ConfigureAwait(false);
+        return actual == enabled
+            ? AutostartResult.Success(actual)
+            : AutostartResult.Failure(
+                enabled
+                    ? "the autostart registry value was not set after the write"
+                    : "the autostart registry value is still present after the delete",
+                actual);
     }
 }

@@ -27,6 +27,13 @@ public static class Bootstrapper
         // public constructor takes an optional journal; it is registered only in the elevated
         // edition (the regular user-scoped store does not run the recovery protocol).
         services.AddSingleton<IElevatedRecoveryJournal, RegistryRecoveryJournal>();
+        // Bridges the Application controller's reset-notice acknowledgement to the elevated
+        // journal's Write(None) transition. Registered only in the elevated edition, matching
+        // the journal instance the store uses.
+        services.AddSingleton<IResetNoticeAck>(sp =>
+            new RecoveryResetNoticeAck(
+                sp.GetRequiredService<IElevatedRecoveryJournal>(),
+                sp.GetRequiredService<ILogger<RecoveryResetNoticeAck>>()));
 #endif
         services.AddSingleton<IConfigurationStore, JsonConfigurationStore>();
 

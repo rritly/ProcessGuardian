@@ -64,7 +64,7 @@ public class GuardianOrchestratorTests
             Autostart.IsEnabledAsync(Arg.Any<CancellationToken>())
                 .Returns(Task.FromResult(false));
             Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
-                .Returns(Task.CompletedTask);
+                .Returns(Task.FromResult(AutostartResult.Success(true)));
             Status.Report(Arg.Do<GuardianStatus>(s => Statuses.Add(s)));
 
             Notifications.ShowAsync(
@@ -770,7 +770,7 @@ public class GuardianOrchestratorTests
             CheckIntervalSeconds = 1,
         });
         var committed = await controller.CommitSettingsAsync(snapshot, otherPath);
-        committed.Should().BeTrue();
+        committed.Saved.Should().BeTrue();
 
         saved.Should().NotBeNull();
         saved!.TargetProcessPath.Should().Be(otherPath);

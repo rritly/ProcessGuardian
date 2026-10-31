@@ -795,6 +795,34 @@
                                FontSize="11"
                                Foreground="#E8A33D"
                                Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
+
+                    <!-- Explicit recovery resolution (A/B). Only shown while a reset notice is
+                         pending (which only the elevated edition produces), so the regular edition
+                         never surfaces these actions. Option A is additionally gated by a recorded
+                         pin through the command's CanExecute. -->
+                    <StackPanel Orientation="Horizontal"
+                                Margin="0,10,0,0"
+                                Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}">
+                        <Button Content="Keep autostart and finish recovery"
+                                Command="{Binding KeepAutostartCommand}"
+                                Padding="10,4"
+                                FontSize="11"
+                                Style="{StaticResource PrimaryButtonStyle}" />
+                        <Button Content="Remove autostart and finish recovery"
+                                Command="{Binding RemoveAutostartCommand}"
+                                Margin="8,0,0,0"
+                                Padding="10,4"
+                                FontSize="11"
+                                Style="{StaticResource PrimaryButtonStyle}" />
+                    </StackPanel>
+
+                    <TextBlock Text="{Binding AutostartError}"
+                               Margin="0,6,0,0"
+                               TextWrapping="Wrap"
+                               HorizontalAlignment="Stretch"
+                               FontSize="11"
+                               Foreground="#E5554F"
+                               Visibility="{Binding AutostartError, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
                 </StackPanel>
             </Grid>
         </Border>

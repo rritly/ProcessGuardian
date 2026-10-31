@@ -1,4 +1,5 @@
 using ProcessGuardian.Domain.Entities;
+using ProcessGuardian.Domain.Enums;
 
 namespace ProcessGuardian.Application.Services;
 
@@ -17,6 +18,13 @@ public interface IMonitoringController
     /// <summary>Latest published monitoring state (readable without subscribing).</summary>
     MonitorState CurrentState { get; }
 
+    /// <summary>
+    /// True when the controller holds a recorded target pin (computed and stored on a Start
+    /// after the reset). Gates the keep-autostart recovery option: it must not be offered for
+    /// execution until the user has re-selected and re-pinned the target.
+    /// </summary>
+    bool HasRecordedPin { get; }
+
     /// <summary>State channel; raised for every observable transition (including degraded/save-failed flags).</summary>
     event EventHandler<MonitorState>? StateChanged;
 
@@ -31,7 +39,7 @@ public interface IMonitoringController
     /// <summary>Persists committed UI settings, ignoring a target-path change while a
     /// session is active (path change is effective only in the stopped state). Clears
     /// the pin on a committed path change in the stopped state.</summary>
-    Task<bool> CommitSettingsAsync(CommittedSettingsSnapshot snapshot, string? targetPath, CancellationToken ct = default);
+    Task<CommitSettingsResult> CommitSettingsAsync(CommittedSettingsSnapshot snapshot, string? targetPath, CancellationToken ct = default);
 
     /// <summary>Starts a monitoring session: validates the path, computes the pin,
     /// persists canonical path + pin + enabled together before the session starts.</summary>
@@ -44,4 +52,18 @@ public interface IMonitoringController
     /// <summary>Cancels the session synchronously without persisting the enabled flag
     /// or any UI snapshot (consumed by Windows SessionEnding).</summary>
     Task SuspendAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Explicitly resolves a pending reset notice through one of the two recovery options
+    /// (see <see cref="RecoveryResolutionChoice"/>). No automatic resolution exists: the
+    /// notice is cleared only after the chosen option's operations succeeded and were
+    /// verified (never on plain start, never on re-select/re-pin alone). Returns
+    /// <see cref="RecoveryResolutionResult.Resolved"/> false with the notice still pending
+    /// on any failure, so the user can retry.
+    /// </summary>
+    Task<RecoveryResolutionResult> ResolveRecoveryAsync(
+        RecoveryResolutionChoice choice,
+        CommittedSettingsSnapshot? snapshot = null,
+        string? targetPath = null,
+        CancellationToken ct = default);
 }

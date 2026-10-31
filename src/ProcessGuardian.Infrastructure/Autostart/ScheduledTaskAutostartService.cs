@@ -11,11 +11,23 @@ namespace ProcessGuardian.Infrastructure.Autostart;
 public sealed class ScheduledTaskAutostartService : IAutostartService
 {
     private readonly ILogger<ScheduledTaskAutostartService> _logger;
+    private readonly SchTasksInvoker? _invoker;
 
     public ScheduledTaskAutostartService(ILogger<ScheduledTaskAutostartService> logger)
+        : this(logger, null)
+    {
+    }
+
+    // Internal seam so CI can script schtasks.exe results (exit code, output, exceptions)
+    // without touching the real scheduled-task store; production leaves it null and runs
+    // the real process.
+    internal ScheduledTaskAutostartService(ILogger<ScheduledTaskAutostartService> logger, SchTasksInvoker? invoker)
     {
         _logger = logger;
+        _invoker = invoker;
     }
+
+    internal delegate Task<(int ExitCode, string Output)> SchTasksInvoker(string arguments, CancellationToken ct);
 
     public async Task<bool> IsEnabledAsync(CancellationToken ct = default)
     {
@@ -23,8 +35,15 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         return exitCode == 0;
     }
 
-    public async Task SetEnabledAsync(bool enabled, CancellationToken ct = default)
+    public async Task<AutostartResult> SetEnabledAsync(bool enabled, CancellationToken ct = default)
     {
+        // Idempotent fast path: when the actual state already matches the requested one,
+        // the operation has already succeeded; a redundant /Create or /Delete is not run
+        // (a second /Delete of an absent task would itself report a nonzero exit code).
+        var current = await IsEnabledAsync(ct).ConfigureAwait(false);
+        if (current == enabled)
+            return AutostartResult.Success(current);
+
         if (enabled)
         {
             var exePath = Process.GetCurrentProcess().MainModule?.FileName ?? string.Empty;
@@ -32,18 +51,40 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             if (string.IsNullOrWhiteSpace(exePath))
             {
                 _logger.LogError("Cannot enable autostart: current executable path is unavailable");
-                return;
+                return AutostartResult.Failure("the current executable path is unavailable for the autostart task", current);
             }
 
             var (code, output) = await RunSchTasksAsync(BuildCreateArguments(exePath), ct);
             if (code != 0)
+            {
+                // A nonzero exit code is an operation error; the diagnostic must not be lost.
                 _logger.LogError("Failed to create autostart task (exit {Code}): {Output}", code, output);
-            return;
+                return AutostartResult.Failure($"task creation failed (exit {code}): {output}");
+            }
+        }
+        else
+        {
+            var (deleteCode, deleteOutput) = await RunSchTasksAsync(BuildDeleteArguments(), ct);
+            if (deleteCode != 0)
+            {
+                _logger.LogError("Failed to delete autostart task (exit {Code}): {Output}", deleteCode, deleteOutput);
+                return AutostartResult.Failure($"task deletion failed (exit {deleteCode}): {deleteOutput}");
+            }
         }
 
-        var (deleteCode, deleteOutput) = await RunSchTasksAsync(BuildDeleteArguments(), ct);
-        if (deleteCode != 0)
-            _logger.LogWarning("Failed to delete autostart task (exit {Code}): {Output}", deleteCode, deleteOutput);
+        // Verify the actual registration state rather than trusting the exit code alone: a
+        // command that exits 0 without the state taking effect is still a failure.
+        var actual = await IsEnabledAsync(ct).ConfigureAwait(false);
+        if (actual == enabled)
+            return AutostartResult.Success(actual);
+
+        _logger.LogError("Autostart state ({Actual}) does not match the requested state ({Requested}) after the operation",
+            actual, enabled);
+        return AutostartResult.Failure(
+            enabled
+                ? "the autostart task was not actually registered after the create exited successfully"
+                : "the autostart task is still registered after the delete exited successfully",
+            actual);
     }
 
     internal static string BuildCreateArguments(string exePath) =>
@@ -71,10 +112,16 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             RedirectStandardError = true,
         };
 
+    // Runs schtasks.exe through the injected seam when present, otherwise the real process.
+    // Both paths share the same exception handling so a seam-thrown error behaves exactly like
+    // a real process-start failure (surfaced as a failure result, never lost).
     private async Task<(int ExitCode, string Output)> RunSchTasksAsync(string arguments, CancellationToken ct)
     {
         try
         {
+            if (_invoker is not null)
+                return await _invoker(arguments, ct).ConfigureAwait(false);
+
             var psi = BuildProcessStartInfo(arguments);
             using var process = Process.Start(psi);
             if (process is null)
@@ -97,8 +144,10 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         }
         catch (Exception ex)
         {
+            // A process-start/invocation failure is surfaced as a failure result, never lost:
+            // the caller must be able to distinguish "operation failed" from "operation ok".
             _logger.LogError(ex, "schtasks.exe invocation failed");
-            return (-1, string.Empty);
+            return (-1, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 }
