@@ -920,10 +920,10 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             if (InsideLaunchGateHook is not null)
                 await InsideLaunchGateHook().ConfigureAwait(false);
 
-            bool started;
+            ProcessStartResult start;
             try
             {
-                started = await _monitor.StartAsync(target, ct).ConfigureAwait(false);
+                start = await _monitor.StartAsync(target, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -932,14 +932,26 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             catch (Exception ex)
             {
                 _logger.LogError(ex, "StartAsync threw for {Target}", target.NameWithoutExtension);
-                started = false;
-            }
-
-            if (!started)
-            {
-                _logger.LogError("Failed to start process {Target}", target.NameWithoutExtension);
                 return StartOutcome.NotStarted;
             }
+
+            switch (start.Status)
+            {
+                case ProcessStartStatus.Cancelled:
+                    return StartOutcome.SessionEnded;
+                case ProcessStartStatus.Missing:
+                    _logger.LogWarning("Target {Target} disappeared before launch; skipping (degraded), no budget spent",
+                        target.NameWithoutExtension);
+                    return StartOutcome.Degraded;
+                case ProcessStartStatus.ReadError:
+                    _logger.LogWarning("Target {Target} became unreadable before launch; skipping (degraded), no budget spent",
+                        target.NameWithoutExtension);
+                    return StartOutcome.Degraded;
+                case ProcessStartStatus.Failed:
+                    _logger.LogError("Failed to start process {Target}: {Error}", target.NameWithoutExtension, start.ErrorMessage);
+                    return StartOutcome.NotStarted;
+            }
+            // Started: proceed to startup verification below.
 
             var verified = await VerifyStartupSafeAsync(target, knobs, ct).ConfigureAwait(false);
             if (verified == VerifyOutcome.Verified)

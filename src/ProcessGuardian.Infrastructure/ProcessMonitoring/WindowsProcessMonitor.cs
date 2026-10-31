@@ -78,7 +78,7 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
     // A synthetic per-process snapshot for the EvaluateCandidates seam (tests).
     internal readonly record struct ProcessCandidate(int ProcessId, string? ModulePath, bool Unreadable);
 
-    public Task<bool> StartAsync(ProcessTarget target, CancellationToken ct)
+    public Task<ProcessStartResult> StartAsync(ProcessTarget target, CancellationToken ct)
     {
         try
         {
@@ -91,29 +91,63 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
             // The Process handle is not needed after the start decision; dispose it
             // immediately instead of holding one handle per restart until finalization.
             using var proc = Process.Start(psi);
-            return Task.FromResult(proc != null);
+            return Task.FromResult(proc != null ? ProcessStartResult.Started() : ProcessStartResult.Failed("the process could not be created"));
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is never a launch failure (R-KE).
+            return Task.FromResult(ProcessStartResult.Cancelled());
         }
         catch (FileNotFoundException ex)
         {
             _logger.LogError(ex, "Target executable not found: {Path}", target.FullPath);
-            return Task.FromResult(false);
+            return Task.FromResult(ProcessStartResult.Missing());
+        }
+        catch (DirectoryNotFoundException ex)
+        {
+            _logger.LogError(ex, "Target directory not found: {Path}", target.FullPath);
+            return Task.FromResult(ProcessStartResult.Missing());
         }
         catch (UnauthorizedAccessException ex)
         {
-            _logger.LogError(ex, "Access denied starting process: {Path}", target.FullPath);
-            return Task.FromResult(false);
+            _logger.LogError(ex, "Access denied reading target: {Path}", target.FullPath);
+            return Task.FromResult(ProcessStartResult.ReadError());
         }
         catch (Win32Exception ex)
         {
-            _logger.LogError(ex, "Win32 error starting process: {Path}", target.FullPath);
-            return Task.FromResult(false);
+            var status = ClassifyWin32Error(ex.NativeErrorCode);
+            switch (status)
+            {
+                case ProcessStartStatus.Missing:
+                    _logger.LogError(ex, "Target executable not found (Win32 {Code}): {Path}",
+                        ex.NativeErrorCode, target.FullPath);
+                    return Task.FromResult(ProcessStartResult.Missing());
+                case ProcessStartStatus.ReadError:
+                    _logger.LogError(ex, "Target executable could not be read (Win32 {Code}): {Path}",
+                        ex.NativeErrorCode, target.FullPath);
+                    return Task.FromResult(ProcessStartResult.ReadError());
+                default:
+                    _logger.LogError(ex, "Win32 error starting process: {Path}", target.FullPath);
+                    return Task.FromResult(ProcessStartResult.Failed($"Win32 error {ex.NativeErrorCode}: {ex.Message}"));
+            }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error starting process: {Path}", target.FullPath);
-            return Task.FromResult(false);
+            return Task.FromResult(ProcessStartResult.Failed(ex.Message));
         }
     }
+
+    // Documented native-code mapping at the launch boundary (R-KE). Only codes proven to mean
+    // the target is absent or unreadable are classified as Missing/ReadError; every other
+    // process-creation failure (bad format, elevation required, etc.) stays a genuine Failed.
+    //   ERROR_FILE_NOT_FOUND = 2, ERROR_PATH_NOT_FOUND = 3  -> Missing
+    //   ERROR_ACCESS_DENIED = 5, ERROR_SHARING_VIOLATION = 32 -> ReadError
+    //   anything else (e.g. 193 bad format, 740 elevation required) -> Failed
+    internal static ProcessStartStatus ClassifyWin32Error(int nativeErrorCode) =>
+        nativeErrorCode is 2 or 3 ? ProcessStartStatus.Missing
+        : nativeErrorCode is 5 or 32 ? ProcessStartStatus.ReadError
+        : ProcessStartStatus.Failed;
 
     public async Task<bool> VerifyStartupAsync(ProcessTarget target, TimeSpan timeout, CancellationToken ct)
     {

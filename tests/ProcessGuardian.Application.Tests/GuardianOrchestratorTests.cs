@@ -167,7 +167,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(false));
+            .Returns(Task.FromResult(ProcessStartResult.Failed("launch failed")));
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request(maxRestarts: 0, restartDelay: 2));
@@ -276,7 +276,7 @@ public class GuardianOrchestratorTests
                 return Task.FromResult(new ProcessCheckResult(running ? ProcessOutcome.Running : ProcessOutcome.NotRunning));
             });
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => { running = true; return Task.FromResult(true); });
+            .Returns(_ => { running = true; return Task.FromResult(ProcessStartResult.Started()); });
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
@@ -307,7 +307,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(false));
+            .Returns(Task.FromResult(ProcessStartResult.Failed("launch failed")));
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request(maxRestarts: 3));
@@ -334,7 +334,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => { h.StartCallCount++; return Task.FromResult(false); });
+            .Returns(_ => { h.StartCallCount++; return Task.FromResult(ProcessStartResult.Failed("launch failed")); });
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request(maxRestarts: 1));
@@ -362,7 +362,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
+            .Returns(Task.FromResult(ProcessStartResult.Started()));
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
@@ -382,6 +382,74 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
+    public async Task Launch_MissingAtStartBoundary_IsDegraded_SessionSurvives_NoBudgetSpent()
+    {
+        using var h = new Harness();
+        // Hash succeeds, then the target disappears right before the OS process-creation call
+        // (R-KE): typed Missing is degraded (no budget spent), never a session-fatal error.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ProcessStartResult.Missing()));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1));
+        start.Started.Should().BeTrue();
+
+        // Let several poll cycles run: a Missing launch must stay degraded and must NOT
+        // consume the consecutive budget, so no Error/exhaustion may ever surface.
+        await Task.Delay(900);
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "a Missing launch must not spend budget or trip exhaustion (R-KE)");
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task Launch_ReadErrorAtStartBoundary_IsDegraded_SessionSurvives_NoBudgetSpent()
+    {
+        using var h = new Harness();
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ProcessStartResult.ReadError()));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1));
+        start.Started.Should().BeTrue();
+
+        await Task.Delay(900);
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "a ReadError launch must not spend budget or trip exhaustion (R-KE)");
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task Launch_CancelledBeforeCreation_SessionEnds_NoError_NoFurtherLaunch()
+    {
+        using var h = new Harness();
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ProcessStartResult.Cancelled()));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        // The initial (cancelled) launch attempt happens; the session then ends without firing
+        // any further launch and without publishing a session-fatal Error (R-KE).
+        await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Any(c =>
+                c.GetMethodInfo().Name == nameof(IProcessMonitor.StartAsync)),
+            "the initial launch to be attempted");
+        await Task.Delay(600);
+
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "cancellation before process creation is never a launch failure (R-KE)");
+        // Only the initial (cancelled) launch attempt: no further launches follow a cancelled start.
+        await h.Monitor.Received(1).StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task HashMismatch_LaunchBlocked_MonitoringDisabled_TargetChangedToast()
     {
         using var h = new Harness();
@@ -393,7 +461,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
+            .Returns(Task.FromResult(ProcessStartResult.Started()));
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
@@ -486,7 +554,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
+            .Returns(Task.FromResult(ProcessStartResult.Started()));
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
@@ -613,7 +681,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => { h.MonitorInitialLaunchCalled = true; return Task.FromResult(true); });
+            .Returns(_ => { h.MonitorInitialLaunchCalled = true; return Task.FromResult(ProcessStartResult.Started()); });
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
@@ -996,7 +1064,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => { h.StartCallCount++; return Task.FromResult(true); });
+            .Returns(_ => { h.StartCallCount++; return Task.FromResult(ProcessStartResult.Started()); });
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
@@ -1023,7 +1091,7 @@ public class GuardianOrchestratorTests
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(false));
+            .Returns(Task.FromResult(ProcessStartResult.Failed("launch failed")));
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request(maxRestarts: 1));

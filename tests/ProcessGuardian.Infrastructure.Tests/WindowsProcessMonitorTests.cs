@@ -123,16 +123,16 @@ public class WindowsProcessMonitorTests : IDisposable
     }
 
     [Fact]
-    public async Task StartAsyncNonexistentPath_ReturnsFalse_NoThrow()
+    public async Task StartAsync_NonexistentPath_ReturnsMissing_NoThrow()
     {
         var bogus = new ProcessTarget(
             @"C:\DoesNotExist\missing.exe",
             "missing",
             @"C:\DoesNotExist");
 
-        Func<Task<bool>> act = () => _monitor.StartAsync(bogus, CancellationToken.None);
+        Func<Task<ProcessStartResult>> act = () => _monitor.StartAsync(bogus, CancellationToken.None);
         var result = await act.Should().NotThrowAsync();
-        result.Which.Should().BeFalse();
+        result.Which.Status.Should().Be(ProcessStartStatus.Missing);
     }
 
     [Fact]
@@ -193,5 +193,19 @@ public class WindowsProcessMonitorTests : IDisposable
 
         result.Outcome.Should().Be(ProcessOutcome.Running);
         result.ProcessId.Should().Be(202);
+    }
+
+    // R-KE: document and verify the native Win32 error-code mapping at the launch boundary.
+    [Theory]
+    [InlineData(2, ProcessStartStatus.Missing)]  // ERROR_FILE_NOT_FOUND
+    [InlineData(3, ProcessStartStatus.Missing)]  // ERROR_PATH_NOT_FOUND
+    [InlineData(5, ProcessStartStatus.ReadError)] // ERROR_ACCESS_DENIED
+    [InlineData(32, ProcessStartStatus.ReadError)] // ERROR_SHARING_VIOLATION
+    [InlineData(193, ProcessStartStatus.Failed)]  // ERROR_BAD_EXE_FORMAT
+    [InlineData(740, ProcessStartStatus.Failed)]  // ERROR_ELEVATION_REQUIRED
+    [InlineData(206, ProcessStartStatus.Failed)]  // ERROR_FILENAME_EXCED_RANGE
+    public void ClassifyWin32Error_MapsDocumentedCodes(int nativeCode, ProcessStartStatus expected)
+    {
+        WindowsProcessMonitor.ClassifyWin32Error(nativeCode).Should().Be(expected);
     }
 }
