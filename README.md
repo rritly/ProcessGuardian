@@ -77,7 +77,7 @@ same rights); the regular edition cannot.
 | Edition | Build configuration | Executable | App manifest | Config file | Autostart mechanism |
 |---------|--------------------|------------|--------------|-------------|---------------------|
 | Regular | Release | `ProcessGuardian.exe` | default (`asInvoker`) | `%LocalAppData%\ProcessGuardian\settings.json` | HKCU `...\CurrentVersion\Run` |
-| Admin | Release-Elevated | `ProcessGuardianAdmin.exe` | `requireAdministrator` | `%ProgramData%\ProcessGuardianAdmin\settings.json` (Administrators/SYSTEM-only ACL) | Scheduled task (logon, highest privileges, silent) |
+| Admin | Release-Elevated | `ProcessGuardianAdmin.exe` | `requireAdministrator` | `%ProgramData%\ProcessGuardianAdmin\config\settings.json` (Administrators/SYSTEM-only ACL) | Scheduled task (logon, highest privileges, silent) |
 
 Both editions run side by side: separate executable identity, single-instance mutex, settings, logs, autostart entry and tray icon.
 
@@ -168,10 +168,19 @@ The badge shows one of three states; the tray tooltip shows the exact internal s
 |-------|-------|-------------------|---------|
 | `STOPPED` | gray | Stopped | Monitoring is off. |
 | `MONITORING` | green | Monitoring, Waiting, Restarting | Polling the target; Waiting = initial delay in progress; Restarting = recovery launch is pending/scheduled. |
-| `ERROR` | red | Error | Target missing/unreadable or the restart budget is exhausted; monitoring is disabled. |
+| `ERROR` | red | Error | Configuration refused/unavailable, a target-pin mismatch, or the restart budget exhausted; monitoring is disabled. |
 
 Exhausted restart budget (unless *Max restart attempts* = 0) puts the guardian into ERROR and
 disables monitoring; pressing **Start monitoring** again re-pins the hash and resets the budget.
+
+A **DEGRADED** indicator appears next to the badge while monitoring is active when the guardian
+cannot reliably determine the target's state — e.g. a poll returns `Unknown`, or the target is
+transiently missing/unreadable at a relaunch. Degraded is *not* an error: the session keeps
+polling, the target stays selected and pinned, and no restart budget is spent. The indicator
+turns on only after a sustained condition (two consecutive degraded cycles over a 120-second
+window) and its tooltip always shows the explanatory reason, regardless of the toast setting. A
+missing or unreadable target at *initial Start* is different: the Start request is rejected
+outright — no session and no launch.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -240,11 +249,15 @@ On every **Start monitoring** the SHA-256 hash of the target executable is recor
 is started:
 
 * **Binary unchanged** → the target is relaunched normally.
-* **Binary changed or missing** → the launch is blocked, a red *Target Changed* toast is
-  shown, and monitoring is disabled. Enabling monitoring again (Start) is the explicit
-  re-confirmation and re-pins the hash.
+* **Binary changed** → the launch is blocked, a red *Target Changed* toast is shown, and
+  monitoring is disabled. Enabling monitoring again (Start) is the explicit re-confirmation
+  and re-pins the hash.
 * **Target unreadable at Start** → Start aborts fail-closed (*Target Unreadable*): no
   monitoring without a valid pin, and the previous pin is kept.
+
+A transparently missing or unreadable target *during an active session* is **not** a pin
+mismatch: it is treated as degraded (see [Status Badge](#status-badge)) — the target stays
+selected and pinned, no restart budget is spent, and monitoring is not disabled.
 
 This prevents a crashed-but-replaced binary (e.g. by malware) from being silently relaunched.
 
@@ -267,13 +280,25 @@ survives an Exit.
 
 | Data | Regular edition | Admin edition |
 |------|-----------------|---------------|
-| Settings | `%LocalAppData%\ProcessGuardian\settings.json` | `%ProgramData%\ProcessGuardianAdmin\settings.json` (ACL: Administrators/SYSTEM only) |
+| Settings | `%LocalAppData%\ProcessGuardian\settings.json` | `%ProgramData%\ProcessGuardianAdmin\config\settings.json` (ACL: Administrators/SYSTEM only) |
 | Log file | `%LocalAppData%\ProcessGuardian\logs.log` | `%LocalAppData%\ProcessGuardianAdmin\logs.log` |
 | Crash diagnostics | same folder (`crash.log`, `shutdown-error.log`) | same folder |
 
 Log files are size-capped (512 KB) with one archive generation (`logs.1.log`), so disk usage
 stays bounded. Deleting `settings.json` while the app runs is safe: it continues with defaults
 and recreates the file on the next save.
+
+#### Recovery journal (elevated edition)
+
+The elevated edition keeps a crash-safe recovery journal at `HKLM\SOFTWARE\ProcessGuardianAdmin\Recovery`.
+On a clean first run the key is absent, which means no recovery is in progress and normal
+autostart sync proceeds. If the journal indicates a quarantined configuration, the app stays
+stopped and shows an explicit *recovery* choice (Keep / Remove the existing autostart task)
+instead of touching the registration on its own. If the elevated configuration is refused as
+unsafe, the app reports an actionable Error: an administrator must repair the owner/DACL of
+`%ProgramData%\ProcessGuardianAdmin` (owner `BUILTIN\Administrators` or `SYSTEM`, no reparse
+points) or the recovery state under `HKLM\SOFTWARE\ProcessGuardianAdmin\Recovery`. Do not relax
+ACLs or grant broad permissions to "fix" a refusal — that would defeat the tamper protection.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -291,7 +316,7 @@ Run manually by a person after a build (no automated pass marks here):
 | 4 | Set max attempts = 1, kill target twice | After 2nd failure: status ERROR, monitoring disabled, tray red |
 | 5 | Launch second instance | First instance window activates (or tray stays), second exits immediately |
 | 6 | Enable autostart, restart Windows *(optional — requires a Windows reboot)* | App starts in background (no window), tray visible, monitoring active if enabled |
-| 7 | Delete target .exe while monitoring | Status ERROR, no crash, log shows file not found |
+| 7 | Delete the target .exe while monitoring | Transient *Missing*: no ERROR, no crash, the target stays selected/pinned and no restart budget is spent; after two degraded cycles (~120 s) the DEGRADED indicator shows with its reason in the tooltip. Restoring the file resumes normal monitoring. |
 | 8 | Change check interval while monitoring | New interval applied within one cycle (≤ old interval seconds) |
 | 9 | Delete `settings.json` while app running | App continues with defaults, recreates file on next save |
 | 10 | Run without any `Assets/` folder next to the exe | Tray shows embedded icons normally — icons are embedded in the assemblies, no external files needed |
@@ -322,6 +347,12 @@ Flags to build a single profile (no arguments → both editions):
 - `-Admin` → `publish/self-contained-admin` (Release-Elevated → `ProcessGuardianAdmin.exe`)
 
 Both editions are also built and tested in CI (`Release` and `Release-Elevated` solution configurations).
+
+Automated CI builds and runs the unit/integration tests for both editions, but it cannot
+exercise real Windows ACL/DACL protection, the elevated *scheduled task* autostart, or the HKLM
+recovery journal — those security-sensitive behaviors depend on an elevated session and must be
+validated with the separate manual elevated checklist (running the admin exe elevated). Passing
+CI alone does not certify real ACL validation on any given machine.
 
 **From source:**
 
