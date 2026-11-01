@@ -8,6 +8,7 @@ using ProcessGuardian.Application.Services;
 using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Entities;
 using ProcessGuardian.Domain.Enums;
+using ProcessGuardian.Domain.Exceptions;
 using ProcessGuardian.Domain.Interfaces;
 using ProcessGuardian.Domain.ValueObjects;
 using Xunit;
@@ -883,6 +884,123 @@ public class GuardianOrchestratorTests
 
         _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    // R-A: after a refused configuration initialization, every mutation entry point is blocked
+    // at the controller level — no settings save, no autostart mutation, no session — even when
+    // the methods are called directly (the disabled-UI gate alone is not the guard).
+    [Fact]
+    public async Task ConfigRefused_CommitSettings_DoesNotSaveDoesNotTouchAutostart()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Refused));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeFalse("a refusal is never degraded (R-F)");
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings
+        {
+            CheckIntervalSeconds = 7,
+            AutostartEnabled = true,
+            EnableToasts = false,
+        });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        result.Saved.Should().BeFalse("a refused store must reject the commit outright");
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        controller.AutostartActualState.Should().BeNull(
+            "no autostart state may be read or changed after a refusal");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error,
+            "the refused Error state must be preserved, not overwritten by a commit");
+    }
+
+    [Fact]
+    public async Task ConfigRefused_Start_Rejected_NoHashNoLaunchNoPersistence()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Refused));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        var result = await controller.StartAsync(h.Request());
+
+        result.Started.Should().BeFalse("Start must be blocked while the configuration is refused");
+        result.Reason.Should().NotBeNullOrWhiteSpace();
+        _ = h.Integrity.DidNotReceive().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+    }
+
+    [Fact]
+    public async Task ConfigRefused_StopAndSuspend_DoNotPersist_DoNotTouchAutostart_StoppedPublished()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Refused));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        var stop = await controller.StopAsync();
+        stop.RuntimeStopped.Should().BeTrue("nothing is running after a refused boot");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        controller.CurrentState.IsDegraded.Should().BeFalse("Stopped is never degraded (R-F)");
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+
+        await controller.SuspendAsync();
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        controller.CurrentState.IsDegraded.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task ConfigRefused_ResolveRecovery_FailsWithoutAutostartMutation()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Refused));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        var result = await controller.ResolveRecoveryAsync(
+            RecoveryResolutionChoice.RemoveAutostart,
+            CommittedSettingsSnapshot.From(new AppSettings()));
+
+        result.Resolved.Should().BeFalse("recovery cannot proceed while the configuration is refused");
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task InitThrowsConfigurationUnavailable_ObservableAsRefused_MutationsBlocked()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<ConfigurationInitializationStatus>(new ConfigurationUnavailableException(
+                "refused", "An administrator must repair the elevated configuration.")));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeFalse();
+
+        var commit = await controller.CommitSettingsAsync(
+            CommittedSettingsSnapshot.From(new AppSettings()), @"C:\app.exe");
+        commit.Saved.Should().BeFalse();
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]

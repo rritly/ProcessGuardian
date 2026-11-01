@@ -73,6 +73,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     // start), the checkbox is locked, and the persisted AutostartEnabled is preserved.
     private bool _recoveryPending;
 
+    // Set when configuration initialization was observed as Refused (or threw
+    // ConfigurationUnavailableException). While set, every mutation entry point is blocked at
+    // the controller level: no settings save, no autostart mutation, no session. The guard is
+    // intentionally independent of the UI disable state so a direct controller call cannot
+    // bypass the refusal (R-A). ReconcileAsync is the only writer; a later successful
+    // initialization re-opens the controller for the recovery/steady-state paths.
+    private volatile bool _configRefused;
+
     // Latest verified actual autostart registration state + startup-sync error, published to the
     // presentation layer so a failed boot-time autostart sync is never lost to logs (2.4/2.5).
     public AutostartState? AutostartActualState { get; private set; }
@@ -152,6 +160,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 _logger.LogError(ex, "Configuration unavailable at startup; monitoring will not run");
                 // A refused/unavailable configuration is Error with a reason, never degraded:
                 // IsDegraded is reserved for active session states (R-F).
+                _configRefused = true;
                 Publish(new MonitorState(GuardianStatus.Error, false, ex.Guidance ?? "Configuration is unavailable", false));
                 return;
             }
@@ -160,6 +169,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             {
                 _logger.LogError("Configuration initialization refused; monitoring will not run");
                 // IsDegraded=false: a refused config is never a degraded session (R-F).
+                _configRefused = true;
                 Publish(new MonitorState(GuardianStatus.Error, false,
                     "Configuration could not be initialized; monitoring is off", false));
                 return;
@@ -171,6 +181,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 // stay stopped until the user chooses A or B: no SyncAutostartAsync(false)
                 // from the fresh defaults, no automatic session. The notice latch is cleared
                 // only by an explicit resolution (ResolveRecoveryAsync), never here.
+                _configRefused = false;
                 _recoveryPending = true;
                 _logger.LogWarning("Reset notice pending; autostart task left untouched, monitoring not started");
                 Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
@@ -194,6 +205,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             _committed = CommittedSettingsSnapshot.From(doc);
             _committedTargetPath = doc.TargetProcessPath;
             _latestPin = doc.TargetHashSha256;
+            // A successful init re-opens the controller for the steady-state paths (the flag
+            // is only an outcome of the most recent initialization, not a sticky failure).
+            _configRefused = false;
 
             // Keeps the autostart registration in sync with the persisted flag on every
             // startup (moved with the persistence path; the ViewModel never writes it).
@@ -262,6 +276,15 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         await _operationLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_configRefused)
+            {
+                // [R-A] A refused configuration store admits no mutation at the controller level:
+                // no settings save, no autostart change, no path/pin state change. A direct caller
+                // (not only the disabled UI) is rejected here.
+                _logger.LogWarning("Settings commit rejected: configuration initialization was refused");
+                return CommitSettingsResult.SaveFailed();
+            }
+
             var sessionActive = SessionActive;
 
             if (_recoveryPending)
@@ -334,6 +357,15 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         await _operationLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_configRefused)
+            {
+                // [R-A] Refused configuration and recovery resolution never combine: the store
+                // cannot be written and no autostart task may be touched.
+                _logger.LogWarning("Recovery resolution rejected: configuration initialization was refused");
+                return RecoveryResolutionResult.Failed(
+                    "the configuration is unavailable; recovery cannot proceed until it is repaired.");
+            }
+
             switch (choice)
             {
                 case RecoveryResolutionChoice.KeepAutostart:
@@ -499,6 +531,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         await _operationLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_configRefused)
+            {
+                // [R-A] No session, no hash read, no persistence and no autostart mutation while
+                // the configuration store is refused: Start fails closed with guidance.
+                _logger.LogWarning("Start rejected: configuration initialization was refused");
+                return new StartResult(false, "monitoring cannot start: the configuration is unavailable");
+            }
+
             if (SessionActive)
                 return new StartResult(false, "monitoring is already running");
 
@@ -555,6 +595,15 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         await _operationLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_configRefused)
+            {
+                // [R-A] A refused store cannot be written; nothing is running and nothing may be
+                // persisted or synced. Publish a clean Stopped state so the UI stays coherent.
+                _logger.LogWarning("Stop: configuration initialization was refused; no persistence attempted");
+                Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
+                return StopResult.AlreadyStopped();
+            }
+
             if (latestCommittedSettings is not null)
                 _committed = latestCommittedSettings;
 
@@ -623,6 +672,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         await _operationLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_configRefused)
+            {
+                // [R-A] Nothing to cancel and nothing to persist in a refused state.
+                Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
+                return;
+            }
+
             var cts = _sessionCts;
             var task = _sessionTask;
             if (cts is null || task is { IsCompleted: true })

@@ -109,6 +109,14 @@ public partial class MainViewModel : ObservableObject
     // debounced save must not rewrite settings.json right after it was loaded.
     private bool _suppressSave;
 
+    // Set when configuration initialization is refused (or the settings load reports a
+    // ConfigurationUnavailableException). While set, every settings edit — target path,
+    // numeric settings, autostart, toasts — is blocked at the ViewModel level so a fallback
+    // instance can never enter the debounce/save pipeline against a refused store (R-A). The
+    // controller independently rejects direct mutation calls, so this is a UX guard on top of
+    // the Application-layer guard, not a substitute for it.
+    private bool _configRefused;
+
     // The controller-owned committed target path, as last persisted through the controller.
     // The TextBox is a draft: only an explicit commit (Browse / focus-lost / commit command)
     // moves the draft into this committed value, which is what CommitSettingsAsync receives
@@ -198,6 +206,13 @@ public partial class MainViewModel : ObservableObject
         if (_previousSettings is not null)
             _previousSettings.PropertyChanged -= OnSettingsPropertyChanged;
         _previousSettings = value;
+        if (_configRefused)
+        {
+            // A refused store admits no persistence at all: the fallback/bound instance is
+            // installed for bindings only — no PropertyChanged subscription and no debounced
+            // save can be scheduled from it (R-A).
+            return;
+        }
         value.PropertyChanged += OnSettingsPropertyChanged;
         if (!_suppressSave)
             ScheduleSave();
@@ -226,6 +241,7 @@ public partial class MainViewModel : ObservableObject
             // Error state as the tray (Status=Error, IsDegraded=false) so a refusal is never
             // shown as a plain STOPPED window (R-A).
             _logger.LogError(ex, "Configuration store refused on load");
+            _configRefused = true;
             ConfigurationError = ex.Guidance ?? "Configuration is unavailable; apply the guidance and restart.";
             Status = GuardianStatus.Error;
             IsDegraded = false;
@@ -268,6 +284,8 @@ public partial class MainViewModel : ObservableObject
         switch (status)
         {
             case ConfigurationInitializationStatus.Refused:
+                _configRefused = true;
+                IsAutostartEditable = false;
                 ConfigurationError =
                     "The elevated configuration is unavailable. An administrator must inspect and repair the " +
                     "elevated configuration (owner BUILTIN\\Administrators or SYSTEM; no reparse points) or the " +
@@ -314,13 +332,16 @@ public partial class MainViewModel : ObservableObject
     // so this gate is a UX guard; the committed-path discipline makes even a stale debounced
     // save incapable of retargeting or clearing the pin.
     public bool IsTargetPathEditable =>
-        Status is GuardianStatus.Stopped or GuardianStatus.Error;
+        Status is GuardianStatus.Stopped or GuardianStatus.Error
+        && string.IsNullOrEmpty(ConfigurationError);
 
     // Explicitly commits the TextBox draft as the controller-owned committed path (called on
     // focus-lost / commit command; Browse commits directly). Only a committed path change is
     // sent to the controller, so it is the sole thing that can clear the pin while stopped.
     public void CommitTargetPathDraft()
     {
+        if (_configRefused)
+            return;
         _committedTargetPath = Settings.TargetProcessPath ?? string.Empty;
         _ = CommitNowAsync();
         // A committed path change clears the recorded pin, possibly disabling keep-autostart.
@@ -345,6 +366,12 @@ public partial class MainViewModel : ObservableObject
     {
         if (_updatingAutostartEffective)
             return;
+        if (_configRefused)
+        {
+            // A refused configuration admits no autostart intent and no scheduler mutation.
+            _logger.LogWarning("Autostart change ignored: configuration initialization was refused");
+            return;
+        }
         _suppressSave = true;
         try
         {
@@ -500,7 +527,7 @@ public partial class MainViewModel : ObservableObject
 
     private void OnSettingsPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (_suppressSave)
+        if (_suppressSave || _configRefused)
             return;
         ScheduleSave();
     }
@@ -617,6 +644,8 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void BrowseExecutable()
     {
+        if (_configRefused)
+            return;
         try
         {
             var dialog = new OpenFileDialog
@@ -715,6 +744,14 @@ public partial class MainViewModel : ObservableObject
 
     private async Task CommitAsync()
     {
+        if (_configRefused)
+        {
+            // Defensive re-entry guard on top of OnSettingsChanged/OnSettingsPropertyChanged:
+            // a refused store must never be reached by the debounce/save pipeline (R-A).
+            _logger.LogWarning("Settings commit skipped: configuration initialization was refused");
+            return;
+        }
+
         try
         {
             // Only the explicitly committed path is passed to the controller (R-CD): the

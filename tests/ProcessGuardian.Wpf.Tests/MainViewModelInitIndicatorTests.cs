@@ -54,6 +54,69 @@ public class MainViewModelInitIndicatorTests
         vm.StopCommand.CanExecute(null).Should().BeFalse();
     }
 
+    // R-A: after a config refusal the ViewModel must block every settings edit at the VM level —
+    // the fallback/bound instance can never enter the debounce/save pipeline and no
+    // CommitSettingsAsync may run, so neither a store write nor an autostart mutation can occur.
+    [Fact]
+    public async Task Refused_EditsOfEverySetting_DoNotReachCommitPipeline()
+    {
+        var h = new Harness();
+        var vm = h.CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.Refused);
+
+        // Touch every user-editable setting: target path, numeric settings, toasts, autostart.
+        vm.Settings.TargetProcessPath = @"C:\new\app.exe";
+        vm.Settings.CheckIntervalSeconds = 42;
+        vm.Settings.InitialDelaySeconds = 9;
+        vm.Settings.MaxRestartAttempts = 3;
+        vm.Settings.EnableToasts = !vm.Settings.EnableToasts;
+        vm.AutostartEffective = true; // user intent toggle on the checkbox
+
+        // Give a (buggy) 500 ms debounce window ample room to fire: no deferred save may run.
+        await Task.Delay(700);
+
+        await h.Controller.Received(0)
+            .CommitSettingsAsync(Arg.Any<CommittedSettingsSnapshot>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public void Refused_TargetPathAndAutostartLocked_StartDisabled_CoherentErrorState()
+    {
+        var vm = new Harness().CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.Refused);
+
+        vm.IsTargetPathEditable.Should().BeFalse("the target path must not be editable after a refusal");
+        vm.IsAutostartEditable.Should().BeFalse("the autostart checkbox must be locked after a refusal");
+        vm.StartCommand.CanExecute(null).Should().BeFalse();
+        vm.StopCommand.CanExecute(null).Should().BeFalse();
+        vm.Status.Should().Be(GuardianStatus.Error);
+        vm.IsDegraded.Should().BeFalse();
+    }
+
+    // R-A: the refused-load (exception) path must also freeze settings editing: the fallback
+    // instance installed for bindings cannot schedule a commit against a refused store.
+    [Fact]
+    public async Task RefusedLoadViaException_EditsOfEverySetting_DoNotReachCommitPipeline()
+    {
+        var h = new Harness();
+        h.Controller.GetCurrentSettingsAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<AppSettings>(new ConfigurationUnavailableException(
+                "refused", "An administrator must repair HKLM\\SOFTWARE\\ProcessGuardianAdmin\\Recovery")));
+
+        var vm = h.CreateVm();
+        await WaitUntilAsync(() => vm.ConfigurationError.Length > 0, "the refused-load error indicator to be set");
+
+        vm.Settings.TargetProcessPath = @"C:\new\app.exe";
+        vm.Settings.CheckIntervalSeconds = 42;
+        vm.Settings.MaxRestartAttempts = 3;
+        vm.AutostartEffective = true;
+
+        await Task.Delay(700); // ample room for any debounce to fire
+
+        await h.Controller.Received(0)
+            .CommitSettingsAsync(Arg.Any<CommittedSettingsSnapshot>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
     [Fact]
     public void ResetNoticePending_SetsResetNotice_StartRemainsAvailable()
     {
