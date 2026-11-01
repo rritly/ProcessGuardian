@@ -120,7 +120,7 @@ public class GuardianRecoveryResolutionTests
 
         h.Autostart.SetCalls.Should().Be(0, "a pending reset notice must never auto-disable a pre-existing task");
         h.Autostart.State.Should().Be(AutostartState.Enabled);
-        _ = h.Monitor.DidNotReceive().StartAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
     }
 

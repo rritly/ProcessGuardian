@@ -634,13 +634,17 @@
                                Foreground="{StaticResource LabelBrush}"
                                Width="47"
                                VerticalAlignment="Center" />
-                    <TextBox Width="433" Height="30"
+                    <TextBox x:Name="TargetPathTextBox"
+                             Width="433" Height="30"
                              Style="{StaticResource DarkTextBoxStyle}"
                              VerticalContentAlignment="Center"
+                             IsEnabled="{Binding IsTargetPathEditable}"
+                             LostFocus="TargetPathTextBox_LostFocus"
                              Text="{Binding Settings.TargetProcessPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                     <Button Width="30" Height="30"
                             Style="{StaticResource AddButtonStyle}"
                             Content="+"
+                            IsEnabled="{Binding IsTargetPathEditable}"
                             Command="{Binding BrowseExecutableCommand}" />
                 </StackPanel>
 

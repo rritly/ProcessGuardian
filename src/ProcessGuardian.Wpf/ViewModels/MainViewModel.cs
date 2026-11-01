@@ -37,6 +37,7 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(StartCommand))]
     [NotifyCanExecuteChangedFor(nameof(StopCommand))]
+    [NotifyPropertyChangedFor(nameof(IsTargetPathEditable))]
     private GuardianStatus _status = GuardianStatus.Stopped;
 
     [ObservableProperty]
@@ -101,6 +102,13 @@ public partial class MainViewModel : ObservableObject
     // Set while the initial load assigns Settings: the subscription is wired, but the
     // debounced save must not rewrite settings.json right after it was loaded.
     private bool _suppressSave;
+
+    // The controller-owned committed target path, as last persisted through the controller.
+    // The TextBox is a draft: only an explicit commit (Browse / focus-lost / commit command)
+    // moves the draft into this committed value, which is what CommitSettingsAsync receives
+    // (R-CD). Typing alone therefore never mutates the committed path, never schedules a save
+    // of an incomplete path, and never clears the target pin.
+    private string _committedTargetPath = string.Empty;
 
     public MainViewModel(
         IMonitoringController controller,
@@ -196,6 +204,7 @@ public partial class MainViewModel : ObservableObject
             try
             {
                 Settings = loaded; // subscription is wired, but no debounced save on load
+                _committedTargetPath = loaded.TargetProcessPath ?? string.Empty;
             }
             finally
             {
@@ -219,6 +228,7 @@ public partial class MainViewModel : ObservableObject
             try
             {
                 Settings = new AppSettings();
+                _committedTargetPath = string.Empty;
             }
             finally
             {
@@ -232,6 +242,7 @@ public partial class MainViewModel : ObservableObject
             try
             {
                 Settings = new AppSettings();
+                _committedTargetPath = string.Empty;
             }
             finally
             {
@@ -289,6 +300,24 @@ public partial class MainViewModel : ObservableObject
         !string.IsNullOrEmpty(ConfigurationError)
         || !string.IsNullOrEmpty(ResetNotice)
         || !string.IsNullOrEmpty(AutostartError);
+
+    // The target-path TextBox and Browse button are editable only while no session is active
+    // (R-CD). The controller independently rejects a target-path change to an active session,
+    // so this gate is a UX guard; the committed-path discipline makes even a stale debounced
+    // save incapable of retargeting or clearing the pin.
+    public bool IsTargetPathEditable =>
+        Status is GuardianStatus.Stopped or GuardianStatus.Error;
+
+    // Explicitly commits the TextBox draft as the controller-owned committed path (called on
+    // focus-lost / commit command; Browse commits directly). Only a committed path change is
+    // sent to the controller, so it is the sole thing that can clear the pin while stopped.
+    public void CommitTargetPathDraft()
+    {
+        _committedTargetPath = Settings.TargetProcessPath ?? string.Empty;
+        _ = CommitNowAsync();
+        // A committed path change clears the recorded pin, possibly disabling keep-autostart.
+        NotifyRecoveryCanExecuteChanged();
+    }
 
     // Exposes the two explicit recovery resolutions. Both require a pending notice; option A
     // (keep autostart) additionally requires a recorded pin so the user must first re-select,
@@ -364,7 +393,7 @@ public partial class MainViewModel : ObservableObject
             var result = await _controller.ResolveRecoveryAsync(
                 RecoveryResolutionChoice.KeepAutostart,
                 CommitSnapshot(),
-                Settings.TargetProcessPath);
+                _committedTargetPath);
             await HandleRecoveryResultAsync(RecoveryResolutionChoice.KeepAutostart, result);
         }
         catch (Exception ex)
@@ -590,8 +619,10 @@ public partial class MainViewModel : ObservableObject
             if (dialog.ShowDialog() == true)
             {
                 Settings.TargetProcessPath = dialog.FileName;
-                // A committed path change in the stopped state clears the pin through the
-                // controller; keystrokes (uncommitted draft) do not.
+                // Browse is an explicit commit: the selection becomes the controller-owned
+                // committed path. A committed path change in the stopped state clears the pin
+                // through the controller; keystrokes (uncommitted draft) never do (R-CD).
+                _committedTargetPath = dialog.FileName;
                 _ = CommitNowAsync();
                 // A path re-selection clears the recorded pin, possibly disabling keep-autostart.
                 NotifyRecoveryCanExecuteChanged();
@@ -678,7 +709,10 @@ public partial class MainViewModel : ObservableObject
     {
         try
         {
-            var result = await _controller.CommitSettingsAsync(CommitSnapshot(), Settings.TargetProcessPath);
+            // Only the explicitly committed path is passed to the controller (R-CD): the
+            // TextBox is a draft, so typing/saving numeric settings can never mutate the
+            // committed path, schedule a save of an incomplete path, or clear the pin.
+            var result = await _controller.CommitSettingsAsync(CommitSnapshot(), _committedTargetPath);
             if (!result.Saved)
             {
                 // The persistence step itself failed; the failure is already surfaced through the

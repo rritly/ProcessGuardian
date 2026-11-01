@@ -123,16 +123,16 @@ public class WindowsProcessMonitorTests : IDisposable
     }
 
     [Fact]
-    public async Task StartAsync_NonexistentPath_ReturnsMissing_NoThrow()
+    public void TryStart_NonexistentPath_ReturnsMissing_NoThrow()
     {
         var bogus = new ProcessTarget(
             @"C:\DoesNotExist\missing.exe",
             "missing",
             @"C:\DoesNotExist");
 
-        Func<Task<ProcessStartResult>> act = () => _monitor.StartAsync(bogus, CancellationToken.None);
-        var result = await act.Should().NotThrowAsync();
-        result.Which.Status.Should().Be(ProcessStartStatus.Missing);
+        var result = _monitor.TryStart(bogus, CancellationToken.None);
+
+        result.Status.Should().Be(ProcessStartStatus.Missing);
     }
 
     [Fact]

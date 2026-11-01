@@ -24,7 +24,7 @@ public enum ProcessStartStatus
     Cancelled,
 }
 
-/// <summary>Typed outcome of <see cref="IProcessMonitor.StartAsync"/>.</summary>
+/// <summary>Typed outcome of <see cref="IProcessMonitor.TryStart"/>.</summary>
 public sealed record ProcessStartResult(ProcessStartStatus Status, string? ErrorMessage = null)
 {
     public static ProcessStartResult Started() => new(ProcessStartStatus.Started);

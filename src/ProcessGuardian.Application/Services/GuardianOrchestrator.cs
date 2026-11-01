@@ -44,8 +44,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     private readonly SemaphoreSlim _operationLock = new(1, 1);
 
     // Linearizes Process.Start against Stop/Suspend: the launch loop acquires it around the
-    // synchronous start; Stop/Suspend acquire it to close the gate before cancelling.
+    // synchronous start; Stop/Suspend acquire it to close the gate before cancelling. The gate
+    // itself is never held across an await: Stop closes it and cancels in one brief critical
+    // section, then settles the session outside the gate (R-CD).
     private readonly SemaphoreSlim _launchGate = new(1, 1);
+
+    // Set while Stop/Suspend is settling the session so no new launch can enter the gate even
+    // after the brief critical section releases it (R-CD). Cleared when a fresh session begins.
+    private volatile bool _launchGateClosed;
 
     // Session state (guarded by _operationLock for writes; reads via properties).
     private CancellationTokenSource? _sessionCts;
@@ -77,11 +83,12 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     public event EventHandler? AutostartStateChanged;
 
     // --- Test seams ------------------------------------------------------------
-    // Pause hooks placed at the two linearization boundaries so the launch-gate race
-    // tests are deterministic: before entering the launch critical section, and inside
-    // it. Production leaves them null.
+    // Pause hooks placed at the two launch-gate boundaries so the launch-gate race tests are
+    // deterministic: before entering the launch critical section, and inside it. Production
+    // leaves them null. The inside hook is synchronous (Action) on purpose: while it runs the
+    // launch gate IS held, so it must never await (R-CD).
     internal Func<SessionSnapshot, CancellationToken, Task>? BeforeLaunchGateHook { get; set; }
-    internal Func<Task>? InsideLaunchGateHook { get; set; }
+    internal Action? InsideLaunchGateHook { get; set; }
 
     public GuardianOrchestrator(
         IProcessMonitor monitor,
@@ -554,28 +561,32 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 return saved ? StopResult.AlreadyStopped() : StopResult.RuntimeStopped_SaveFailed(new Exception("persisting the disabled state failed"));
             }
 
-            // Close the launch gate, then cancel: no Process.Start may begin after this point,
-            // and none may occur after this Stop returns. A launch critical section already in
-            // flight holds the gate; this wait makes RuntimeStopped honest.
+            // Close the launch gate and cancel the session in one brief critical section (R-CD):
+            // no Process.Start may begin after the gate closes, and none may occur after this
+            // Stop returns. An in-flight launch critical section holds the gate; this wait makes
+            // RuntimeStopped honest. The gate is released before the session is awaited so Stop
+            // never blocks on the full verification timeout — a verification already running
+            // observes the cancellation as soon as the key is turned. The _launchGateClosed flag
+            // keeps the gate logically closed to new starts while the session settles.
             await _launchGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                _launchGateClosed = true;
                 _sessionCts?.Cancel();
             }
             finally
             {
-                // Release only after the session settled, so nothing re-enters the gate.
-                try
-                {
-                    await (task!).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Session task faulted during Stop");
-                }
-
                 _launchGate.Release();
+            }
+
+            try
+            {
+                await (task!).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Session task faulted during Stop");
             }
 
             _session = null;
@@ -615,24 +626,29 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 return;
             }
 
-            // Synchronously close the launch gate before the first await of the session.
+            // Close the launch gate and cancel in one brief critical section, then settle the
+            // session outside the gate (R-CD): the session-token cancellation unblocks any
+            // verification that was already running, and _launchGateClosed keeps the gate
+            // logically closed to new launches while the session settles.
             await _launchGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                _launchGateClosed = true;
                 _sessionCts?.Cancel();
-                try
-                {
-                    await (task!).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Session task faulted during Suspend");
-                }
             }
             finally
             {
                 _launchGate.Release();
+            }
+
+            try
+            {
+                await (task!).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Session task faulted during Suspend");
             }
 
             _session = null;
@@ -677,6 +693,8 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
     private void BeginSession(SessionSnapshot session)
     {
+        // A fresh session re-opens the launch gate: any previous Stop/Suspend close is void.
+        _launchGateClosed = false;
         _sessionCts = new CancellationTokenSource();
         _session = session;
         var cts = _sessionCts;
@@ -903,89 +921,90 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 return StartOutcome.SessionEnded;
         }
 
-        // Linearized launch: the last session/gate check and the synchronous Process.Start
-        // execute in one non-awaiting critical section. Stop/Suspend close this gate and
-        // cancel the session before awaiting it, so no launch begins after they act and
-        // none begins after a completed Stop returns.
+        // Linearized launch (R-CD): only the final session/gate check and the synchronous
+        // Process.Start run while _launchGate is held. The gate is released immediately after
+        // the process-creation result is captured — startup verification, toasts and delays all
+        // run outside it and remain cancellable by the session token. Stop/Suspend close the
+        // gate and cancel the session in one brief critical section, then settle it outside the
+        // gate, so no launch begins after they act and none begins after a completed Stop
+        // returns.
         if (BeforeLaunchGateHook is not null)
             await BeforeLaunchGateHook(CurrentSessionOr(target), ct).ConfigureAwait(false);
 
         await _launchGate.WaitAsync(ct).ConfigureAwait(false);
+        ProcessStartResult start;
         try
         {
-            // Re-check session identity under the gate; no await may precede the launch itself.
-            if (ct.IsCancellationRequested)
+            // Re-check session identity under the gate; no await may precede the sync launch.
+            if (ct.IsCancellationRequested || _launchGateClosed)
                 return StartOutcome.SessionEnded;
 
-            if (InsideLaunchGateHook is not null)
-                await InsideLaunchGateHook().ConfigureAwait(false);
+            InsideLaunchGateHook?.Invoke();
 
-            ProcessStartResult start;
-            try
-            {
-                start = await _monitor.StartAsync(target, ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return StartOutcome.SessionEnded;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "StartAsync threw for {Target}", target.NameWithoutExtension);
-                return StartOutcome.NotStarted;
-            }
-
-            switch (start.Status)
-            {
-                case ProcessStartStatus.Cancelled:
-                    return StartOutcome.SessionEnded;
-                case ProcessStartStatus.Missing:
-                    _logger.LogWarning("Target {Target} disappeared before launch; skipping (degraded), no budget spent",
-                        target.NameWithoutExtension);
-                    return StartOutcome.Degraded;
-                case ProcessStartStatus.ReadError:
-                    _logger.LogWarning("Target {Target} became unreadable before launch; skipping (degraded), no budget spent",
-                        target.NameWithoutExtension);
-                    return StartOutcome.Degraded;
-                case ProcessStartStatus.Failed:
-                    _logger.LogError("Failed to start process {Target}: {Error}", target.NameWithoutExtension, start.ErrorMessage);
-                    return StartOutcome.NotStarted;
-            }
-            // Started: proceed to startup verification below.
-
-            var verified = await VerifyStartupSafeAsync(target, knobs, ct).ConfigureAwait(false);
-            if (verified == VerifyOutcome.Verified)
-            {
-                _logger.LogInformation("Process {Target} verified running", target.NameWithoutExtension);
-                Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
-                if (showRecoveryToast)
-                {
-                    try
-                    {
-                        if (knobs.EnableToasts)
-                            await _notifications.ShowAsync("Process Recovered", string.Empty, ct).ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Failed to show recovery toast");
-                    }
-                }
-                return StartOutcome.Verified;
-            }
-
-            if (verified == VerifyOutcome.Failed)
-            {
-                _logger.LogWarning("Startup verification failed for {Target}", target.NameWithoutExtension);
-                return StartOutcome.VerifyFailed;
-            }
-
-            // VerifyStartupAsync observed cancellation: the session is ending.
+            start = _monitor.TryStart(target, ct);
+        }
+        catch (OperationCanceledException)
+        {
             return StartOutcome.SessionEnded;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "TryStart threw for {Target}", target.NameWithoutExtension);
+            return StartOutcome.NotStarted;
         }
         finally
         {
+            // Released immediately after the start result is captured (R-CD); never held across
+            // an await, so verification below cannot block Stop for the verification timeout.
             _launchGate.Release();
         }
+
+        switch (start.Status)
+        {
+            case ProcessStartStatus.Cancelled:
+                return StartOutcome.SessionEnded;
+            case ProcessStartStatus.Missing:
+                _logger.LogWarning("Target {Target} disappeared before launch; skipping (degraded), no budget spent",
+                    target.NameWithoutExtension);
+                return StartOutcome.Degraded;
+            case ProcessStartStatus.ReadError:
+                _logger.LogWarning("Target {Target} became unreadable before launch; skipping (degraded), no budget spent",
+                    target.NameWithoutExtension);
+                return StartOutcome.Degraded;
+            case ProcessStartStatus.Failed:
+                _logger.LogError("Failed to start process {Target}: {Error}", target.NameWithoutExtension, start.ErrorMessage);
+                return StartOutcome.NotStarted;
+        }
+        // Started: proceed to startup verification below (outside the gate).
+
+        var verified = await VerifyStartupSafeAsync(target, knobs, ct).ConfigureAwait(false);
+        if (verified == VerifyOutcome.Verified)
+        {
+            _logger.LogInformation("Process {Target} verified running", target.NameWithoutExtension);
+            Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
+            if (showRecoveryToast)
+            {
+                try
+                {
+                    if (knobs.EnableToasts)
+                        await _notifications.ShowAsync("Process Recovered", string.Empty, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to show recovery toast");
+                }
+            }
+            return StartOutcome.Verified;
+        }
+
+        if (verified == VerifyOutcome.Failed)
+        {
+            _logger.LogWarning("Startup verification failed for {Target}", target.NameWithoutExtension);
+            return StartOutcome.VerifyFailed;
+        }
+
+        // VerifyStartupAsync observed cancellation: the session is ending.
+        return StartOutcome.SessionEnded;
     }
 
     private enum VerifyOutcome { Verified, Failed, Cancelled }

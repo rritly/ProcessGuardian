@@ -78,7 +78,7 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
     // A synthetic per-process snapshot for the EvaluateCandidates seam (tests).
     internal readonly record struct ProcessCandidate(int ProcessId, string? ModulePath, bool Unreadable);
 
-    public Task<ProcessStartResult> StartAsync(ProcessTarget target, CancellationToken ct)
+    public ProcessStartResult TryStart(ProcessTarget target, CancellationToken ct)
     {
         try
         {
@@ -91,27 +91,27 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
             // The Process handle is not needed after the start decision; dispose it
             // immediately instead of holding one handle per restart until finalization.
             using var proc = Process.Start(psi);
-            return Task.FromResult(proc != null ? ProcessStartResult.Started() : ProcessStartResult.Failed("the process could not be created"));
+            return proc != null ? ProcessStartResult.Started() : ProcessStartResult.Failed("the process could not be created");
         }
         catch (OperationCanceledException)
         {
             // Cancellation is never a launch failure (R-KE).
-            return Task.FromResult(ProcessStartResult.Cancelled());
+            return ProcessStartResult.Cancelled();
         }
         catch (FileNotFoundException ex)
         {
             _logger.LogError(ex, "Target executable not found: {Path}", target.FullPath);
-            return Task.FromResult(ProcessStartResult.Missing());
+            return ProcessStartResult.Missing();
         }
         catch (DirectoryNotFoundException ex)
         {
             _logger.LogError(ex, "Target directory not found: {Path}", target.FullPath);
-            return Task.FromResult(ProcessStartResult.Missing());
+            return ProcessStartResult.Missing();
         }
         catch (UnauthorizedAccessException ex)
         {
             _logger.LogError(ex, "Access denied reading target: {Path}", target.FullPath);
-            return Task.FromResult(ProcessStartResult.ReadError());
+            return ProcessStartResult.ReadError();
         }
         catch (Win32Exception ex)
         {
@@ -121,20 +121,20 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
                 case ProcessStartStatus.Missing:
                     _logger.LogError(ex, "Target executable not found (Win32 {Code}): {Path}",
                         ex.NativeErrorCode, target.FullPath);
-                    return Task.FromResult(ProcessStartResult.Missing());
+                    return ProcessStartResult.Missing();
                 case ProcessStartStatus.ReadError:
                     _logger.LogError(ex, "Target executable could not be read (Win32 {Code}): {Path}",
                         ex.NativeErrorCode, target.FullPath);
-                    return Task.FromResult(ProcessStartResult.ReadError());
+                    return ProcessStartResult.ReadError();
                 default:
                     _logger.LogError(ex, "Win32 error starting process: {Path}", target.FullPath);
-                    return Task.FromResult(ProcessStartResult.Failed($"Win32 error {ex.NativeErrorCode}: {ex.Message}"));
+                    return ProcessStartResult.Failed($"Win32 error {ex.NativeErrorCode}: {ex.Message}");
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error starting process: {Path}", target.FullPath);
-            return Task.FromResult(ProcessStartResult.Failed(ex.Message));
+            return ProcessStartResult.Failed(ex.Message);
         }
     }
 

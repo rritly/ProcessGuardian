@@ -19,6 +19,15 @@ public partial class MainWindow : Window
         StateChanged += OnStateChanged;
     }
 
+    // An explicit commit point for the target-path draft (R-CD): focus leaving the TextBox
+    // commits the draft as the controller-owned committed path via the ViewModel, so the
+    // draft is only ever touched by Browse / focus-lost / an explicit commit command.
+    private void TargetPathTextBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (DataContext is ViewModels.MainViewModel vm)
+            vm.CommitTargetPathDraft();
+    }
+
     private void OnStateChanged(object? sender, EventArgs e)
     {
         // Maximize must not resize the fixed-size window: snap straight back.
