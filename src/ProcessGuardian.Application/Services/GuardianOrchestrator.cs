@@ -625,9 +625,17 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             var task = _sessionTask;
             if (cts is null || task is { IsCompleted: true })
             {
-                // No live session: persist the desired off-state (best-effort) and report stopped.
+                // No live session: tear down the (possibly completed) session holder here too so
+                // an in-flight fatal settlement continuation observes a stale reference and skips
+                // its persist/publish (it re-checks inside the operation lock). Persist the desired
+                // off-state best-effort and report stopped — never degraded (R-F).
+                _session = null;
+                cts?.Dispose();
+                _sessionCts = null;
+                _sessionTask = null;
+
                 var saved = await PersistEnabledAsync(enabled: false, ct, applyAutostart: !_recoveryPending).ConfigureAwait(false);
-                Publish(new MonitorState(GuardianStatus.Stopped, !saved, null, !saved));
+                Publish(new MonitorState(GuardianStatus.Stopped, false, null, !saved));
                 return saved ? StopResult.AlreadyStopped() : StopResult.RuntimeStopped_SaveFailed(new Exception("persisting the disabled state failed"));
             }
 
@@ -666,7 +674,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
             // One final store save merging committed fields with controller-owned state.
             var settingsSaved = await PersistEnabledAsync(enabled: false, ct, applyAutostart: !_recoveryPending).ConfigureAwait(false);
-            Publish(new MonitorState(GuardianStatus.Stopped, !settingsSaved, null, !settingsSaved));
+            Publish(new MonitorState(GuardianStatus.Stopped, false, null, !settingsSaved));
             if (!settingsSaved)
             {
                 _logger.LogError("Stop persisted runtime stop but failed to save enabled=false; disk may retain true");
@@ -805,16 +813,30 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         if (fatalReason is null)
             return;
 
-        // Published outside the session task (R-F): the loop already ran to completion, so a
-        // new Start is already allowed; this guard keeps a stale fatal Error from being
-        // published over a session that has since begun.
-        if (!ReferenceEquals(_sessionTask, sessionTask))
-            return;
+        // [R-F settlement sync] Settle under the operation lock, with the liveness re-check inside
+        // the lock: Stop/Suspend tear the session holder down and a new Start replaces it, so a
+        // stale fatal continuation — one that was already in flight past its first await while the
+        // persist ran — observes a stale reference and skips both the persist and the publish.
+        // Serializing the persist-and-publish with Start/Stop means a Stop during the settlement
+        // either wins the lock first (holder nulled -> this continuation skips) or runs after it
+        // and publishes Stopped last; either way a stale Error is never the final published state,
+        // and a late IsMonitoringEnabled=false / AutostartEnabled=false cannot disable a newer
+        // session whose Start is linearized after (or re-persists over) this settlement.
+        await _operationLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            if (!ReferenceEquals(_sessionTask, sessionTask))
+                return;
 
-        // Persist enabled=false best-effort, then Error — a failed save never turns the
-        // terminal state into degraded, it is surfaced via the independent SaveFailed flag.
-        await TryPersistDisabledBestEffortAsync(_committed).ConfigureAwait(false);
-        Publish(new MonitorState(GuardianStatus.Error, false, fatalReason, _lastPersistFailed));
+            // Persist enabled=false best-effort, then Error — a failed save never turns the
+            // terminal state into degraded, it is surfaced via the independent SaveFailed flag.
+            await TryPersistDisabledBestEffortAsync(_committed).ConfigureAwait(false);
+            Publish(new MonitorState(GuardianStatus.Error, false, fatalReason, _lastPersistFailed));
+        }
+        finally
+        {
+            _operationLock.Release();
+        }
     }
 
     private async Task<SessionEnd> RunSessionAsync(SessionSnapshot session, CancellationToken ct)

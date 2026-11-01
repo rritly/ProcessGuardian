@@ -1418,6 +1418,178 @@ public class GuardianOrchestratorTests
         controller.CurrentState.IsDegraded.Should().BeFalse("a fatal Error is never degraded (R-F)");
     }
 
+    // R-F: every Stopped publication is IsDegraded=false; a failed save is surfaced ONLY through
+    // SaveFailed, never by marking the state degraded. This test exercises the no-live-session
+    // branch of StopAsync (a session that never ran, or already completed) with the save failing.
+    [Fact]
+    public async Task Stop_NoLiveSession_SaveFails_StoppedIsDegradedFalse_SaveFailedOnly()
+    {
+        using var h = new Harness();
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ => throw new IOException("disk failed"));
+
+        var controller = h.CreateController();
+        var stop = await controller.StopAsync(); // no session ever started -> no-live-session branch
+
+        stop.RuntimeStopped.Should().BeTrue();
+        stop.SettingsSaved.Should().BeFalse();
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        controller.CurrentState.IsDegraded.Should().BeFalse(
+            "Stopped is never degraded even when the disabled-state save fails (R-F)");
+        controller.CurrentState.SaveFailed.Should().BeTrue(
+            "the save failure is surfaced only through the independent SaveFailed flag");
+    }
+
+    // R-F: the live-session branch of StopAsync must publish IsDegraded=false when its final
+    // save fails; the failure is a SaveFailed flag, never a degraded Stopped.
+    [Fact]
+    public async Task Stop_LiveSession_SaveFails_StoppedIsDegradedFalse_SaveFailedOnly()
+    {
+        using var h = new Harness();
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42)));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Monitoring,
+            "the session to reach Monitoring");
+
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ => throw new IOException("disk failed"));
+
+        var stop = await controller.StopAsync();
+
+        stop.RuntimeStopped.Should().BeTrue("Stop always stops the runtime session (F)");
+        stop.SettingsSaved.Should().BeFalse();
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        controller.CurrentState.IsDegraded.Should().BeFalse(
+            "a failed final save during Stop is never a degraded Stopped (R-F)");
+        controller.CurrentState.SaveFailed.Should().BeTrue(
+            "the failure must be surfaced via SaveFailed, independently of IsDegraded");
+    }
+
+    // R-F settlement sync (4.2, Scenario A): Stop during the fatal settlement. The fatal
+    // disabled-save is parked on a barrier while the settlement holds the operation lock; Stop
+    // then linearizes after it. The settlement publishes its fatal Error first, Stop publishes
+    // Stopped last, and no stale Error follows the Stop — the final state is a clean Stopped.
+    [Fact]
+    public async Task FatalSettlement_RaceStop_DuringSave_StopWins_NoStaleError()
+    {
+        using var h = new Harness();
+        // Pin at Start is "PIN"; at the launch re-verify the target reads "BB" -> fatal Mismatch.
+        int hashCalls = 0;
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(TargetHashResult.Computed(hashCalls++ == 0 ? "PIN" : "BB")));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+
+        var published = new System.Collections.Concurrent.ConcurrentQueue<GuardianStatus>();
+        var controller = h.CreateController();
+        controller.StateChanged += (_, s) => published.Enqueue(s.Status);
+
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        // Park the fatal disabled-save (the settlement's persist) on a barrier. Because the
+        // settlement now holds the operation lock while the save is parked, Stop cannot run
+        // concurrently with the settlement — it is deterministically linearized after it.
+        var persistedEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePersist = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                persistedEntered.TrySetResult(true);
+                return releasePersist.Task;
+            });
+
+        await WaitUntilAsync(() => persistedEntered.Task.IsCompleted,
+            "the fatal disabled-save (settlement continuation) to be entered");
+
+        // Stop is now pending on the operation lock held by the parked settlement.
+        var stopTask = controller.StopAsync();
+
+        releasePersist.TrySetResult(true);
+
+        var stop = await stopTask;
+        stop.RuntimeStopped.Should().BeTrue();
+
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Stopped,
+            "the final state to be Stopped after the Stop linearizes after the settlement");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        controller.CurrentState.IsDegraded.Should().BeFalse("a Stopped state is never degraded (R-F)");
+        controller.CurrentState.SaveFailed.Should().BeFalse(
+            "both the settlement save and the Stop final save succeeded in this run");
+
+        published.Last().Should().Be(GuardianStatus.Stopped,
+            "the final published state must be the Stop result — the stale fatal Error is never the last state");
+    }
+
+    // R-F settlement sync (4.2, Scenario B): Start during the fatal settlement. Start waits on the
+    // operation lock, so it can never begin while the previous settlement is mid-flight; once the
+    // settlement settles (persists disabled, publishes its fatal Error) Start re-persists
+    // enabled=true and begins a fresh session. The old disabled write is overwritten by the new
+    // session's own save and the stale Error precedes (never overwrites) the new session's state.
+    [Fact]
+    public async Task FatalSettlement_RaceStart_DuringSave_NewSessionStartsClean()
+    {
+        using var h = new Harness();
+        int hashCalls = 0;
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(TargetHashResult.Computed(hashCalls++ == 1 ? "BB" : "PIN")));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+
+        var published = new System.Collections.Concurrent.ConcurrentQueue<GuardianStatus>();
+        var controller = h.CreateController();
+        controller.StateChanged += (_, s) => published.Enqueue(s.Status);
+
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        var persistedEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePersist = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var savedDocs = new List<AppSettings>();
+        h.Config.SaveAsync(Arg.Do<AppSettings>(d => savedDocs.Add(d)), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                persistedEntered.TrySetResult(true);
+                return releasePersist.Task;
+            });
+
+        await WaitUntilAsync(() => persistedEntered.Task.IsCompleted,
+            "the fatal disabled-save (settlement continuation) to be entered");
+
+        // A new Start is now pending on the operation lock: SessionActive is false (the old task
+        // completed), so the request is valid, but it must not begin until the settlement settles.
+        var startTask = controller.StartAsync(h.Request());
+
+        releasePersist.TrySetResult(true);
+
+        var result = await startTask;
+        result.Started.Should().BeTrue("a new session may start once the previous settlement has settled");
+
+        // The new session is active and its state is published LAST — the stale fatal Error from
+        // the old settlement never overwrites it.
+        await WaitUntilAsync(
+            () => controller.CurrentState.Status is GuardianStatus.Waiting
+                or GuardianStatus.Monitoring
+                or GuardianStatus.Restarting,
+            "the new session to be active");
+        controller.CurrentState.IsDegraded.Should().BeFalse("the new session is not degraded");
+        published.Last().Should().BeOneOf(
+            new[] { GuardianStatus.Waiting, GuardianStatus.Monitoring, GuardianStatus.Restarting },
+            "the stale fatal Error must never be the final published state after a new Start");
+
+        // Settings: the old settlement's disabled write is overwritten by the new session's own
+        // PersistEnabledAsync(true), so the last persisted state is enabled again — the old
+        // settlement cannot disable the new session.
+        savedDocs.Should().Contain(d => !d.IsMonitoringEnabled,
+            "the settlement persisted IsMonitoringEnabled=false while parked");
+        savedDocs.Last().IsMonitoringEnabled.Should().BeTrue(
+            "the new session re-persists IsMonitoringEnabled=true after the old disabled write");
+    }
+
     [Fact]
     public async Task IsDegraded_OnlyWhileActive_StoppedAndErrorAlwaysFalse_ReasonPresentWhenTrue()
     {
