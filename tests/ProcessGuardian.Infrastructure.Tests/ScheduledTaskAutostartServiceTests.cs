@@ -248,6 +248,240 @@ public class ScheduledTaskAutostartServiceTests
     }
 
     // ------------------------------------------------------------------
+    // Real Windows Task Scheduler XML shape + structured mismatch diagnostics
+    // ------------------------------------------------------------------
+
+    // A realistic /XML export as schtasks writes it: RegistrationInfo, a full Settings block
+    // with IdleSettings, <Actions Context="Author">, a per-trigger Enabled/UserId, and — matching
+    // the schtasks round-trip of the quoted /TR executable — a quoted <Command> by default.
+    private static string RealTaskXml(
+        string? command = null,
+        string? arguments = "--background",
+        bool logonTrigger = true,
+        string? logonType = "InteractiveToken",
+        string? runLevel = "HighestAvailable",
+        string? enabled = "true")
+    {
+        var trigger = logonTrigger
+            ? "<LogonTrigger><Enabled>true</Enabled><UserId>DESKTOP-TEST\\admin</UserId></LogonTrigger>"
+            : "<BootTrigger><Enabled>true</Enabled></BootTrigger>";
+        var commandEl = command is null ? string.Empty : $"<Command>{command}</Command>";
+        return $"""
+            <?xml version="1.0" encoding="UTF-16"?>
+            <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+              <RegistrationInfo>
+                <Date>2026-10-25T09:30:00.1234567</Date>
+                <Author>DESKTOP-TEST\admin</Author>
+                <Description>ProcessGuardian elevated autostart</Description>
+                <URI>\ProcessGuardianAdmin</URI>
+              </RegistrationInfo>
+              <Triggers>
+                {trigger}
+              </Triggers>
+              <Principals>
+                <Principal id="Author">
+                  <UserId>DESKTOP-TEST\admin</UserId>
+                  <LogonType>{logonType}</LogonType>
+                  <RunLevel>{runLevel}</RunLevel>
+                </Principal>
+              </Principals>
+              <Settings>
+                <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+                <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+                <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+                <AllowHardTerminate>true</AllowHardTerminate>
+                <StartWhenAvailable>false</StartWhenAvailable>
+                <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+                <IdleSettings>
+                  <StopOnIdleEnd>true</StopOnIdleEnd>
+                  <RestartOnIdle>false</RestartOnIdle>
+                  <IdleDuration>PT10M</IdleDuration>
+                  <WaitTimeout>PT1H</WaitTimeout>
+                </IdleSettings>
+                <AllowStartOnDemand>true</AllowStartOnDemand>
+                <Enabled>{enabled}</Enabled>
+                <Hidden>false</Hidden>
+                <RunOnlyIfIdle>false</RunOnlyIfIdle>
+                <WakeToRun>false</WakeToRun>
+                <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
+                <Priority>7</Priority>
+              </Settings>
+              <Actions Context="Author">
+                <Exec>
+                  {commandEl}
+                  <Arguments>{arguments}</Arguments>
+                </Exec>
+              </Actions>
+            </Task>
+            """;
+    }
+
+    [Fact]
+    public void ParseTaskXml_RealSchedulerExport_QuotedCommand_IsParsedWithQuotesPreserved()
+    {
+        const string exe = @"C:\Program Files\ProcessGuardian\ProcessGuardianAdmin.exe";
+        var xml = RealTaskXml(command: $"\"{exe}\"");
+
+        var d = ScheduledTaskAutostartService.ParseTaskXml(xml);
+
+        d.Should().NotBeNull();
+        d!.Value.Command.Should().Be($"\"{exe}\"", "the raw export value is preserved for diagnosis");
+        ScheduledTaskAutostartService.NormalizeCommand(d.Value.Command).Should().Be(exe);
+        ScheduledTaskAutostartService.GetMismatches(d.Value, exe).Should().BeEmpty();
+        ScheduledTaskAutostartService.Evaluate(d.Value, exe).Should().Be(AutostartState.Enabled);
+    }
+
+    [Fact]
+    public void Evaluate_RealSchedulerExport_QuotedCommand_IsEnabled_NotMisconfigured()
+    {
+        const string exe = @"C:\Program Files\ProcessGuardian\ProcessGuardianAdmin.exe";
+
+        var d = ScheduledTaskAutostartService.ParseTaskXml(RealTaskXml(command: $"\"{exe}\""))!.Value;
+
+        ScheduledTaskAutostartService.Evaluate(d, exe).Should().Be(AutostartState.Enabled);
+    }
+
+    [Fact]
+    public void Evaluate_RealSchedulerExport_UnquotedCommand_IsEnabled()
+    {
+        var d = ScheduledTaskAutostartService.ParseTaskXml(
+            RealTaskXml(command: ExpectedCommand()))!.Value;
+
+        ScheduledTaskAutostartService.Evaluate(d, ExpectedCommand()).Should().Be(AutostartState.Enabled);
+    }
+
+    [Fact]
+    public void Evaluate_RealSchedulerExport_DisabledFlag_IsDisabled()
+    {
+        var d = ScheduledTaskAutostartService.ParseTaskXml(
+            RealTaskXml(command: ExpectedCommand(), enabled: "false"))!.Value;
+
+        ScheduledTaskAutostartService.Evaluate(d, ExpectedCommand()).Should().Be(AutostartState.Disabled);
+    }
+
+    [Theory]
+    [InlineData(@"C:\path\app.exe", @"C:\path\app.exe")]
+    [InlineData(@"""C:\path\app.exe""", @"C:\path\app.exe")]
+    [InlineData(@"  ""C:\path\app.exe""  ", @"C:\path\app.exe")]
+    [InlineData(null, null)]
+    [InlineData("", "")]
+    [InlineData("single quote \"", "single quote \"")]
+    public void NormalizeCommand_StripsOnlyAPairedOuterQuotePair(string? raw, string? expected)
+    {
+        ScheduledTaskAutostartService.NormalizeCommand(raw).Should().Be(expected);
+    }
+
+    [Fact]
+    public void GetMismatches_WrongCommand_ReportsExactCheckExpectedActual()
+    {
+        const string expected = @"C:\Program Files\ProcessGuardian\ProcessGuardianAdmin.exe";
+        const string actual = @"C:\Other\moved.exe";
+        var d = ScheduledTaskAutostartService.ParseTaskXml(RealTaskXml(command: actual))!.Value;
+
+        var m = ScheduledTaskAutostartService.GetMismatches(d, expected).Should().ContainSingle().Subject;
+
+        m.Check.Should().Be("Command");
+        m.Expected.Should().Be(expected);
+        m.Actual.Should().Be(actual);
+    }
+
+    [Fact]
+    public void GetMismatches_QuotedCommandWithDifferentExe_IsStillACommandMismatch()
+    {
+        const string expected = @"C:\Program Files\ProcessGuardian\ProcessGuardianAdmin.exe";
+        var d = ScheduledTaskAutostartService.ParseTaskXml(
+            RealTaskXml(command: @"""C:\Old\ProcessGuardianAdmin.exe"""))!.Value;
+
+        var m = ScheduledTaskAutostartService.GetMismatches(d, expected).Should().ContainSingle().Subject;
+
+        m.Check.Should().Be("Command");
+        m.Actual.Should().Contain(@"C:\Old\ProcessGuardianAdmin.exe");
+    }
+
+    [Fact]
+    public void GetMismatches_MissingCommand_ReportsMissingActual()
+    {
+        var d = ScheduledTaskAutostartService.ParseTaskXml(RealTaskXml(command: null))!.Value;
+
+        var m = ScheduledTaskAutostartService.GetMismatches(d, ExpectedCommand()).Should().ContainSingle().Subject;
+
+        m.Check.Should().Be("Command");
+        m.Actual.Should().Be("<missing>");
+    }
+
+    [Fact]
+    public void GetMismatches_MissingBackgroundFlag_ReportsExactCheckExpectedActual()
+    {
+        var d = ScheduledTaskAutostartService.ParseTaskXml(
+            RealTaskXml(command: ExpectedCommand(), arguments: "--normal"))!.Value;
+
+        var m = ScheduledTaskAutostartService.GetMismatches(d, ExpectedCommand()).Should().ContainSingle().Subject;
+
+        m.Check.Should().Be("Arguments");
+        m.Expected.Should().Be("--background");
+        m.Actual.Should().Be("--normal");
+    }
+
+    [Fact]
+    public void GetMismatches_NoLogonTrigger_ReportsTriggerMismatch()
+    {
+        var d = ScheduledTaskAutostartService.ParseTaskXml(
+            RealTaskXml(command: ExpectedCommand(), logonTrigger: false))!.Value;
+
+        var m = ScheduledTaskAutostartService.GetMismatches(d, ExpectedCommand()).Should().ContainSingle().Subject;
+
+        m.Check.Should().Be("LogonTrigger");
+        m.Actual.Should().Be("<none>");
+    }
+
+    [Fact]
+    public void GetMismatches_WrongLogonType_ReportsExactCheckExpectedActual()
+    {
+        var d = ScheduledTaskAutostartService.ParseTaskXml(
+            RealTaskXml(command: ExpectedCommand(), logonType: "Password"))!.Value;
+
+        var m = ScheduledTaskAutostartService.GetMismatches(d, ExpectedCommand()).Should().ContainSingle().Subject;
+
+        m.Check.Should().Be("LogonType");
+        m.Expected.Should().Be("InteractiveToken");
+        m.Actual.Should().Be("Password");
+    }
+
+    [Fact]
+    public void GetMismatches_WrongRunLevel_ReportsExactCheckExpectedActual()
+    {
+        var d = ScheduledTaskAutostartService.ParseTaskXml(
+            RealTaskXml(command: ExpectedCommand(), runLevel: "LeastPrivilege"))!.Value;
+
+        var m = ScheduledTaskAutostartService.GetMismatches(d, ExpectedCommand()).Should().ContainSingle().Subject;
+
+        m.Check.Should().Be("RunLevel");
+        m.Expected.Should().Be("HighestAvailable");
+        m.Actual.Should().Be("LeastPrivilege");
+    }
+
+    [Fact]
+    public void GetMismatches_FullyMatchingRealXml_IsEmpty()
+    {
+        var d = ScheduledTaskAutostartService.ParseTaskXml(
+            RealTaskXml(command: $"\"{ExpectedCommand()}\""))!.Value;
+
+        ScheduledTaskAutostartService.GetMismatches(d, ExpectedCommand()).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Evaluate_RealSchedulerExport_MissingEnabledElement_IsUnknown_NotEnabled()
+    {
+        var xml = RealTaskXml(command: ExpectedCommand(), enabled: "true")
+            .Replace("<Enabled>true</Enabled>", string.Empty, StringComparison.Ordinal);
+        var d = ScheduledTaskAutostartService.ParseTaskXml(xml)!;
+
+        var state = ScheduledTaskAutostartService.Evaluate(d.Value, ExpectedCommand());
+
+        state.Should().Be(AutostartState.Unknown);
+    }
+
+    // ------------------------------------------------------------------
     // LooksLikeMissingTask
     // ------------------------------------------------------------------
 

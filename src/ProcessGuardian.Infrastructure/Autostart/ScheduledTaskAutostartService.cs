@@ -41,6 +41,17 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
 
     public async Task<AutostartState> ReadStateAsync(CancellationToken ct = default)
     {
+        var (state, _) = await ReadStateDetailedAsync(ct).ConfigureAwait(false);
+        return state;
+    }
+
+    /// <summary>
+    /// Reads the typed autostart state together with the parsed task descriptor. The descriptor
+    /// lets callers surface a per-check diagnostic (which field failed, what was expected, what
+    /// was actually found) instead of only the aggregate Misconfigured result.
+    /// </summary>
+    internal async Task<(AutostartState State, TaskDescriptor? Descriptor)> ReadStateDetailedAsync(CancellationToken ct = default)
+    {
         var (exitCode, output) = await RunSchTasksAsync(BuildQueryXmlArguments(), ct).ConfigureAwait(false);
         if (exitCode == 0)
         {
@@ -48,10 +59,13 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             if (config is null)
             {
                 _logger.LogWarning("Autostart task query succeeded but the task XML could not be parsed");
-                return AutostartState.Unknown;
+                return (AutostartState.Unknown, null);
             }
 
-            return Evaluate(config.Value, ExpectedCommand);
+            var state = Evaluate(config.Value, ExpectedCommand);
+            if (state == AutostartState.Misconfigured)
+                LogMismatches(GetMismatches(config.Value, ExpectedCommand), "read-state");
+            return (state, config);
         }
 
         // A nonzero /Query exit code is NOT proof the task is absent: schtasks returns nonzero
@@ -59,12 +73,23 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         // clean "task not found" result is Absent; every other failure is Unknown so the caller
         // can never mistake a read error for a verified "off" registration.
         if (LooksLikeMissingTask(output))
-            return AutostartState.Absent;
+            return (AutostartState.Absent, null);
 
         _logger.LogWarning(
             "Autostart task query failed (exit {Code}) and the cause is not a clean missing task; state cannot be verified",
             exitCode);
-        return AutostartState.Unknown;
+        return (AutostartState.Unknown, null);
+    }
+
+    // Per-check diagnostic for a Misconfigured task: which field, what was expected, what was
+    // found. The full exported XML is never logged; the command value is the executable path the
+    // task points at, which the application already logs elsewhere for the same diagnostics.
+    private void LogMismatches(IReadOnlyList<TaskMismatch> mismatches, string context)
+    {
+        foreach (var m in mismatches)
+            _logger.LogError(
+                "Autostart task mismatch ({Context}): check {Check}; expected {Expected}; actual {Actual}",
+                context, m.Check, m.Expected, m.Actual);
     }
 
     public async Task<AutostartResult> SetEnabledAsync(bool enabled, CancellationToken ct = default)
@@ -118,7 +143,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
 
         // Verify the actual registration state rather than trusting the exit code alone: a
         // command that exits 0 without the state taking effect is still a failure.
-        var actual = await ReadStateAsync(ct).ConfigureAwait(false);
+        var (actual, descriptor) = await ReadStateDetailedAsync(ct).ConfigureAwait(false);
         var expected = enabled ? AutostartState.Enabled : AutostartState.Absent;
         if (actual == expected)
             return AutostartResult.Success(actual);
@@ -126,6 +151,12 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             return AutostartResult.Failure(
                 "the operation completed but the resulting autostart state could not be verified",
                 AutostartState.Unknown);
+
+        // For a Misconfigured task whose descriptor we could parse, log the exact failing check
+        // with the expected and actual values — never the whole exported XML — so the cause of a
+        // "create exited 0 but the task checked as Misconfigured" report can be pinned down.
+        if (actual == AutostartState.Misconfigured && descriptor is { } d)
+            LogMismatches(GetMismatches(d, ExpectedCommand), enabled ? "set-enabled=true" : "set-enabled=false");
 
         _logger.LogError("Autostart state ({Actual}) does not match the requested state ({Requested}) after the operation",
             actual, expected);
@@ -148,6 +179,9 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         string? LogonType,
         string? RunLevel,
         bool? Enabled);
+
+    /// <summary>A single failed verification check: which field, what was expected, what was found.</summary>
+    internal readonly record struct TaskMismatch(string Check, string Expected, string Actual);
 
     // Parses the /XML export of a single task. Returns null (Unknown) when the XML cannot be
     // interpreted — a task we cannot describe is a task we cannot call "enabled".
@@ -214,21 +248,61 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     }
 
     /// <summary>
+    /// Windows Task Scheduler round-trips a <c>/TR</c> executable that was quoted on the command
+    /// line into a quoted <c>&lt;Command&gt;</c> element (e.g. <c>"C:\...\app.exe"</c>). The compare
+    /// value is the quoted path's content; the quoting itself is not part of the task semantics.
+    /// A single paired outer quote pair is stripped; nothing else is altered.
+    /// </summary>
+    internal static string? NormalizeCommand(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return raw;
+        var t = raw.Trim();
+        if (t.Length >= 2 && t[0] == '"' && t[^1] == '"')
+            t = t.Substring(1, t.Length - 2);
+        return t;
+    }
+
+    /// <summary>
+    /// The set of verification checks that fail for the parsed task definition. An empty result
+    /// means the task matches every autostart invariant (it may still be Disabled, or its Enabled
+    /// flag may be unreadable, which Evaluate reports separately as Unknown). The security
+    /// invariants — LogonTrigger, InteractiveToken, HighestAvailable, the --background flag and
+    /// the exact-command requirement — are never relaxed by this classification.
+    /// </summary>
+    internal static IReadOnlyList<TaskMismatch> GetMismatches(TaskDescriptor d, string expectedCommand)
+    {
+        var mismatches = new List<TaskMismatch>();
+
+        var command = NormalizeCommand(d.Command);
+        if (string.IsNullOrWhiteSpace(command))
+            mismatches.Add(new TaskMismatch("Command", expectedCommand, d.Command ?? "<missing>"));
+        else if (!string.Equals(command, expectedCommand, StringComparison.OrdinalIgnoreCase))
+            mismatches.Add(new TaskMismatch("Command", expectedCommand, d.Command ?? "<missing>"));
+
+        if (!(d.Arguments?.Contains("--background", StringComparison.OrdinalIgnoreCase) ?? false))
+            mismatches.Add(new TaskMismatch("Arguments", "--background", d.Arguments ?? "<missing>"));
+
+        if (!d.HasLogonTrigger)
+            mismatches.Add(new TaskMismatch("LogonTrigger", "LogonTrigger", "<none>"));
+
+        if (!string.Equals(d.LogonType, "InteractiveToken", StringComparison.OrdinalIgnoreCase))
+            mismatches.Add(new TaskMismatch("LogonType", "InteractiveToken", d.LogonType ?? "<missing>"));
+
+        if (!string.Equals(d.RunLevel, "HighestAvailable", StringComparison.OrdinalIgnoreCase))
+            mismatches.Add(new TaskMismatch("RunLevel", "HighestAvailable", d.RunLevel ?? "<missing>"));
+
+        return mismatches;
+    }
+
+    /// <summary>
     /// Classifies a parsed task definition against the expected autostart configuration.
     /// Misconfigured wins over Disabled: any parameter mismatch means the registration cannot
     /// be trusted as the correct autostart entry, regardless of its enabled flag.
     /// </summary>
     internal static AutostartState Evaluate(TaskDescriptor d, string expectedCommand)
     {
-        var misconfigured =
-            string.IsNullOrWhiteSpace(d.Command)
-            || !string.Equals(d.Command, expectedCommand, StringComparison.OrdinalIgnoreCase)
-            || !(d.Arguments?.Contains("--background", StringComparison.OrdinalIgnoreCase) ?? false)
-            || !d.HasLogonTrigger
-            || !string.Equals(d.LogonType, "InteractiveToken", StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(d.RunLevel, "HighestAvailable", StringComparison.OrdinalIgnoreCase);
-
-        if (misconfigured)
+        if (GetMismatches(d, expectedCommand).Count > 0)
             return AutostartState.Misconfigured;
 
         if (d.Enabled is null)

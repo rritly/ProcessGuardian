@@ -412,4 +412,140 @@ public class ScheduledTaskAutostartServiceErrorTests
         result.Succeeded.Should().BeFalse();
         result.ErrorMessage.Should().Contain("boom");
     }
+
+    // ---------------------------------------------------------------------
+    // Structured Misconfigured diagnostics via the seam (full /Query /XML -> typed state)
+    // ---------------------------------------------------------------------
+
+    // A realistic /XML export (RegistrationInfo, full Settings with IdleSettings,
+    // <Actions Context="Author">, quoted-command round-trip) so the detailed read is verified
+    // against the real Windows Task Scheduler shape, not a hand-simplified structure.
+    private static string RealXmlWith(
+        string? command = null,
+        string? arguments = "--background",
+        bool logonTrigger = true,
+        string? logonType = "InteractiveToken",
+        string? runLevel = "HighestAvailable",
+        string? enabled = "true")
+    {
+        var trigger = logonTrigger
+            ? "<LogonTrigger><Enabled>true</Enabled><UserId>DESKTOP-TEST\\admin</UserId></LogonTrigger>"
+            : "<BootTrigger><Enabled>true</Enabled></BootTrigger>";
+        var commandEl = command is null ? string.Empty : $"<Command>{command}</Command>";
+        return $"""
+            <?xml version="1.0" encoding="UTF-16"?>
+            <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+              <RegistrationInfo>
+                <Date>2026-10-25T09:30:00.1234567</Date>
+                <Author>DESKTOP-TEST\admin</Author>
+                <Description>ProcessGuardian elevated autostart</Description>
+                <URI>\ProcessGuardianAdmin</URI>
+              </RegistrationInfo>
+              <Triggers>
+                {trigger}
+              </Triggers>
+              <Principals>
+                <Principal id="Author">
+                  <UserId>DESKTOP-TEST\admin</UserId>
+                  <LogonType>{logonType}</LogonType>
+                  <RunLevel>{runLevel}</RunLevel>
+                </Principal>
+              </Principals>
+              <Settings>
+                <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+                <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+                <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+                <AllowHardTerminate>true</AllowHardTerminate>
+                <StartWhenAvailable>false</StartWhenAvailable>
+                <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+                <IdleSettings>
+                  <StopOnIdleEnd>true</StopOnIdleEnd>
+                  <RestartOnIdle>false</RestartOnIdle>
+                  <IdleDuration>PT10M</IdleDuration>
+                  <WaitTimeout>PT1H</WaitTimeout>
+                </IdleSettings>
+                <AllowStartOnDemand>true</AllowStartOnDemand>
+                <Enabled>{enabled}</Enabled>
+                <Hidden>false</Hidden>
+                <RunOnlyIfIdle>false</RunOnlyIfIdle>
+                <WakeToRun>false</WakeToRun>
+                <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
+                <Priority>7</Priority>
+              </Settings>
+              <Actions Context="Author">
+                <Exec>
+                  {commandEl}
+                  <Arguments>{arguments}</Arguments>
+                </Exec>
+              </Actions>
+            </Task>
+            """;
+    }
+
+    [Fact]
+    public async Task ReadStateDetailed_RealQuotedXml_ReturnsEnabledStateAndParsedDescriptor()
+    {
+        var service = NewService(new Script
+        {
+            QueryExitCode = 0,
+            QueryXml = RealXmlWith(command: $"\"{ExpectedCommand()}\""),
+            MutatingExitCode = 0,
+        });
+
+        var (state, descriptor) = await service.ReadStateDetailedAsync();
+
+        state.Should().Be(AutostartState.Enabled);
+        descriptor.Should().NotBeNull();
+        ScheduledTaskAutostartService.NormalizeCommand(descriptor!.Value.Command).Should().Be(ExpectedCommand());
+        ScheduledTaskAutostartService.GetMismatches(descriptor.Value, ExpectedCommand()).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ReadStateDetailed_MisconfiguredXml_ReturnsDescriptorForPerCheckDiagnostic()
+    {
+        var service = NewService(new Script
+        {
+            QueryExitCode = 0,
+            QueryXml = RealXmlWith(command: ExpectedCommand(), runLevel: "LeastPrivilege"),
+            MutatingExitCode = 0,
+        });
+
+        var (state, descriptor) = await service.ReadStateDetailedAsync();
+
+        state.Should().Be(AutostartState.Misconfigured);
+        descriptor.Should().NotBeNull();
+        var m = ScheduledTaskAutostartService.GetMismatches(descriptor!.Value, ExpectedCommand())
+            .Should().ContainSingle().Subject;
+        m.Check.Should().Be("RunLevel");
+        m.Expected.Should().Be("HighestAvailable");
+        m.Actual.Should().Be("LeastPrivilege");
+    }
+
+    [Fact]
+    public async Task Enable_CreateSucceedsButVerificationIsMisconfigured_ReportsFailed_NotWeakened()
+    {
+        // Absent -> create exits 0, but the post-operation verification returns a task with a
+        // wrong logon type: the enable must still fail as Misconfigured. The security/verification
+        // invariants are never relaxed just to let the checkbox turn on.
+        var verifyCalled = false;
+        ScheduledTaskAutostartService.SchTasksInvoker invoker = (arguments, _) =>
+        {
+            if (arguments.Contains("/Query", StringComparison.Ordinal))
+            {
+                if (verifyCalled)
+                    return System.Threading.Tasks.Task.FromResult(
+                        (0, RealXmlWith(command: ExpectedCommand(), logonType: "Password")));
+                verifyCalled = true;
+                return System.Threading.Tasks.Task.FromResult((1, "ERROR: The system cannot find the file specified."));
+            }
+            return System.Threading.Tasks.Task.FromResult((0, "SUCCESS"));
+        };
+        var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+
+        var result = await service.SetEnabledAsync(true);
+
+        result.Succeeded.Should().BeFalse();
+        result.ActualState.Should().Be(AutostartState.Misconfigured);
+        result.ErrorMessage.Should().Contain("not correctly registered");
+    }
 }
