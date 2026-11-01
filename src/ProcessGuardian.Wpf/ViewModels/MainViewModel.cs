@@ -486,6 +486,13 @@ public partial class MainViewModel : ObservableObject
         NotifyRecoveryCanExecuteChanged();
     }
 
+    /// <summary>
+    /// Raised after a fully-verified recovery resolution clears the persistent reset notice, so
+    /// the composition root (App) can restore the standard tray tooltip — clearing the stale
+    /// "reset now" notice that was set at boot when a reset was pending.
+    /// </summary>
+    public event EventHandler? RecoveryNoticeCleared;
+
     private void NotifyRecoveryCanExecuteChanged()
     {
         KeepAutostartCommand.NotifyCanExecuteChanged();
@@ -502,6 +509,9 @@ public partial class MainViewModel : ObservableObject
             ResetNotice = string.Empty;
             AutostartError = string.Empty;
             IsAutostartEditable = true;
+            // The persistent reset notice is gone; the composition root clears the matching stale
+            // tray "reset now" notice so the tray tooltip returns to its standard status text.
+            RecoveryNoticeCleared?.Invoke(this, EventArgs.Empty);
             var (title, body) = choice == RecoveryResolutionChoice.KeepAutostart
                 ? ("Autostart Kept",
                    "The scheduled task is enabled and the recovery is complete. The app will start " +

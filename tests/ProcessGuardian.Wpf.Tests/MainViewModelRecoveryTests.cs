@@ -124,6 +124,58 @@ public class MainViewModelRecoveryTests
         vm.AutostartError.Should().Contain("exit 1");
     }
 
+    // R-tray: a successful, fully-verified recovery resolution clears the persistent reset notice
+    // and must also signal the composition root to clear the stale tray "reset now" notice
+    // (RecoveryNoticeCleared), so the tray tooltip returns to its standard status text.
+    [Fact]
+    public async Task Resolution_Success_RaisesRecoveryNoticeCleared()
+    {
+        var h = new Harness(hasPin: true);
+        h.Controller.ResolveRecoveryAsync(
+                RecoveryResolutionChoice.KeepAutostart,
+                Arg.Any<CommittedSettingsSnapshot>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(RecoveryResolutionResult.Succeeded()));
+
+        var vm = h.CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+
+        var cleared = 0;
+        vm.RecoveryNoticeCleared += (_, __) => cleared++;
+
+        await vm.KeepAutostartCommand.ExecuteAsync(null);
+
+        vm.ResetNotice.Should().BeEmpty();
+        cleared.Should().Be(1, "a successful resolution must fire the recovery-notice-cleared signal once");
+    }
+
+    // R-tray: a failed resolution leaves the reset notice pending and must NOT signal that the
+    // tray notice should be cleared — the stale "reset now" tray notice stays until a real success.
+    [Fact]
+    public async Task Resolution_Failure_DoesNotRaiseRecoveryNoticeCleared()
+    {
+        var h = new Harness(hasPin: true);
+        h.Controller.ResolveRecoveryAsync(
+                RecoveryResolutionChoice.KeepAutostart,
+                Arg.Any<CommittedSettingsSnapshot>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(RecoveryResolutionResult.Failed(
+                "autostart could not be enabled: task creation failed (exit 1)")));
+
+        var vm = h.CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+
+        var cleared = 0;
+        vm.RecoveryNoticeCleared += (_, __) => cleared++;
+
+        await vm.KeepAutostartCommand.ExecuteAsync(null);
+
+        vm.ResetNotice.Should().NotBeEmpty("the notice stays pending after a failed resolution");
+        cleared.Should().Be(0, "a failed resolution must never signal the tray notice to be cleared");
+    }
+
     [Fact]
     public async Task RemoveAutostart_Success_ClearsResetNotice()
     {

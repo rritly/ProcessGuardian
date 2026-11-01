@@ -148,6 +148,9 @@ public partial class App : System.Windows.Application
         else
         {
             var vm = _host!.Services.GetRequiredService<MainViewModel>();
+            // A successful recovery resolution clears the persistent reset notice; clear the
+            // matching stale tray "reset now" notice so the tooltip returns to standard status.
+            vm.RecoveryNoticeCleared += (_, __) => Dispatcher.BeginInvoke(() => _tray?.SetNotice(null));
             vm.ApplyInitializationStatus(initStatus);
             if (initStatus == ConfigurationInitializationStatus.ResetNoticePending)
             {
