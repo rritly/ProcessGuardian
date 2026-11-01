@@ -138,6 +138,43 @@ public class MainViewModelInitIndicatorTests
         vm.Settings.Should().NotBeNull("a fallback instance remains installed for bindings");
     }
 
+    // R-F: the view shows the degraded state's reason independently of EnableToasts. StatusReason
+    // is projected straight from the controller state channel (both the initial CurrentState sync
+    // and every live StateChanged publication).
+    [Fact]
+    public void StatusReason_ProjectedFromControllerCurrentState_IndependentOfToasts()
+    {
+        var h = new Harness();
+        h.Controller.CurrentState.Returns(new MonitorState(
+            GuardianStatus.Monitoring, true,
+            "the target identity or reachability cannot be verified", false));
+
+        var vm = h.CreateVm();
+
+        vm.Status.Should().Be(GuardianStatus.Monitoring);
+        vm.IsDegraded.Should().BeTrue();
+        vm.StatusReason.Should().Be("the target identity or reachability cannot be verified",
+            "the degraded reason must flow to the view bindings regardless of toast settings (R-F)");
+    }
+
+    [Fact]
+    public void StatusReason_UpdatedOnLiveStateChange()
+    {
+        var h = new Harness();
+        var vm = h.CreateVm();
+        vm.StatusReason.Should().BeEmpty("an initial Stopped state carries no reason");
+
+        // A live publication of a degraded active state must update StatusReason immediately.
+        h.Controller.StateChanged += Raise.Event<EventHandler<MonitorState>>(
+            h.Controller,
+            new MonitorState(
+                GuardianStatus.Monitoring, true,
+                "the target identity or reachability cannot be verified", false));
+
+        vm.IsDegraded.Should().BeTrue();
+        vm.StatusReason.Should().Be("the target identity or reachability cannot be verified");
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, string failureMessage)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();

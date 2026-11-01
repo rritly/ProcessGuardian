@@ -876,8 +876,10 @@ public class GuardianOrchestratorTests
 
         h.Statuses.Should().Contain(GuardianStatus.Error);
         controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
-        controller.CurrentState.IsDegraded.Should().BeTrue();
+        controller.CurrentState.IsDegraded.Should().BeFalse(
+            "an Error state is never degraded (R-F)");
         controller.CurrentState.Reason.Should().Contain("target");
+        controller.CurrentState.Reason.Should().NotBeNullOrWhiteSpace();
 
         _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
@@ -910,7 +912,8 @@ public class GuardianOrchestratorTests
         {
             h.Statuses.Should().Contain(GuardianStatus.Error);
             controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
-            controller.CurrentState.IsDegraded.Should().BeTrue();
+            controller.CurrentState.IsDegraded.Should().BeFalse(
+                "an Error state is never degraded (R-F)");
             controller.CurrentState.Reason.Should().Contain("pin");
             _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
             // No pin is ever created automatically at boot: no hash is read.
@@ -1052,7 +1055,8 @@ public class GuardianOrchestratorTests
         await controller.ReconcileAsync();
 
         controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
-        controller.CurrentState.IsDegraded.Should().BeTrue();
+        controller.CurrentState.IsDegraded.Should().BeFalse(
+            "an Error state is never degraded (R-F)");
         controller.CurrentState.Reason.Should().Contain("path");
         _ = h.Monitor.DidNotReceive().CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
@@ -1083,6 +1087,9 @@ public class GuardianOrchestratorTests
         time.Advance(TimeSpan.FromSeconds(120));
         await WaitUntilAsync(() => h.CheckCount >= 3, "a third unknown cycle to run after time elapsed");
         await WaitUntilAsync(() => controller.CurrentState.IsDegraded, "degraded indicator after the time threshold");
+        // A degraded active session must carry a stable non-empty reason, independent of toasts (R-F).
+        controller.CurrentState.Reason.Should().NotBeNullOrWhiteSpace();
+        controller.CurrentState.Reason.Should().Contain("cannot be verified");
 
         await controller.StopAsync();
         controller.CurrentState.Status.Should().NotBe(GuardianStatus.Error, "Unknown never escalates to Error");
@@ -1162,7 +1169,103 @@ public class GuardianOrchestratorTests
         controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
         controller.CurrentState.SaveFailed.Should().BeTrue(
             "a failed Save(false) must not suppress the Error publication (F)");
+        controller.CurrentState.IsDegraded.Should().BeFalse(
+            "a persistence failure is SaveFailed, never IsDegraded (R-F)");
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task FatalMismatch_ErrorPublishedOnlyAfterSessionTaskBySettleContinuation()
+    {
+        using var h = new Harness();
+        // Pin at Start is "PIN"; at the launch re-verify the target reads "BB" -> fatal Mismatch.
+        int hashCalls = 0;
+        h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(TargetHashResult.Computed(hashCalls++ == 0 ? "PIN" : "BB")));
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeTrue();
+
+        // Park the fatal disabled-save on a barrier. The persist runs in the outside-the-task
+        // continuation (SettleSessionOutcomeAsync, R-F), which is reached only after the session
+        // task has already returned its terminal outcome — so while the persist is parked, the
+        // session has ended and Error has NOT yet been published.
+        var persistedEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePersist = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                persistedEntered.TrySetResult(true);
+                return releasePersist.Task;
+            });
+
+        await WaitUntilAsync(() => persistedEntered.Task.IsCompleted,
+            "the fatal disabled-save (outside the session task) to be entered");
+
+        // The session task finished first (it must, for the continuation to be running its
+        // persist), yet the Error is only published after that persist: it is not emitted inside
+        // the session loop (R-F).
+        controller.CurrentState.Status.Should().NotBe(GuardianStatus.Error,
+            "Error is not published until the outside-the-task settle runs after the session task completes");
+
+        releasePersist.TrySetResult(true);
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
+            "Error to be published once the settle continuation completes");
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeFalse("a fatal Error is never degraded (R-F)");
+    }
+
+    [Fact]
+    public async Task IsDegraded_OnlyWhileActive_StoppedAndErrorAlwaysFalse_ReasonPresentWhenTrue()
+    {
+        using var h = new Harness();
+        var time = new ManualTimeProvider();
+        h.Time = time;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
+            });
+
+        var published = new ConcurrentQueue<(GuardianStatus Status, bool IsDegraded, string? Reason)>();
+        var controller = h.CreateController();
+        controller.StateChanged += (_, s) => published.Enqueue((s.Status, s.IsDegraded, s.Reason));
+
+        var start = await controller.StartAsync(h.Request(checkInterval: 1));
+        start.Started.Should().BeTrue();
+
+        // Drive a live session into the degraded indicator (active Monitoring state), then stop it.
+        // Two Unknown cycles must run BEFORE the time shift so FirstDegradedTimestamp is anchored
+        // to the elapsed=0 moment (otherwise the 120s threshold is consumed by the anchor itself).
+        await WaitUntilAsync(() => h.CheckCount >= 2, "two unknown cycles to anchor the degraded timestamp");
+        time.Advance(TimeSpan.FromSeconds(120));
+        await WaitUntilAsync(() => h.CheckCount >= 3, "a third unknown cycle to run after time elapsed");
+        await WaitUntilAsync(() => controller.CurrentState.IsDegraded, "degraded indicator after the threshold");
+        await controller.StopAsync();
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        controller.CurrentState.IsDegraded.Should().BeFalse("a clean stop is never degraded (R-F)");
+
+        // Invariant scan over the whole run (R-F): every IsDegraded=true publication is an active
+        // state carrying a non-empty reason; every Stopped/Error publication is IsDegraded=false.
+        foreach (var (status, isDegraded, reason) in published)
+        {
+            if (isDegraded)
+            {
+                status.Should().BeOneOf(
+                    new[] { GuardianStatus.Waiting, GuardianStatus.Monitoring, GuardianStatus.Restarting },
+                    "IsDegraded=true is valid only while the session is active");
+                reason.Should().NotBeNullOrWhiteSpace("a degraded state must carry a stable, non-empty reason");
+            }
+        }
+
+        published.Where(p => p.Status is GuardianStatus.Stopped or GuardianStatus.Error)
+            .Should().OnlyContain(p => !p.IsDegraded, "Stopped/Error are never degraded (R-F)");
     }
 
     [Fact]

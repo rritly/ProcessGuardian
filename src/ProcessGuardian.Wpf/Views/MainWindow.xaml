@@ -783,7 +783,7 @@
                            FontWeight="Bold"
                            Foreground="#E5554F"
                            VerticalAlignment="Center"
-                           ToolTip="Monitoring is degraded; see the logs for details."
+                           ToolTip="{Binding StatusReason}"
                            Visibility="{Binding IsDegraded, Converter={StaticResource BoolToVisibilityConverter}}" />
                 </StackPanel>
 

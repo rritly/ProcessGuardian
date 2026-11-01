@@ -43,6 +43,12 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private bool _isDegraded;
 
+    // Stable non-empty reason carried by degraded/Error/Stopped-with-guidance states (R-F). The
+    // view and tray surface it independently of EnableToasts; it is projected straight from the
+    // controller state channel and never gated by toast settings.
+    [ObservableProperty]
+    private string _statusReason = string.Empty;
+
     [ObservableProperty]
     private string _logText = string.Empty;
 
@@ -128,6 +134,7 @@ public partial class MainViewModel : ObservableObject
             {
                 Status = state.Status;
                 IsDegraded = state.IsDegraded;
+                StatusReason = state.Reason ?? string.Empty;
                 if (state.SaveFailed)
                     _logger.LogError("Monitoring state: save failed ({Reason})", state.Reason);
             });
@@ -143,6 +150,7 @@ public partial class MainViewModel : ObservableObject
         // Sync current state from the controller so a late-opened window is not stale.
         Status = _controller.CurrentState.Status;
         IsDegraded = _controller.CurrentState.IsDegraded;
+        StatusReason = _controller.CurrentState.Reason ?? string.Empty;
         LogText = _logSink.GetRecentLogs(200);
 
         _ = LoadSettingsAsync();

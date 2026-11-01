@@ -55,7 +55,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
     // Session state (guarded by _operationLock for writes; reads via properties).
     private CancellationTokenSource? _sessionCts;
-    private Task? _sessionTask;
+    private Task<SessionEnd>? _sessionTask;
     private SessionSnapshot? _session;
 
     // Persistence state owned by the controller.
@@ -150,14 +150,17 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             catch (ConfigurationUnavailableException ex)
             {
                 _logger.LogError(ex, "Configuration unavailable at startup; monitoring will not run");
-                Publish(new MonitorState(GuardianStatus.Error, true, ex.Guidance ?? "Configuration is unavailable", false));
+                // A refused/unavailable configuration is Error with a reason, never degraded:
+                // IsDegraded is reserved for active session states (R-F).
+                Publish(new MonitorState(GuardianStatus.Error, false, ex.Guidance ?? "Configuration is unavailable", false));
                 return;
             }
 
             if (init == ConfigurationInitializationStatus.Refused)
             {
                 _logger.LogError("Configuration initialization refused; monitoring will not run");
-                Publish(new MonitorState(GuardianStatus.Error, true,
+                // IsDegraded=false: a refused config is never a degraded session (R-F).
+                Publish(new MonitorState(GuardianStatus.Error, false,
                     "Configuration could not be initialized; monitoring is off", false));
                 return;
             }
@@ -182,7 +185,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             catch (ConfigurationUnavailableException ex)
             {
                 _logger.LogError(ex, "Configuration unavailable at startup; monitoring will not run");
-                Publish(new MonitorState(GuardianStatus.Error, true, ex.Guidance ?? "Configuration is unavailable", false));
+                // A refused/unavailable configuration is Error with a reason, never degraded:
+                // IsDegraded is reserved for active session states (R-F).
+                Publish(new MonitorState(GuardianStatus.Error, false, ex.Guidance ?? "Configuration is unavailable", false));
                 return;
             }
 
@@ -527,7 +532,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             _latestPin = pin;
             if (!await PersistEnabledAsync(enabled: true, ct, applyAutostart: !_recoveryPending).ConfigureAwait(false))
             {
-                Publish(new MonitorState(GuardianStatus.Stopped, true, "settings could not be persisted; monitoring not started", true));
+                // Persistence failure is surfaced via SaveFailed, never by marking degraded:
+                // a stopped session cannot be degraded (R-F).
+                Publish(new MonitorState(GuardianStatus.Stopped, false, "settings could not be persisted; monitoring not started", true));
                 return new StartResult(false, "settings could not be persisted; monitoring not started");
             }
 
@@ -699,9 +706,48 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         _session = session;
         var cts = _sessionCts;
         _sessionTask = Task.Run(() => RunSessionAsync(session, cts.Token));
+        // Fatal causes (budget exhaustion, hash mismatch) leave the session loop as a terminal
+        // outcome. The session task finishes first; a continuation outside it then persists
+        // enabled=false and publishes Error even if that save fails (SaveFailed independent).
+        // The guard skips the publish if a newer session already replaced this one (R-F).
+        _ = SettleSessionOutcomeAsync(_sessionTask);
     }
 
-    private async Task RunSessionAsync(SessionSnapshot session, CancellationToken ct)
+    private async Task SettleSessionOutcomeAsync(Task<SessionEnd> sessionTask)
+    {
+        SessionEnd outcome;
+        try
+        {
+            outcome = await sessionTask.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Session task faulted; no fatal outcome was settled");
+            return;
+        }
+
+        string? fatalReason = outcome switch
+        {
+            SessionEnd.HashMismatch => "the target binary no longer matches the recorded pin; monitoring stopped",
+            SessionEnd.BudgetExhausted => "monitoring stopped after repeated failed recovery attempts",
+            _ => null,
+        };
+        if (fatalReason is null)
+            return;
+
+        // Published outside the session task (R-F): the loop already ran to completion, so a
+        // new Start is already allowed; this guard keeps a stale fatal Error from being
+        // published over a session that has since begun.
+        if (!ReferenceEquals(_sessionTask, sessionTask))
+            return;
+
+        // Persist enabled=false best-effort, then Error — a failed save never turns the
+        // terminal state into degraded, it is surfaced via the independent SaveFailed flag.
+        await TryPersistDisabledBestEffortAsync(_committed).ConfigureAwait(false);
+        Publish(new MonitorState(GuardianStatus.Error, false, fatalReason, _lastPersistFailed));
+    }
+
+    private async Task<SessionEnd> RunSessionAsync(SessionSnapshot session, CancellationToken ct)
     {
         var counters = new SessionCounters();
         // Path form is fixed for the whole session (validated at Start/Reconcile); the monitor
@@ -713,7 +759,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             {
                 Publish(new MonitorState(GuardianStatus.Waiting, false, null, false));
                 if (!await WaitForDelayAsync(TimeSpan.FromSeconds(_committed.InitialDelaySeconds), ct).ConfigureAwait(false))
-                    return;
+                    return SessionEnd.Cancelled;
             }
 
             while (!ct.IsCancellationRequested)
@@ -742,13 +788,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                     {
                         var outcome = await HandleMissingAsync(session, target, counters, knobs, ct)
                             .ConfigureAwait(false);
-                        if (outcome == SessionAction.EndSession)
-                            return;
+                        if (outcome != SessionEnd.Continue)
+                            return outcome;
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    return;
+                    return SessionEnd.Cancelled;
                 }
                 catch (Exception ex)
                 {
@@ -760,7 +806,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 }
 
                 if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(knobs.CheckIntervalSeconds), ct).ConfigureAwait(false))
-                    return;
+                    return SessionEnd.Cancelled;
             }
         }
         finally
@@ -768,9 +814,26 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             // Only the session task clears the session; it is the source of truth for "session over".
             _session = null;
         }
+
+        return SessionEnd.Cancelled;
     }
 
-    private enum SessionAction { Continue, EndSession }
+    /// <summary>Terminal/loop outcome of a monitoring session (R-F). Only
+    /// <see cref="SessionEnd.HashMismatch"/> and <see cref="SessionEnd.BudgetExhausted"/> are
+    /// fatal and are settled outside the session task by <see cref="SettleSessionOutcomeAsync"/>.</summary>
+    private enum SessionEnd
+    {
+        /// <summary>Continue the check loop.</summary>
+        Continue,
+        /// <summary>The session ended without a fatal cause (routine terminal).</summary>
+        Normal,
+        /// <summary>The session was cancelled (Stop/Suspend or token cancellation).</summary>
+        Cancelled,
+        /// <summary>Fatal: the target binary no longer matches the recorded pin.</summary>
+        HashMismatch,
+        /// <summary>Fatal: the consecutive restart budget was exhausted.</summary>
+        BudgetExhausted,
+    }
 
     private sealed class SessionCounters
     {
@@ -812,7 +875,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             Publish(new MonitorState(CurrentState.Status, true, "the target identity or reachability cannot be verified", CurrentState.SaveFailed));
     }
 
-    private async Task<SessionAction> HandleMissingAsync(
+    private async Task<SessionEnd> HandleMissingAsync(
         SessionSnapshot session, ProcessTarget target,
         SessionCounters counters,
         CommittedSettingsSnapshot knobs, CancellationToken ct)
@@ -822,18 +885,20 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             _logger.LogInformation("Initial start for {Target}", target.NameWithoutExtension);
             var outcome = await StartAndVerifyAsync(target, knobs, showRecoveryToast: false, ct).ConfigureAwait(false);
             if (outcome == StartOutcome.SessionEnded || outcome == StartOutcome.Blocked)
-                return SessionAction.EndSession;
+                return SessionEnd.Cancelled;
+            if (outcome == StartOutcome.Mismatch)
+                return SessionEnd.HashMismatch;
             // A degraded (missing/unreadable) free launch spends no budget, does not consume the
             // free launch, and feeds the degraded indicator (E): keep initial-pending, mark degraded.
             if (outcome == StartOutcome.Degraded)
             {
                 MarkDegraded(counters);
-                return SessionAction.Continue;
+                return SessionEnd.Continue;
             }
             counters.InitialLaunchPending = false;
             if (outcome == StartOutcome.Verified)
                 ResetDegraded(counters);
-            return SessionAction.Continue;
+            return SessionEnd.Continue;
         }
 
         if (knobs.MaxRestartAttempts > 0 && counters.RestartAttempts >= knobs.MaxRestartAttempts)
@@ -849,10 +914,10 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 _logger.LogWarning(ex, "Failed to show exhaustion toast");
             }
 
-            await TryPersistDisabledBestEffortAsync(knobs).ConfigureAwait(false);
-            Publish(new MonitorState(GuardianStatus.Error, false,
-                "monitoring stopped after repeated failed recovery attempts", _lastPersistFailed));
-            return SessionAction.EndSession;
+            // Fatal: the budget is spent. The enabled=false persistence and the Error publish
+            // happen outside the session task (SettleSessionOutcomeAsync), so the loop may not
+            // await a store write and a new Start stays blocked only until this task completes (R-F).
+            return SessionEnd.BudgetExhausted;
         }
 
         Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
@@ -860,14 +925,16 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
         var started = await StartAndVerifyAsync(target, knobs, showRecoveryToast: true, ct).ConfigureAwait(false);
         if (started == StartOutcome.SessionEnded || started == StartOutcome.Blocked)
-            return SessionAction.EndSession;
+            return SessionEnd.Cancelled;
+        if (started == StartOutcome.Mismatch)
+            return SessionEnd.HashMismatch;
         if (started == StartOutcome.Degraded)
         {
             // A degraded (missing/unreadable) relaunch spends no budget and sleeps no restart
             // delay; the session keeps polling and feeds the degraded indicator. Only a genuine
             // launch that ran and failed advances the consecutive counter (budget-charge rule, E).
             MarkDegraded(counters);
-            return SessionAction.Continue;
+            return SessionEnd.Continue;
         }
 
         // Budget-charge rule (E): only a genuine launched-but-failed attempt advances the
@@ -887,14 +954,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             }
             catch (OperationCanceledException)
             {
-                return SessionAction.EndSession;
+                return SessionEnd.Cancelled;
             }
         }
 
-        return SessionAction.Continue;
+        return SessionEnd.Continue;
     }
 
-    private enum StartOutcome { NotStarted, Verified, VerifyFailed, Blocked, Degraded, SessionEnded }
+    private enum StartOutcome { NotStarted, Verified, VerifyFailed, Blocked, Degraded, SessionEnded, Mismatch }
 
     private async Task<StartOutcome> StartAndVerifyAsync(
         ProcessTarget target, CommittedSettingsSnapshot knobs, bool showRecoveryToast, CancellationToken ct)
@@ -913,12 +980,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                     target.NameWithoutExtension);
                 return StartOutcome.Degraded;
             case HashVerifyResult.Mismatch:
-                // Fail closed (K keeping today's behavior until F): persist disabled, terminate the
-                // session, publish Error — even if that save fails, with the save-failure flag surfaced.
-                await TryPersistDisabledBestEffortAsync(knobs).ConfigureAwait(false);
-                Publish(new MonitorState(GuardianStatus.Error, false,
-                    "the target binary no longer matches the recorded pin; monitoring stopped", _lastPersistFailed));
-                return StartOutcome.SessionEnded;
+                // Fail closed (K): hash mismatch is fatal. The enabled=false persistence and the
+                // Error publish are deferred to the outside-the-task continuation
+                // (SettleSessionOutcomeAsync, R-F), so this method only returns the terminal
+                // outcome and never publishes Error from inside the session task.
+                _logger.LogError("Target {Target} no longer matches its recorded pin; terminating the session",
+                    target.NameWithoutExtension);
+                return StartOutcome.Mismatch;
         }
 
         // Linearized launch (R-CD): only the final session/gate check and the synchronous
@@ -1140,7 +1208,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     {
         await TryPersistDisabledBestEffortAsync(_committed).ConfigureAwait(false);
         var saveFailed = _lastPersistFailed;
-        Publish(new MonitorState(GuardianStatus.Error, true, reason, saveFailed));
+        // A configuration/dependency refusal is Error with guidance; IsDegraded is reserved
+        // for active session states and a failed save is reported via SaveFailed (R-F).
+        Publish(new MonitorState(GuardianStatus.Error, false, reason, saveFailed));
     }
 
     private static void ApplyCommitted(AppSettings doc, CommittedSettingsSnapshot s)
