@@ -335,6 +335,20 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             // The autostart result is surfaced with the commit so a registration failure is
             // never masked by a successful settings save (the UI shows the error explicitly).
             var autostart = await SyncAutostartAsync(snapshot.AutostartEnabled, ct).ConfigureAwait(false);
+
+            // [R-autostart rollback] A requested enable that the scheduler rejected must not leave
+            // a stale AutostartEnabled=true in the persisted config or the committed snapshot: a
+            // later launch would repeat the failed registration. Revert both to the value the UI
+            // also reverts its checkbox to (false) and re-persist as one consistent rollback — this
+            // is a re-persist of the corrected flag, never a fresh enable attempt. The autostart
+            // failure itself is still surfaced, not masked.
+            if (autostart is { Succeeded: false } && snapshot.AutostartEnabled)
+            {
+                _committed = snapshot with { AutostartEnabled = false };
+                if (saved)
+                    await PersistEnabledAsync(enabled: sessionActive, ct).ConfigureAwait(false);
+            }
+
             return saved
                 ? CommitSettingsResult.Persisted(autostart)
                 : CommitSettingsResult.SaveFailed();

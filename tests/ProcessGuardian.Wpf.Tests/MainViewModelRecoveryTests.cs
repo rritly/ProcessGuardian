@@ -168,6 +168,49 @@ public class MainViewModelRecoveryTests
         vm.AutostartError.Should().Contain("exit 1");
     }
 
+    // 2.5 — a failed autostart ENABLE must revert the checkbox and the persisted intent to off and
+    // must not schedule a save loop: the persistence-side rollback of the committed state and the
+    // JSON file is the controller's single-writer responsibility (covered by the Application
+    // tests), while the ViewModel here must at minimum show the checkbox off, the intent off and
+    // not re-commit from its own revert.
+    [Fact]
+    public async Task Commit_AutostartEnableFailure_RevertsCheckboxAndIntent_NoSaveLoop()
+    {
+        var h = new Harness();
+        var commitCount = 0;
+        h.Controller.CommitSettingsAsync(
+                Arg.Any<CommittedSettingsSnapshot>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                commitCount++;
+                // Toggling on is requested but the scheduler rejects the registration.
+                return Task.FromResult(new CommitSettingsResult(true,
+                    AutostartResult.Failure("task registration failed (exit 1)", AutostartState.Absent)));
+            });
+
+        var vm = h.CreateVm();
+        await Task.Delay(100); // let the initial LoadSettingsAsync settle
+
+        vm.AutostartEffective = true; // user intent: turn autostart on via the checkbox
+
+        await WaitUntilAsync(
+            () => vm.AutostartError.Length > 0 && !vm.AutostartEffective && !vm.Settings.AutostartEnabled,
+            "the failed enable to surface the error and revert the checkbox and the intent to off");
+
+        vm.AutostartEffective.Should().BeFalse(
+            "the checkbox must never read 'on' without a verified registration");
+        vm.Settings.AutostartEnabled.Should().BeFalse(
+            "the persisted/intended AutostartEnabled must be reverted to off");
+        vm.AutostartError.Should().Contain("exit 1");
+
+        // The revert is programmatic (suppressed): it may not schedule a second commit, so only
+        // the user's own toggle reaches the controller — no save loop.
+        await Task.Delay(700); // ample room for any spurious debounce to fire
+        commitCount.Should().Be(1, "the failed-enable revert must not schedule a save loop");
+    }
+
     // ------------------------------------------------------------------
     // 2.1 — checkbox locked while a reset notice is pending.
     // ------------------------------------------------------------------

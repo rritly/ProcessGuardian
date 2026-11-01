@@ -1003,6 +1003,87 @@ public class GuardianOrchestratorTests
         _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
     }
 
+    // R-autostart rollback: a failed autostart ENABLE on a settings commit must not leave a stale
+    // AutostartEnabled=true in the persisted config or the controller's committed snapshot — a
+    // later launch (or a follow-up persist from the committed state) would repeat the failed
+    // registration. The rollback re-persists false as one consistent operation and the autostart
+    // failure is still surfaced, never masked; no second enable is ever attempted.
+    [Fact]
+    public async Task CommitSettings_AutostartEnableFails_RollbackPersistsFalse_CommittedStaysFalse_NoRepeatEnable()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Autostart.SetEnabledAsync(true, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(AutostartResult.Failure(
+                "task registration failed (exit 1)", AutostartState.Absent)));
+
+        var savedDocs = new List<AppSettings>();
+        h.Config.SaveAsync(Arg.Do<AppSettings>(d => savedDocs.Add(d)), Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings
+        {
+            AutostartEnabled = true,
+            CheckIntervalSeconds = 5,
+            EnableToasts = false,
+        });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        // The plain settings save succeeded; only the autostart step failed and that failure is
+        // surfaced (Saved=true + Autostart failure), never masked as a full commit success.
+        result.Saved.Should().BeTrue("the settings save itself succeeded");
+        result.Autostart.Should().NotBeNull("the autostart outcome must always accompany the commit");
+        result.Autostart!.Value.Succeeded.Should().BeFalse("an autostart failure must never be masked");
+
+        _ = h.Autostart.Received(1).SetEnabledAsync(true, Arg.Any<CancellationToken>());
+        savedDocs.Should().NotBeEmpty();
+        savedDocs.Last().AutostartEnabled.Should().BeFalse(
+            "a failed autostart enable must roll the persisted AutostartEnabled back to false");
+
+        // The controller's committed state follows the rollback: a follow-up Stop persisting from
+        // the committed snapshot (no fresh snapshot passed) writes false, not the stale true.
+        var stop = await controller.StopAsync();
+        stop.RuntimeStopped.Should().BeTrue();
+        savedDocs.Last().AutostartEnabled.Should().BeFalse(
+            "the committed snapshot must keep AutostartEnabled=false after the rollback");
+        _ = h.Autostart.Received(1).SetEnabledAsync(true, Arg.Any<CancellationToken>());
+    }
+
+    // The rollback must not fire when the requested autostart state was already off (a disable
+    // outcome leaves the persisted flag as requested); only an enable that the scheduler rejected
+    // triggers the corrective re-persist, so a successful disable is stored unchanged.
+    [Fact]
+    public async Task CommitSettings_AutostartDisableFailure_DoesNotRollbackToTrue_PersistsFalse()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Autostart.ReadStateAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(AutostartState.Enabled));
+        h.Autostart.SetEnabledAsync(false, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(AutostartResult.Failure(
+                "task deletion failed (exit 1)", AutostartState.Enabled)));
+
+        var savedDocs = new List<AppSettings>();
+        h.Config.SaveAsync(Arg.Do<AppSettings>(d => savedDocs.Add(d)), Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = false });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        result.Saved.Should().BeTrue();
+        result.Autostart!.Value.Succeeded.Should().BeFalse();
+        savedDocs.Last().AutostartEnabled.Should().BeFalse(
+            "a disable failure must keep the persisted AutostartEnabled=false (the requested off state)");
+    }
+
     [Fact]
     public async Task Reconcile_EmptyPin_EditionScoped()
     {
