@@ -792,36 +792,6 @@
                            ToolTip="{Binding StatusReason}"
                            Visibility="{Binding IsDegraded, Converter={StaticResource BoolToVisibilityConverter}}" />
                 </StackPanel>
-
-                <!-- Full-width guidance row below the monitoring controls/status row (R-A): long
-                     refusal/reset guidance wraps and stays readable at normal window width instead of
-                     being squeezed into the horizontal controls row or a fixed-height row. The whole
-                     container is Collapsed when no message and no recovery indication exists, so an
-                     empty row reserves no vertical space (each child also collapses individually). -->
-                <StackPanel Grid.Row="1" Margin="15,10,15,12" HorizontalAlignment="Stretch"
-                            Visibility="{Binding HasStatusGuidance, Converter={StaticResource BoolToVisibilityConverter}}">
-                    <TextBlock Text="{Binding ConfigurationError}"
-                               TextWrapping="Wrap"
-                               HorizontalAlignment="Stretch"
-                               FontSize="11"
-                               Foreground="#E5554F"
-                               Visibility="{Binding ConfigurationError, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
-                    <TextBlock Text="{Binding ResetNotice}"
-                               Margin="0,6,0,0"
-                               TextWrapping="Wrap"
-                               HorizontalAlignment="Stretch"
-                               FontSize="11"
-                               Foreground="#E8A33D"
-                               Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
-
-                    <TextBlock Text="{Binding AutostartError}"
-                               Margin="0,6,0,0"
-                               TextWrapping="Wrap"
-                               HorizontalAlignment="Stretch"
-                               FontSize="11"
-                               Foreground="#E5554F"
-                               Visibility="{Binding AutostartError, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
-                </StackPanel>
             </Grid>
         </Border>
 

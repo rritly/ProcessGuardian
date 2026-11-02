@@ -408,8 +408,6 @@ public partial class MainViewModel : ObservableObject
         {
             AutostartError = _controller.AutostartSyncError!;
             _logger.LogWarning("Autostart sync error surfaced: {Error}", _controller.AutostartSyncError);
-            if (Settings.EnableToasts)
-                _ = _notifications.ShowAsync("Autostart Error", AutostartError);
         }
         else if (_controller.AutostartActualState is not null)
         {
@@ -457,9 +455,7 @@ public partial class MainViewModel : ObservableObject
             if (!result.Started)
             {
                 _logger.LogWarning("Start rejected: {Reason}", result.Reason);
-                if (Settings.EnableToasts)
-                    _ = _notifications.ShowAsync("Monitoring Not Started", result.Reason ?? string.Empty);
-                return; // fail-closed: no session, no loop
+                return; // fail-closed: no session, no loop; the failure goes to the log/status, not a toast (R-UI-TOAST)
             }
 
             _logger.LogInformation("Start Monitoring: path={Path}", Settings.TargetProcessPath);
@@ -701,8 +697,6 @@ public partial class MainViewModel : ObservableObject
                         _suppressSave = false;
                     }
                 }
-                if (Settings.EnableToasts)
-                    _ = _notifications.ShowAsync("Autostart Error", AutostartError);
             }
             else if (result.Autostart is { Succeeded: true } autostartOk)
             {

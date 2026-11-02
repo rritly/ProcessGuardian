@@ -134,10 +134,9 @@ public class MainViewModelRecoveryTests
 
         vm.AutostartEffective.Should().BeFalse("Unknown must not be displayed as a verified-off checkbox");
         vm.AutostartError.Should().NotBeEmpty("the startup-sync error must be surfaced in the UI");
-        h.Notifications.Received(1).ShowAsync(
-            Arg.Is<string>(t => t == "Autostart Error"),
-            Arg.Is<string>(m => m.Contains("could not be verified")),
-            Arg.Any<CancellationToken>());
+        // R-UI-TOAST: autostart errors produce no Toast (not "Autostart Error"); they go to the
+        // checkbox/state and the log, leaving exactly the five standard titles for the overlay.
+        _ = h.Notifications.DidNotReceive().ShowAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]

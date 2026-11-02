@@ -50,10 +50,10 @@
                        Grid.Column="1"
                        VerticalAlignment="Center"
                        TextAlignment="Center"
-                       TextWrapping="NoWrap"
-                       TextTrimming="CharacterEllipsis"
+                       TextWrapping="Wrap"
+                       TextTrimming="None"
                        FontFamily="Noto Sans, Segoe UI"
-                       FontWeight="Black"
+                       FontWeight="SemiBold"
                        TextOptions.TextRenderingMode="Grayscale"
                        TextOptions.TextHintingMode="Fixed"/>
         </Grid>
