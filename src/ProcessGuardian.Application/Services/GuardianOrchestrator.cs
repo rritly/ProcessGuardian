@@ -68,10 +68,17 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     private MonitorState _state = new(GuardianStatus.Stopped, false, null, false);
 
     // Recovery pending flag: set when initialization reports ResetNoticePending and cleared only
-    // by an explicit, fully-verified A/B resolution. While pending, ordinary autostart sync is
-    // blocked (a pre-existing scheduler task is never touched by plain settings commits or a
-    // start), the checkbox is locked, and the persisted AutostartEnabled is preserved.
+    // by the controller-owned automatic recovery whose steps were all verified (task verified
+    // absent -> AutostartEnabled=false + IsMonitoringEnabled=false persisted -> journal cleared).
+    // While pending, Start is blocked at the controller level, ordinary autostart sync is blocked
+    // (a pre-existing scheduler task is never enabled/created by plain settings commits or a
+    // start), the checkbox is locked, and IsMonitoringEnabled stays off (v2.5 R-AS-AUTO).
     private bool _recoveryPending;
+
+    // Automatic recovery: bounded delete/verify attempts per startup — never an unbounded timer
+    // or background loop. A failed attempt leaves the journal pending; the next startup re-runs
+    // the same idempotent flow and can safely finish after any crash boundary.
+    private const int MaxRecoveryAttempts = 3;
 
     // Set when configuration initialization was observed as Refused (or threw
     // ConfigurationUnavailableException). While set, every mutation entry point is blocked at
@@ -123,6 +130,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     public MonitorState CurrentState => _state;
 
     public event EventHandler<MonitorState>? StateChanged;
+
+    /// <summary>Raised when the recovery-pending flag transitions (on successful recovery completion).</summary>
+    public event EventHandler? RecoveryPendingChanged;
 
     /// <summary>True while a reset notice is pending and ordinary autostart sync is blocked.</summary>
     public bool RecoveryPending => _recoveryPending;
@@ -177,13 +187,20 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
             if (init == ConfigurationInitializationStatus.ResetNoticePending)
             {
-                // [recovery policy] Preserve the (possibly pre-existing) autostart task and
-                // stay stopped until the user chooses A or B: no SyncAutostartAsync(false)
-                // from the fresh defaults, no automatic session. The notice latch is cleared
-                // only by an explicit resolution (ResolveRecoveryAsync), never here.
+                // [recovery policy, product v2.5 R-AS-AUTO] A pending reset notice means the
+                // previous configuration was untrusted and quarantined and fresh safe defaults
+                // were written. The controller now runs the automatic recovery BEFORE any
+                // ordinary autostart sync and before any possibility of Start: remove the
+                // (possibly pre-existing) elevated autostart task, persist AutostartEnabled=false
+                // + IsMonitoringEnabled=false, and only then clear the journal. Until it settles,
+                // _recoveryPending blocks Start at the controller level, no SyncAutostartAsync and
+                // no session may run, and a failed recovery leaves the journal pending for the
+                // next startup (idempotent). No A/B choice exists anymore — target path and pin
+                // stay at their safe defaults and the user re-selects the target later.
                 _configRefused = false;
                 _recoveryPending = true;
-                _logger.LogWarning("Reset notice pending; autostart task left untouched, monitoring not started");
+                _logger.LogWarning("Reset notice pending; running automatic recovery (remove autostart, save disabled, clear journal)");
+                await RunAutomaticRecoveryAsync(ct).ConfigureAwait(false);
                 Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
                 return;
             }
@@ -293,12 +310,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
             if (_recoveryPending)
             {
-                // [recovery policy] While a reset notice is pending, an ordinary settings commit
-                // must NOT enable/disable autostart (the pre-existing task is never touched by a
-                // plain save) and must NOT overwrite the persisted AutostartEnabled with a value
-                // from a UI snapshot: only an explicit A/B resolution may change the flag. Other
-                // settings are still saved normally, and a committed path change still clears the
-                // pin (which is exactly what re-selecting the target must do).
+                // [recovery policy] While automatic recovery is pending (journal not yet cleared),
+                // an ordinary settings commit must NOT enable/disable autostart (the pre-existing
+                // scheduler task is never touched by a plain save) and must NOT overwrite the
+                // persisted AutostartEnabled with a value from a UI snapshot: only the controller-
+                // owned recovery steps may change the flag. Other settings are still saved
+                // normally, and a committed path change still clears the pin (which is exactly
+                // what re-selecting the target must do).
                 _committed = snapshot;
                 var pendingNewTarget = string.IsNullOrWhiteSpace(targetPath) ? string.Empty : targetPath;
                 var pendingPathChanged =
@@ -363,184 +381,131 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         }
     }
 
-    /// <summary>True when the controller holds a recorded target pin (set on a Start after the reset).</summary>
-    public bool HasRecordedPin => !string.IsNullOrWhiteSpace(_latestPin);
-
-    public async Task<RecoveryResolutionResult> ResolveRecoveryAsync(
-        RecoveryResolutionChoice choice,
-        CommittedSettingsSnapshot? snapshot = null,
-        string? targetPath = null,
-        CancellationToken ct = default)
+    // Controller-owned automatic recovery (v2.5 R-AS-AUTO): removes the app-owned autostart
+    // task, persists AutostartEnabled=false + IsMonitoringEnabled=false, and only then clears
+    // the journal. Runs inside ReconcileAsync before any ordinary autostart sync and before any
+    // possibility of Start (_recoveryPending is set while it runs and stays set on failure).
+    // Bounded to MaxRecoveryAttempts per startup; each step is verified and each failure leaves
+    // the journal pending so the next startup re-runs the same idempotent flow (a crash after
+    // the delete, after the save, or before the journal clear never recreates the task).
+    private async Task RunAutomaticRecoveryAsync(CancellationToken ct)
     {
-        await _operationLock.WaitAsync(ct).ConfigureAwait(false);
-        try
+        for (var attempt = 1; attempt <= MaxRecoveryAttempts; attempt++)
         {
-            if (_configRefused)
+            if (attempt > 1)
+                _logger.LogWarning("Automatic recovery attempt {Attempt}/{Max} after a previous failure", attempt, MaxRecoveryAttempts);
+
+            // 1) Unconditional, positively-verified removal of the app-owned task. The service
+            //    scopes the delete to the exact app task name; a not-found delete still confirms
+            //    absence via a follow-up read. The /Delete exit code alone is never proof.
+            AutostartResult removal;
+            try
             {
-                // [R-A] Refused configuration and recovery resolution never combine: the store
-                // cannot be written and no autostart task may be touched.
-                _logger.LogWarning("Recovery resolution rejected: configuration initialization was refused");
-                return RecoveryResolutionResult.Failed(
-                    "the configuration is unavailable; recovery cannot proceed until it is repaired.");
+                removal = await _autostart.RemoveRegistrationAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Automatic recovery attempt {Attempt}: autostart removal failed unexpectedly", attempt);
+                continue;
             }
 
-            switch (choice)
+            if (!removal.Succeeded)
             {
-                case RecoveryResolutionChoice.KeepAutostart:
-                    return await ResolveKeepAutostartAsync(snapshot, targetPath, ct).ConfigureAwait(false);
-                case RecoveryResolutionChoice.RemoveAutostart:
-                    return await ResolveRemoveAutostartAsync(snapshot, ct).ConfigureAwait(false);
-                default:
-                    _logger.LogError("Unknown recovery resolution choice {Choice}", choice);
-                    return RecoveryResolutionResult.Failed("an unknown recovery option was requested");
+                _logger.LogError("Automatic recovery attempt {Attempt}: autostart removal not verified: {Error}",
+                    attempt, removal.ErrorMessage ?? "unknown");
+                PublishAutostartState(removal.ActualState, removal.ErrorMessage);
+                continue;
             }
-        }
-        finally
-        {
-            _operationLock.Release();
-        }
-    }
 
-    // Option A: keep the (possibly pre-existing) task. Allowed only after an explicit target
-    // re-select + re-pin + successful save of that selection; an out-of-date pin or a stale
-    // target path is rejected so the operation is idempotent and never clears the notice on a
-    // partial success.
-    private async Task<RecoveryResolutionResult> ResolveKeepAutostartAsync(
-        CommittedSettingsSnapshot? snapshot, string? targetPath, CancellationToken ct)
-    {
-        // The user must have re-selected and re-pinned the target through a Start, which is the
-        // only path that records a pin. Without a recorded pin, keep-autostart is not offered.
-        if (!HasRecordedPin)
-        {
-            _logger.LogWarning("Keep-autostart rejected: no recorded target pin (must re-select and re-pin first)");
-            return RecoveryResolutionResult.Failed(
-                "re-select and pin the target first; the target has no recorded pin.");
-        }
+            PublishAutostartState(AutostartState.Absent, null);
 
-        if (snapshot is null)
-        {
-            _logger.LogWarning("Keep-autostart rejected: no committed settings supplied");
-            return RecoveryResolutionResult.Failed("settings are unavailable; re-save your settings first.");
-        }
+            // 2) Persist AutostartEnabled=false + IsMonitoringEnabled=false as one controller
+            //    snapshot. Only a confirmed save proceeds to the journal clear; a failed save
+            //    keeps the journal pending (task is already absent; the next attempt re-verifies).
+            bool saved;
+            try
+            {
+                saved = await PersistRecoveryStateAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Automatic recovery attempt {Attempt}: persisting the disabled state failed", attempt);
+                continue;
+            }
 
-        // The committed path+pin must be consistent: a staleness mismatch means the user's
-        // pinned selection was not what we are about to persist, so refuse (idempotent fail).
-        if (!string.IsNullOrWhiteSpace(targetPath)
-            && !string.Equals(targetPath, _committedTargetPath, StringComparison.OrdinalIgnoreCase))
-        {
-            _logger.LogWarning("Keep-autostart rejected: target path mismatch with the recorded pin");
-            return RecoveryResolutionResult.Failed(
-                "the selected target does not match the recorded pin; re-select and re-pin the target.");
-        }
+            if (!saved)
+            {
+                _logger.LogError("Automatic recovery attempt {Attempt}: settings save failed; journal stays pending", attempt);
+                continue;
+            }
 
-        // 1) Enable autostart first and verify its actual state.
-        var enabled = await SyncAutostartAsync(true, ct).ConfigureAwait(false);
-        if (enabled is null || !enabled.Value.Succeeded)
-        {
-            _logger.LogError("Recovery resolution (Keep autostart) failed: autostart could not be enabled: {Error}",
-                enabled?.ErrorMessage ?? "not attempted");
-            return RecoveryResolutionResult.Failed(
-                $"autostart could not be enabled: {enabled?.ErrorMessage ?? "unknown reason"}");
-        }
+            // 3) Only after verified task absence AND a successful save is the journal cleared.
+            //    A clear failure keeps the journal pending; the next startup re-runs the same
+            //    idempotent flow and finishes (the task is already absent, so the removal step
+            //    becomes a non-destructive verification).
+            if (_resetNoticeAck is null)
+            {
+                _logger.LogError("Automatic recovery attempt {Attempt}: reset-notice acknowledgement is unavailable; journal stays pending", attempt);
+                continue;
+            }
 
-        PublishAutostartState(AutostartState.Enabled, null);
+            try
+            {
+                await _resetNoticeAck.ClearAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Automatic recovery attempt {Attempt}: clearing the reset notice failed; journal stays pending", attempt);
+                continue;
+            }
 
-        // 2) Persist the committed settings with AutostartEnabled = true.
-        _committed = snapshot with { AutostartEnabled = true };
-        bool saved;
-        try
-        {
-            saved = await PersistEnabledAsync(enabled: SessionActive, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Keep-autostart: persisting settings failed");
-            return RecoveryResolutionResult.Failed($"settings could not be saved: {ex.Message}");
-        }
-
-        if (!saved)
-        {
-            _logger.LogError("Keep-autostart: settings save failed");
-            return RecoveryResolutionResult.Failed("settings could not be saved; try again.");
-        }
-
-        // 3) Only a fully-verified operation clears the notice; a failure anywhere above leaves
-        // it pending so the user can retry.
-        return await TryClearResetNoticeAsync("Keep autostart").ConfigureAwait(false);
-    }
-
-    // Option B: remove the (possibly pre-existing) task and keep AutostartEnabled = false.
-    private async Task<RecoveryResolutionResult> ResolveRemoveAutostartAsync(
-        CommittedSettingsSnapshot? snapshot, CancellationToken ct)
-    {
-        // 1) Disable autostart first and verify its actual state (task actually absent).
-        var disabled = await SyncAutostartAsync(false, ct).ConfigureAwait(false);
-        if (disabled is null || !disabled.Value.Succeeded)
-        {
-            _logger.LogError("Recovery resolution (Remove autostart) failed: autostart could not be removed: {Error}",
-                disabled?.ErrorMessage ?? "not attempted");
-            return RecoveryResolutionResult.Failed(
-                $"autostart could not be removed: {disabled?.ErrorMessage ?? "unknown reason"}");
-        }
-
-        PublishAutostartState(AutostartState.Absent, null);
-
-        // 2) Persist AutostartEnabled = false. Monitoring state is untouched by option B.
-        if (snapshot is not null)
-            _committed = snapshot with { AutostartEnabled = false };
-        bool saved;
-        try
-        {
-            saved = await PersistEnabledAsync(enabled: SessionActive, ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Remove-autostart: persisting settings failed");
-            return RecoveryResolutionResult.Failed($"settings could not be saved: {ex.Message}");
-        }
-
-        if (!saved)
-        {
-            _logger.LogError("Remove-autostart: settings save failed");
-            return RecoveryResolutionResult.Failed("settings could not be saved; try again.");
-        }
-
-        // 3) Only a fully-verified operation clears the notice.
-        return await TryClearResetNoticeAsync("Remove autostart").ConfigureAwait(false);
-    }
-
-    private async Task<RecoveryResolutionResult> TryClearResetNoticeAsync(string variant)
-    {
-        if (_resetNoticeAck is null)
-        {
-            _logger.LogError("Recovery resolution ({Variant}) failed: reset-notice acknowledgement is unavailable", variant);
-            return RecoveryResolutionResult.Failed("the recovery could not be finalized; try again later.");
-        }
-
-        try
-        {
-            await _resetNoticeAck.ClearAsync(CancellationToken.None).ConfigureAwait(false);
-            _logger.LogInformation("Recovery resolution ({Variant}) completed; reset notice cleared", variant);
-            // The notice is gone: ordinary autostart sync is allowed again.
+            // 4) Fully verified: task absent + disabled state persisted + journal cleared.
             _recoveryPending = false;
-            Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
-            return RecoveryResolutionResult.Succeeded();
+            _logger.LogInformation("Automatic recovery completed: task verified absent, monitoring disabled, journal cleared");
+            RecoveryPendingChanged?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        _logger.LogError("Automatic recovery failed after {Max} attempts; journal stays pending and Start stays blocked until a later startup retries",
+            MaxRecoveryAttempts);
+    }
+
+    // Persists the post-recovery snapshot with explicit AutostartEnabled=false and
+    // IsMonitoringEnabled=false, regardless of _committed.AutostartEnabled (which may carry a UI
+    // intent that must not leak into the recovery). Target path and pin stay at their current
+    // (safe, default) values — the user re-selects the target later. This is the only autostart
+    // flag write on the recovery path.
+    private async Task<bool> PersistRecoveryStateAsync(CancellationToken ct)
+    {
+        try
+        {
+            var doc = await _config.LoadAsync(ct).ConfigureAwait(false);
+            ApplyCommitted(doc, _committed);
+            doc.TargetProcessPath = _committedTargetPath;
+            doc.TargetHashSha256 = _latestPin;
+            doc.AutostartEnabled = false;
+            doc.IsMonitoringEnabled = false;
+            await _config.SaveAsync(doc, ct).ConfigureAwait(false);
+            _lastPersistFailed = false;
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            // The latch could not be cleared, so the recovery is not complete: leave the notice
-            // pending (and ordinary sync blocked) and let the user retry rather than reporting a
-            // false success.
-            _logger.LogError(ex, "Recovery resolution ({Variant}) could not finalize the reset notice", variant);
-            return RecoveryResolutionResult.Failed("the recovery could not be finalized; try again.");
+            _lastPersistFailed = true;
+            _logger.LogError(ex, "Persist recovery state (AutostartEnabled=false, IsMonitoringEnabled=false) failed");
+            return false;
         }
     }
 
@@ -555,6 +520,16 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 // the configuration store is refused: Start fails closed with guidance.
                 _logger.LogWarning("Start rejected: configuration initialization was refused");
                 return new StartResult(false, "monitoring cannot start: the configuration is unavailable");
+            }
+
+            if (_recoveryPending)
+            {
+                // [recovery policy v2.5 R-AS-AUTO] While automatic recovery is pending (task not
+                // verified absent / journal not cleared), the controller itself blocks Start — not
+                // only the UI. No monitoring may begin, and no autostart enable/create may run,
+                // until the recovery settles. A later startup retries the same idempotent flow.
+                _logger.LogWarning("Start rejected: an automatic recovery is pending (task not verified absent / journal not cleared)");
+                return new StartResult(false, "monitoring cannot start until the pending recovery completes");
             }
 
             if (SessionActive)
@@ -1263,7 +1238,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             doc.TargetHashSha256 = _latestPin;
             doc.IsMonitoringEnabled = enabled;
             if (!applyAutostart)
-                doc.AutostartEnabled = preservedAutostart; // never overwrite the flag outside an explicit A/B resolution
+                doc.AutostartEnabled = preservedAutostart; // never overwrite the flag on a plain save; the recovery path writes its own snapshot
             await _config.SaveAsync(doc, ct).ConfigureAwait(false);
             _lastPersistFailed = false;
             return true;

@@ -292,13 +292,17 @@ and recreates the file on the next save.
 
 The elevated edition keeps a crash-safe recovery journal at `HKLM\SOFTWARE\ProcessGuardianAdmin\Recovery`.
 On a clean first run the key is absent, which means no recovery is in progress and normal
-autostart sync proceeds. If the journal indicates a quarantined configuration, the app stays
-stopped and shows an explicit *recovery* choice (Keep / Remove the existing autostart task)
-instead of touching the registration on its own. If the elevated configuration is refused as
-unsafe, the app reports an actionable Error: an administrator must repair the owner/DACL of
-`%ProgramData%\ProcessGuardianAdmin` (owner `BUILTIN\Administrators` or `SYSTEM`, no reparse
-points) or the recovery state under `HKLM\SOFTWARE\ProcessGuardianAdmin\Recovery`. Do not relax
-ACLs or grant broad permissions to "fix" a refusal — that would defeat the tamper protection.
+autostart sync proceeds. If the journal indicates a quarantined configuration, the app runs an
+automatic recovery before any ordinary autostart sync or Start: the existing autostart task is
+removed and verified absent, `AutostartEnabled=false` and `IsMonitoringEnabled=false` are
+persisted, and only then is the journal cleared. Monitoring stays stopped and Start is blocked
+until the journal is cleared; if the recovery is interrupted the journal stays pending and the
+next startup re-runs the same idempotent flow without ever recreating the task. If the elevated
+configuration is refused as unsafe, the app reports an actionable Error: an administrator must
+repair the owner/DACL of `%ProgramData%\ProcessGuardianAdmin` (owner `BUILTIN\Administrators` or
+`SYSTEM`, no reparse points) or the recovery state under
+`HKLM\SOFTWARE\ProcessGuardianAdmin\Recovery`. Do not relax ACLs or grant broad permissions to
+"fix" a refusal — that would defeat the tamper protection.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 

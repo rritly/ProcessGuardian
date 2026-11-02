@@ -814,42 +814,6 @@
                                Foreground="#E8A33D"
                                Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}" />
 
-                    <!-- Explicit recovery resolution (A/B). Only shown while a reset notice is
-                         pending (which only the elevated edition produces), so the regular edition
-                         never surfaces these actions. Option A is additionally gated by a recorded
-                         pin through the command's CanExecute. The guidance directly explains what each
-                         option does, so the re-pin requirement of option A is not a hidden step. -->
-                    <StackPanel Orientation="Horizontal"
-                                Margin="0,10,0,0"
-                                Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}">
-                        <Button Content="Keep autostart and finish recovery"
-                                Command="{Binding KeepAutostartCommand}"
-                                Padding="10,4"
-                                FontSize="11"
-                                Style="{StaticResource PrimaryButtonStyle}" />
-                        <Button Content="Remove autostart and finish recovery"
-                                Command="{Binding RemoveAutostartCommand}"
-                                Margin="8,0,0,0"
-                                Padding="10,4"
-                                FontSize="11"
-                                Style="{StaticResource PrimaryButtonStyle}" />
-                    </StackPanel>
-
-                    <!-- What each recovery option does, so the user can decide without guessing.
-                         Option A needs a freshly recorded pin (set by starting monitoring once). -->
-                    <TextBlock Margin="0,10,0,0"
-                               TextWrapping="Wrap"
-                               HorizontalAlignment="Stretch"
-                               FontSize="11"
-                               Foreground="{StaticResource LabelBrush}"
-                               Visibility="{Binding ResetNotice, Converter={StaticResource StringIsEmptyToVisibilityConverter}}">
-                        <Run Text="Keep autostart" FontWeight="Bold" /> — restores the automatic start of the
-                        admin edition at Windows logon and finishes recovery. It requires re-selecting and
-                        re-pinning the target first (start monitoring once, then return here).
-                        <LineBreak />
-                        <Run Text="Remove autostart" FontWeight="Bold" /> — deletes the scheduled task; the app
-                        will not start automatically at the next logon. Monitoring is left as it is.</TextBlock>
-
                     <TextBlock Text="{Binding AutostartError}"
                                Margin="0,6,0,0"
                                TextWrapping="Wrap"

@@ -87,8 +87,11 @@ public partial class MainViewModel : ObservableObject
     // (a programmatic set must not re-schedule a save and loop on an error state).
     private bool _updatingAutostartEffective;
 
-    // Serializes the two recovery resolutions so Keep/Remove cannot run concurrently.
-    private bool _resolutionInProgress;
+    // True while an automatic recovery is pending (journal not yet cleared): Start and the
+    // autostart checkbox stay locked and the pending notice is shown, exactly as reported by the
+    // controller's RecoveryPending gate. Reopened only when the controller raises
+    // RecoveryPendingChanged after a fully-verified recovery (R-AS-AUTO).
+    private bool _recoveryPending;
 
     private CancellationTokenSource? _saveCts;
 
@@ -151,6 +154,10 @@ public partial class MainViewModel : ObservableObject
         // Autostart actual-state channel: the controller is the single writer; the checkbox and
         // the startup-sync error are driven from the verified registration state (2.4/2.5).
         _controller.AutostartStateChanged += (_, __) => OnDispatcher(ApplyAutostartStateFromController);
+
+        // A fully-verified automatic recovery reopens the pending gate: Start and the autostart
+        // checkbox become available again and the pending-notice guidance clears (R-AS-AUTO).
+        _controller.RecoveryPendingChanged += (_, __) => OnDispatcher(OnRecoveryCompleted);
 
         // Update log text when new entries arrive
         _logSink.LogUpdated += (_, __) =>
@@ -300,10 +307,11 @@ public partial class MainViewModel : ObservableObject
             case ConfigurationInitializationStatus.ResetNoticePending:
                 ResetNotice =
                     "Settings were reset to safe defaults: the previous configuration was untrusted and has been " +
-                    "quarantined. Monitoring is off and the target pin is cleared — start monitoring once to " +
-                    "re-select and re-pin the target, then choose how to resolve autostart below.";
-                // Until the user resolves the recovery explicitly, autostart edits are locked and the
-                // checkbox must not show a verified state (2.1/2.5).
+                    "quarantined. Automatic recovery (removing the scheduled task and disabling autostart) " +
+                    "completes at startup; monitoring stays off until you re-select the target and start it.";
+                // Until the automatic recovery completes and the journal is cleared, autostart edits
+                // and Start stay locked and the checkbox shows no verified state (2.1/2.5 / R-AS-AUTO).
+                _recoveryPending = true;
                 IsAutostartEditable = false;
                 _updatingAutostartEffective = true;
                 try
@@ -314,7 +322,7 @@ public partial class MainViewModel : ObservableObject
                 {
                     _updatingAutostartEffective = false;
                 }
-                NotifyRecoveryCanExecuteChanged();
+                NotifyStartStopCanExecuteChanged();
                 break;
         }
     }
@@ -351,20 +359,7 @@ public partial class MainViewModel : ObservableObject
             return;
         _committedTargetPath = Settings.TargetProcessPath ?? string.Empty;
         _ = CommitNowAsync();
-        // A committed path change clears the recorded pin, possibly disabling keep-autostart.
-        NotifyRecoveryCanExecuteChanged();
     }
-
-    // Exposes the two explicit recovery resolutions. Both require a pending notice; option A
-    // (keep autostart) additionally requires a recorded pin so the user must first re-select,
-    // re-pin and save the target through the controller.
-    private bool CanKeepAutostart =>
-        !_resolutionInProgress
-        && !string.IsNullOrEmpty(ResetNotice)
-        && _controller.HasRecordedPin;
-
-    private bool CanRemoveAutostart =>
-        !_resolutionInProgress && !string.IsNullOrEmpty(ResetNotice);
 
     // The checkbox toggles the DESIRED intent; the controller verifies the actual registration
     // and corrects AutostartEffective on the result / autostart-state channel. A programmatic
@@ -424,122 +419,18 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    [RelayCommand(CanExecute = nameof(CanKeepAutostart))]
-    private async Task KeepAutostart()
+    // R-AS-AUTO: a fully-verified automatic recovery completed and the controller reopened the
+    // pending gate. The pending-notice guidance clears, autostart editing unlocks and Start is
+    // enabled again (the checkbox reflects the verified actual off-registration via the autostart
+    // state channel).
+    private void OnRecoveryCompleted()
     {
-        if (!BeginResolution())
-            return;
-        try
-        {
-            AutostartError = string.Empty;
-            var result = await _controller.ResolveRecoveryAsync(
-                RecoveryResolutionChoice.KeepAutostart,
-                CommitSnapshot(),
-                _committedTargetPath);
-            await HandleRecoveryResultAsync(RecoveryResolutionChoice.KeepAutostart, result);
-        }
-        catch (Exception ex)
-        {
-            AutostartError = $"Keep-autostart failed: {ex.Message}";
-            _logger.LogError(ex, "Keep-autostart resolution failed");
-            if (Settings.EnableToasts)
-                _ = _notifications.ShowAsync("Recovery Not Complete", AutostartError);
-        }
-        finally
-        {
-            EndResolution();
-        }
-    }
-
-    [RelayCommand(CanExecute = nameof(CanRemoveAutostart))]
-    private async Task RemoveAutostart()
-    {
-        if (!BeginResolution())
-            return;
-        try
-        {
-            AutostartError = string.Empty;
-            var result = await _controller.ResolveRecoveryAsync(
-                RecoveryResolutionChoice.RemoveAutostart,
-                CommitSnapshot());
-            await HandleRecoveryResultAsync(RecoveryResolutionChoice.RemoveAutostart, result);
-        }
-        catch (Exception ex)
-        {
-            AutostartError = $"Remove-autostart failed: {ex.Message}";
-            _logger.LogError(ex, "Remove-autostart resolution failed");
-            if (Settings.EnableToasts)
-                _ = _notifications.ShowAsync("Recovery Not Complete", AutostartError);
-        }
-        finally
-        {
-            EndResolution();
-        }
-    }
-
-    // Claims the recovery gate; returns false when a resolution is already in flight.
-    private bool BeginResolution()
-    {
-        if (_resolutionInProgress)
-            return false;
-        _resolutionInProgress = true;
-        NotifyRecoveryCanExecuteChanged();
-        return true;
-    }
-
-    private void EndResolution()
-    {
-        _resolutionInProgress = false;
-        NotifyRecoveryCanExecuteChanged();
-    }
-
-    /// <summary>
-    /// Raised after a fully-verified recovery resolution clears the persistent reset notice, so
-    /// the composition root (App) can restore the standard tray tooltip — clearing the stale
-    /// "reset now" notice that was set at boot when a reset was pending.
-    /// </summary>
-    public event EventHandler? RecoveryNoticeCleared;
-
-    private void NotifyRecoveryCanExecuteChanged()
-    {
-        KeepAutostartCommand.NotifyCanExecuteChanged();
-        RemoveAutostartCommand.NotifyCanExecuteChanged();
-    }
-
-    private async Task HandleRecoveryResultAsync(RecoveryResolutionChoice choice, RecoveryResolutionResult result)
-    {
-        NotifyRecoveryCanExecuteChanged();
-        if (result.Resolved)
-        {
-            // A fully-verified resolution clears the notice and unlocks autostart editing; the
-            // recovery is complete only after the operations AND the journal clear succeeded.
-            ResetNotice = string.Empty;
-            AutostartError = string.Empty;
-            IsAutostartEditable = true;
-            // The persistent reset notice is gone; the composition root clears the matching stale
-            // tray "reset now" notice so the tray tooltip returns to its standard status text.
-            RecoveryNoticeCleared?.Invoke(this, EventArgs.Empty);
-            var (title, body) = choice == RecoveryResolutionChoice.KeepAutostart
-                ? ("Autostart Kept",
-                   "The scheduled task is enabled and the recovery is complete. The app will start " +
-                   "automatically at the next logon.")
-                : ("Autostart Removed",
-                   "The scheduled task was removed and the recovery is complete. The app will not " +
-                   "start automatically at the next logon.");
-            _logger.LogInformation("Recovery resolution ({Variant}) completed; reset notice cleared", choice);
-            NotifyRecoveryCanExecuteChanged();
-            if (Settings.EnableToasts)
-                _ = _notifications.ShowAsync(title, body);
-        }
-        else
-        {
-            // The notice stays pending; the user can retry the same or the other option.
-            AutostartError = result.ErrorMessage ?? "The recovery could not be completed; try again.";
-            _logger.LogWarning("Recovery not completed ({Variant}): {Error}", choice, AutostartError);
-            NotifyRecoveryCanExecuteChanged();
-            if (Settings.EnableToasts)
-                _ = _notifications.ShowAsync("Recovery Not Complete", AutostartError);
-        }
+        _recoveryPending = false;
+        ResetNotice = string.Empty;
+        AutostartError = string.Empty;
+        IsAutostartEditable = true;
+        NotifyStartStopCanExecuteChanged();
+        _logger.LogInformation("Automatic recovery completed; recovery gate reopened");
     }
 
     private void OnSettingsPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -575,8 +466,6 @@ public partial class MainViewModel : ObservableObject
             if (Settings.EnableToasts)
                 _ = _notifications.ShowAsync("Monitoring Started", string.Empty);
             await WaitUntilReadyAsync();
-            // A Start records the target pin, which may enable the keep-autostart recovery option.
-            NotifyRecoveryCanExecuteChanged();
         }
         finally
         {
@@ -654,6 +543,7 @@ public partial class MainViewModel : ObservableObject
     }
 
     private bool CanStart => !_startStopInProgress
+        && !_recoveryPending
         && string.IsNullOrEmpty(ConfigurationError)
         && Status is GuardianStatus.Stopped or GuardianStatus.Error;
     private bool CanStop => !_startStopInProgress && Status is GuardianStatus.Monitoring or GuardianStatus.Waiting or GuardianStatus.Restarting;
@@ -678,8 +568,6 @@ public partial class MainViewModel : ObservableObject
                 // through the controller; keystrokes (uncommitted draft) never do (R-CD).
                 _committedTargetPath = dialog.FileName;
                 _ = CommitNowAsync();
-                // A path re-selection clears the recorded pin, possibly disabling keep-autostart.
-                NotifyRecoveryCanExecuteChanged();
             }
         }
         catch (Exception ex)

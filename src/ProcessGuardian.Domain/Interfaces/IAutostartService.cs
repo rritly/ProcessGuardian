@@ -27,4 +27,16 @@ public interface IAutostartService
     /// effect are all reported as failures with diagnostics.
     /// </summary>
     Task<AutostartResult> SetEnabledAsync(bool enabled, CancellationToken ct = default);
+
+    /// <summary>
+    /// Unconditionally removes the app-owned autostart registration (recovery policy always
+    /// lands on "absent"): the exact app-owned scheduled task / Run value is deleted without a
+    /// pre-query gate, and the actual state is then positively verified as
+    /// <see cref="AutostartState.Absent"/> before success is reported. A delete that reports
+    /// not-found must still confirm absence via a follow-up read; a still-present task, an
+    /// unverifiable (Unknown) read, or an access/invocation failure all report failure so the
+    /// recovery stays pending. The service scopes the mutation to the exact app-owned
+    /// registration only and never touches anything else.
+    /// </summary>
+    Task<AutostartResult> RemoveRegistrationAsync(CancellationToken ct = default);
 }

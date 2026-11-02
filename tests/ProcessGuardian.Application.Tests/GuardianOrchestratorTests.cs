@@ -963,8 +963,11 @@ public class GuardianOrchestratorTests
         controller.CurrentState.IsDegraded.Should().BeFalse();
     }
 
+    // R-AS-AUTO: a refused configuration never reaches automatic recovery (Refused and
+    // ResetNoticePending are mutually exclusive init outcomes, and Reconcile returns at the
+    // refusal). No autostart removal, no save, no autostart mutation.
     [Fact]
-    public async Task ConfigRefused_ResolveRecovery_FailsWithoutAutostartMutation()
+    public async Task ConfigRefused_NoAutomaticRecovery_NoAutostartMutation()
     {
         using var h = new Harness();
         h.Config.InitializeAsync(Arg.Any<CancellationToken>())
@@ -973,13 +976,10 @@ public class GuardianOrchestratorTests
         var controller = h.CreateController();
         await controller.ReconcileAsync();
 
-        var result = await controller.ResolveRecoveryAsync(
-            RecoveryResolutionChoice.RemoveAutostart,
-            CommittedSettingsSnapshot.From(new AppSettings()));
-
-        result.Resolved.Should().BeFalse("recovery cannot proceed while the configuration is refused");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
         _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
         _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -1036,11 +1036,6 @@ public class GuardianOrchestratorTests
         _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
         _ = h.Integrity.DidNotReceive().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-
-        // Recovery resolution is rejected: no autostart mutation on an unavailable store.
-        var recovery = await controller.ResolveRecoveryAsync(RecoveryResolutionChoice.RemoveAutostart, null);
-        recovery.Resolved.Should().BeFalse();
-        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
 
         // Stop does not persist and touches no autostart; a stopped session cannot be started.
         await controller.StopAsync();

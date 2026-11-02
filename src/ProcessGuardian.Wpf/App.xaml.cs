@@ -46,10 +46,6 @@ public partial class App : System.Windows.Application
         "(owner BUILTIN\\Administrators or SYSTEM; no reparse points) or the recovery state at " +
         "HKLM\\SOFTWARE\\ProcessGuardianAdmin\\Recovery, then start the application again.";
 
-    private static readonly string ResetTrayNotice =
-        $"{AppEdition.Name}: settings were reset to safe defaults — the previous configuration was untrusted and " +
-        "was quarantined. Monitoring is off and the target pin is cleared; select and re-pin the target to start.";
-
     private void InitializeApplication(StartupEventArgs e)
     {
         _singleInstance = new SingleInstanceManager();
@@ -148,17 +144,9 @@ public partial class App : System.Windows.Application
         else
         {
             var vm = _host!.Services.GetRequiredService<MainViewModel>();
-            // A successful recovery resolution clears the persistent reset notice; clear the
-            // matching stale tray "reset now" notice so the tooltip returns to standard status.
-            vm.RecoveryNoticeCleared += (_, __) => Dispatcher.BeginInvoke(() => _tray?.SetNotice(null));
             vm.ApplyInitializationStatus(initStatus);
-            if (initStatus == ConfigurationInitializationStatus.ResetNoticePending)
-            {
-                _tray?.SetNotice(ResetTrayNotice);
-            }
-
-            // Resolve the VM (singleton) before starting the host so its status/log
-            // subscriptions exist before the orchestrator's first Report().
+            // A successful automatic recovery is surfaced through the controller state channels;
+            // the tray shows only the standard status tooltip (no separate reset notice).
             StartHostAsync();
         }
 

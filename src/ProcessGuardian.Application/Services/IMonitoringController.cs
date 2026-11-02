@@ -18,14 +18,16 @@ public interface IMonitoringController
     MonitorState CurrentState { get; }
 
     /// <summary>
-    /// True when the controller holds a recorded target pin (computed and stored on a Start
-    /// after the reset). Gates the keep-autostart recovery option: it must not be offered for
-    /// execution until the user has re-selected and re-pinned the target.
+    /// True while a reset-notice recovery is pending (journal not yet cleared). Automatic
+    /// recovery removes the autostart task, persists <c>AutostartEnabled=false</c> +
+    /// <c>IsMonitoringEnabled=false</c>, and clears the journal; until the flag clears, Start
+    /// is blocked at the controller level and ordinary autostart sync is suppressed.
     /// </summary>
-    bool HasRecordedPin { get; }
-
-    /// <summary>True while a reset notice is pending; ordinary autostart sync is blocked (recovery A/B).</summary>
     bool RecoveryPending { get; }
+
+    /// <summary>Raised when the recovery-pending flag transitions (for example, after a
+    /// successfully completed automatic recovery the pending gate reopens).</summary>
+    event EventHandler? RecoveryPendingChanged;
 
     /// <summary>Latest verified actual autostart registration state (drives the checkbox display).</summary>
     AutostartState? AutostartActualState { get; }
@@ -63,18 +65,4 @@ public interface IMonitoringController
     /// <summary>Cancels the session synchronously without persisting the enabled flag
     /// or any UI snapshot (consumed by Windows SessionEnding).</summary>
     Task SuspendAsync(CancellationToken ct = default);
-
-    /// <summary>
-    /// Explicitly resolves a pending reset notice through one of the two recovery options
-    /// (see <see cref="RecoveryResolutionChoice"/>). No automatic resolution exists: the
-    /// notice is cleared only after the chosen option's operations succeeded and were
-    /// verified (never on plain start, never on re-select/re-pin alone). Returns
-    /// <see cref="RecoveryResolutionResult.Resolved"/> false with the notice still pending
-    /// on any failure, so the user can retry.
-    /// </summary>
-    Task<RecoveryResolutionResult> ResolveRecoveryAsync(
-        RecoveryResolutionChoice choice,
-        CommittedSettingsSnapshot? snapshot = null,
-        string? targetPath = null,
-        CancellationToken ct = default);
 }

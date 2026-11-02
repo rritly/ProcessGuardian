@@ -542,6 +542,119 @@ public class ScheduledTaskAutostartServiceErrorTests
     }
 
     // ---------------------------------------------------------------------
+    // RemoveRegistrationAsync (recovery primitive, R-AS-AUTO): unconditional
+    // /Delete followed by a positive Absent verification. The /Delete exit code alone is
+    // never proof either way — only a follow-up read that confirms Absent reports success.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task RemoveRegistration_TaskAbsent_DeleteNonZero_VerifiedAbsent_ReportsSucceeded()
+    {
+        // The task is already gone (a previous, interrupted recovery): the /Delete exits nonzero
+        // (not-found) but the positive follow-up read confirms Absent, so removal is verified.
+        var service = NewService(new Script
+        {
+            QueryExitCode = 1,
+            QueryError = "ERROR: The system cannot find the file specified.",
+            MutatingExitCode = 1,
+        });
+
+        var result = await service.RemoveRegistrationAsync();
+
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().Be(AutostartState.Absent);
+    }
+
+    [Fact]
+    public async Task RemoveRegistration_DeleteZero_QueryAbsent_ReportsSucceeded()
+    {
+        var service = NewService(new Script
+        {
+            QueryExitCode = 1,
+            QueryError = "ERROR: The system cannot find the file specified.",
+            MutatingExitCode = 0,
+        });
+
+        var result = await service.RemoveRegistrationAsync();
+
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().Be(AutostartState.Absent);
+    }
+
+    [Fact]
+    public async Task RemoveRegistration_DeleteZero_QueryStillPresent_ReportsFailed()
+    {
+        // The /Delete said success but the task is still registered: the positive verification
+        // detects it and fails closed so the recovery stays pending.
+        var service = NewService(new Script
+        {
+            QueryExitCode = 0,
+            QueryXml = TaskXml(command: ExpectedCommand()),
+            MutatingExitCode = 0,
+        });
+
+        var result = await service.RemoveRegistrationAsync();
+
+        result.Succeeded.Should().BeFalse();
+        result.ActualState.Should().Be(AutostartState.Enabled);
+        result.ErrorMessage.Should().Contain("still present");
+    }
+
+    [Fact]
+    public async Task RemoveRegistration_DeleteNonZero_QueryMisconfigured_ReportsFailed_NotWeakened()
+    {
+        // The /Delete failed and the follow-up read yields a Misconfigured task (not Absent):
+        // verification invariants are never relaxed just to let the recovery report success.
+        var service = NewService(new Script
+        {
+            QueryExitCode = 0,
+            QueryXml = TaskXml(command: @"C:\Other\app.exe"),
+            MutatingExitCode = 1,
+        });
+
+        var result = await service.RemoveRegistrationAsync();
+
+        result.Succeeded.Should().BeFalse();
+        result.ActualState.Should().Be(AutostartState.Misconfigured);
+    }
+
+    [Fact]
+    public async Task RemoveRegistration_QueryUnknown_ReportsFailed()
+    {
+        // The follow-up read cannot verify Absent (access denied): fail closed, never report the
+        // removal as verified.
+        var service = NewService(new Script
+        {
+            QueryExitCode = 1,
+            QueryError = "ERROR: Access is denied.",
+            MutatingExitCode = 0,
+        });
+
+        var result = await service.RemoveRegistrationAsync();
+
+        result.Succeeded.Should().BeFalse();
+        result.ActualState.Should().Be(AutostartState.Unknown);
+        result.ErrorMessage.Should().Contain("could not be verified");
+    }
+
+    [Fact]
+    public async Task RemoveRegistration_InvocationFailure_ReportsFailed()
+    {
+        var service = NewService(new Script
+        {
+            QueryExitCode = 1,
+            QueryError = "ERROR: The system cannot find the file specified.",
+            MutatingExitCode = 0,
+            ThrowOnMutate = new InvalidOperationException("schtasks.exe could not be started"),
+        });
+
+        var result = await service.RemoveRegistrationAsync();
+
+        result.Succeeded.Should().BeFalse();
+        result.ErrorMessage.Should().Contain("schtasks.exe could not be started");
+    }
+
+    // ---------------------------------------------------------------------
     // Structured Misconfigured diagnostics via the seam (full /Query /XML -> typed state)
     // ---------------------------------------------------------------------
 

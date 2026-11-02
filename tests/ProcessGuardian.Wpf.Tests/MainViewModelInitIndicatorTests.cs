@@ -16,7 +16,8 @@ namespace ProcessGuardian.Wpf.Tests;
 
 // Boot-path regression for the A refusal/reset indicators: a refused store must surface an
 // ordinary Error indicator and gate Start off (no monitoring launch), while a pending reset
-// notice is surfaced without disabling Start (the user re-selects/re-pins the target).
+// notice is surfaced with Start gated off (the controller-owned automatic recovery runs first and
+// only a fully-verified recovery reopens the Start gate — R-AS-AUTO).
 public class MainViewModelInitIndicatorTests
 {
     private sealed class Harness
@@ -120,7 +121,7 @@ public class MainViewModelInitIndicatorTests
     }
 
     [Fact]
-    public void ResetNoticePending_SetsResetNotice_StartRemainsAvailable()
+    public void ResetNoticePending_SetsResetNotice_StartDisabledUntilRecoveryCompletes()
     {
         var vm = new Harness().CreateVm();
 
@@ -128,7 +129,9 @@ public class MainViewModelInitIndicatorTests
 
         vm.ResetNotice.Should().NotBeEmpty();
         vm.ConfigurationError.Should().BeEmpty();
-        vm.StartCommand.CanExecute(null).Should().BeTrue("after a reset the user must be able to re-select/re-pin the target");
+        vm.StartCommand.CanExecute(null).Should().BeFalse(
+            "Start must be gated off while the automatic recovery is pending (R-AS-AUTO); it reopens only " +
+            "after the controller raises RecoveryPendingChanged for a fully-verified recovery");
     }
 
     // Monitoring Card layout: the guidance row must be fully collapsed (HasStatusGuidance ==

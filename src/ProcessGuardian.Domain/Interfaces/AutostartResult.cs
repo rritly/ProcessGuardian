@@ -3,7 +3,7 @@ using ProcessGuardian.Domain.Enums;
 namespace ProcessGuardian.Domain.Interfaces;
 
 /// <summary>
-/// Outcome of an autostart enable/disable operation. <c>Succeeded</c> reports whether the
+/// Outcome of an autostart enable/disable/remove operation. <c>Succeeded</c> reports whether the
 /// requested state change was verified to have taken effect (the actual registration state
 /// matches the requested state) — never merely that a command exited cleanly or that no
 /// exception was thrown. <c>ErrorMessage</c> carries the diagnostic when the operation

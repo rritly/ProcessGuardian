@@ -13,10 +13,12 @@ using Xunit;
 
 namespace ProcessGuardian.Wpf.Tests;
 
-// Recovery-resolution and autostart-error projection in the ViewModel: the A/B actions are
-// enabled only while a reset notice is pending (option A additionally requires a recorded
-// pin), a successful resolution clears the notice, a failed one keeps it and surfaces the
-// error, and an autostart failure from a settings commit is never masked by a saved flag.
+// Recovery projection in the ViewModel (v2.5 R-AS-AUTO): a ResetNoticePending init locks the
+// autostart checkbox AND Start (the controller runs the automatic recovery and blocks Start until
+// the journal is cleared), and a RecoveryPendingChanged publication from the controller reopens
+// both — clearing the pending-notice guidance, unlocking autostart editing and enabling Start.
+// The remaining autostart-error tests cover the 2.5 rollback: an autostart failure from a
+// settings commit is never masked by a saved flag and the checkbox never reports "on" falsely.
 public class MainViewModelRecoveryTests
 {
     private sealed class Harness
@@ -24,10 +26,9 @@ public class MainViewModelRecoveryTests
         public IMonitoringController Controller { get; }
         public INotificationService Notifications { get; } = Substitute.For<INotificationService>();
 
-        public Harness(bool hasPin = false)
+        public Harness()
         {
             Controller = Substitute.For<IMonitoringController>();
-            Controller.HasRecordedPin.Returns(hasPin);
             Controller.GetCurrentSettingsAsync(Arg.Any<CancellationToken>())
                 .Returns(Task.FromResult(new AppSettings()));
             Controller.CurrentState.Returns(new MonitorState(GuardianStatus.Stopped, false, null, false));
@@ -51,149 +52,112 @@ public class MainViewModelRecoveryTests
         throw new Xunit.Sdk.XunitException($"Timed out waiting for: {failureMessage}");
     }
 
+    // ------------------------------------------------------------------
+    // 2.1 / R-AS-AUTO — pending recovery locks autostart and Start.
+    // ------------------------------------------------------------------
+
     [Fact]
-    public void ResetNoticePending_KeepDisabledWithoutPin_RemoveEnabled()
+    public void ResetNoticePending_LocksCheckboxAndStartDisabled()
     {
-        var vm = new Harness(hasPin: false).CreateVm();
+        var vm = new Harness().CreateVm();
         vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
 
         vm.ResetNotice.Should().NotBeEmpty();
-        vm.RemoveAutostartCommand.CanExecute(null).Should().BeTrue("option B needs only the pending notice");
-        vm.KeepAutostartCommand.CanExecute(null).Should().BeFalse(
-            "option A is unavailable until the target is re-selected and re-pinned");
+        vm.IsAutostartEditable.Should().BeFalse("the checkbox is locked until the automatic recovery completes");
+        vm.AutostartEffective.Should().BeFalse("no verified autostart state may be displayed while pending");
+        vm.StartCommand.CanExecute(null).Should().BeFalse(
+            "Start is disabled while the automatic recovery is pending (R-AS-AUTO)");
     }
 
     [Fact]
-    public void ResetNoticePending_KeepEnabledOncePinRecorded()
-    {
-        var vm = new Harness(hasPin: true).CreateVm();
-        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
-
-        vm.KeepAutostartCommand.CanExecute(null).Should().BeTrue();
-        vm.RemoveAutostartCommand.CanExecute(null).Should().BeTrue();
-    }
-
-    [Fact]
-    public void NoResetNotice_BothActionsDisabled()
-    {
-        var vm = new Harness(hasPin: true).CreateVm();
-
-        vm.ResetNotice.Should().BeEmpty();
-        vm.KeepAutostartCommand.CanExecute(null).Should().BeFalse();
-        vm.RemoveAutostartCommand.CanExecute(null).Should().BeFalse();
-    }
-
-    [Fact]
-    public async Task KeepAutostart_Success_ClearsResetNoticeAndError()
-    {
-        var h = new Harness(hasPin: true);
-        h.Controller.ResolveRecoveryAsync(
-                RecoveryResolutionChoice.KeepAutostart,
-                Arg.Any<CommittedSettingsSnapshot>(),
-                Arg.Any<string>(),
-                Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(RecoveryResolutionResult.Succeeded()));
-
-        var vm = h.CreateVm();
-        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
-
-        await vm.KeepAutostartCommand.ExecuteAsync(null);
-
-        vm.ResetNotice.Should().BeEmpty("a successful resolution clears the notice");
-        vm.AutostartError.Should().BeEmpty();
-    }
-
-    [Fact]
-    public async Task KeepAutostart_Failure_KeepsResetNoticeAndSurfacesError()
-    {
-        var h = new Harness(hasPin: true);
-        h.Controller.ResolveRecoveryAsync(
-                RecoveryResolutionChoice.KeepAutostart,
-                Arg.Any<CommittedSettingsSnapshot>(),
-                Arg.Any<string>(),
-                Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(RecoveryResolutionResult.Failed(
-                "autostart could not be enabled: task creation failed (exit 1)")));
-
-        var vm = h.CreateVm();
-        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
-
-        await vm.KeepAutostartCommand.ExecuteAsync(null);
-
-        vm.ResetNotice.Should().NotBeEmpty("a failed resolution must keep the notice pending and retryable");
-        vm.AutostartError.Should().Contain("exit 1");
-    }
-
-    // R-tray: a successful, fully-verified recovery resolution clears the persistent reset notice
-    // and must also signal the composition root to clear the stale tray "reset now" notice
-    // (RecoveryNoticeCleared), so the tray tooltip returns to its standard status text.
-    [Fact]
-    public async Task Resolution_Success_RaisesRecoveryNoticeCleared()
-    {
-        var h = new Harness(hasPin: true);
-        h.Controller.ResolveRecoveryAsync(
-                RecoveryResolutionChoice.KeepAutostart,
-                Arg.Any<CommittedSettingsSnapshot>(),
-                Arg.Any<string>(),
-                Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(RecoveryResolutionResult.Succeeded()));
-
-        var vm = h.CreateVm();
-        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
-
-        var cleared = 0;
-        vm.RecoveryNoticeCleared += (_, __) => cleared++;
-
-        await vm.KeepAutostartCommand.ExecuteAsync(null);
-
-        vm.ResetNotice.Should().BeEmpty();
-        cleared.Should().Be(1, "a successful resolution must fire the recovery-notice-cleared signal once");
-    }
-
-    // R-tray: a failed resolution leaves the reset notice pending and must NOT signal that the
-    // tray notice should be cleared — the stale "reset now" tray notice stays until a real success.
-    [Fact]
-    public async Task Resolution_Failure_DoesNotRaiseRecoveryNoticeCleared()
-    {
-        var h = new Harness(hasPin: true);
-        h.Controller.ResolveRecoveryAsync(
-                RecoveryResolutionChoice.KeepAutostart,
-                Arg.Any<CommittedSettingsSnapshot>(),
-                Arg.Any<string>(),
-                Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(RecoveryResolutionResult.Failed(
-                "autostart could not be enabled: task creation failed (exit 1)")));
-
-        var vm = h.CreateVm();
-        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
-
-        var cleared = 0;
-        vm.RecoveryNoticeCleared += (_, __) => cleared++;
-
-        await vm.KeepAutostartCommand.ExecuteAsync(null);
-
-        vm.ResetNotice.Should().NotBeEmpty("the notice stays pending after a failed resolution");
-        cleared.Should().Be(0, "a failed resolution must never signal the tray notice to be cleared");
-    }
-
-    [Fact]
-    public async Task RemoveAutostart_Success_ClearsResetNotice()
+    public void RecoveryPendingChanged_UnlocksAutostartAndStart_ClearsNotice()
     {
         var h = new Harness();
-        h.Controller.ResolveRecoveryAsync(
-                RecoveryResolutionChoice.RemoveAutostart,
-                Arg.Any<CommittedSettingsSnapshot>(),
-                Arg.Any<string>(),
-                Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(RecoveryResolutionResult.Succeeded()));
-
         var vm = h.CreateVm();
         vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+        vm.IsAutostartEditable.Should().BeFalse();
+        vm.StartCommand.CanExecute(null).Should().BeFalse();
 
-        await vm.RemoveAutostartCommand.ExecuteAsync(null);
+        // The controller raised RecoveryPendingChanged after a fully-verified recovery: the pending
+        // gate reopens — the notice clears, autostart editing unlocks and Start becomes available.
+        h.Controller.RecoveryPendingChanged += Raise.Event();
 
-        vm.ResetNotice.Should().BeEmpty();
+        vm.ResetNotice.Should().BeEmpty("a completed automatic recovery clears the pending-notice guidance");
         vm.AutostartError.Should().BeEmpty();
+        vm.IsAutostartEditable.Should().BeTrue("the autostart checkbox unlocks once the recovery completes");
+        vm.StartCommand.CanExecute(null).Should().BeTrue(
+            "once the recovery settles, the Start gate reopens and the target can be selected/started");
+    }
+
+    // ------------------------------------------------------------------
+    // 2.1 — checkbox locked while a reset notice is pending.
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void ResetNoticePending_LocksAutostartCheckbox_ShowsNoVerifiedState()
+    {
+        var vm = new Harness().CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+
+        vm.IsAutostartEditable.Should().BeFalse("the checkbox is locked until the automatic recovery completes");
+        vm.AutostartEffective.Should().BeFalse("no verified autostart state may be displayed while pending");
+    }
+
+    // ------------------------------------------------------------------
+    // 2.5 — checkbox follows the controller's verified actual state; Unknown/Error is
+    // never shown as verified-off, and a failed enable reverts the checkbox without loops.
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void AutostartStateChanged_Enabled_ChecksCheckbox()
+    {
+        var h = new Harness();
+        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
+        var vm = h.CreateVm();
+
+        h.Controller.AutostartStateChanged += Raise.Event();
+
+        vm.AutostartEffective.Should().BeTrue("the checkbox reflects the verified enabled registration");
+        vm.AutostartError.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void AutostartStateChanged_Unknown_NeverShowsVerifiedOffAndSurfacesError()
+    {
+        var h = new Harness();
+        h.Controller.AutostartActualState.Returns(AutostartState.Unknown);
+        h.Controller.AutostartSyncError.Returns(
+            "the autostart registration state could not be verified; no change was made");
+        var vm = h.CreateVm();
+
+        h.Controller.AutostartStateChanged += Raise.Event();
+
+        vm.AutostartEffective.Should().BeFalse("Unknown must not be displayed as a verified-off checkbox");
+        vm.AutostartError.Should().NotBeEmpty("the startup-sync error must be surfaced in the UI");
+        h.Notifications.Received(1).ShowAsync(
+            Arg.Is<string>(t => t == "Autostart Error"),
+            Arg.Is<string>(m => m.Contains("could not be verified")),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public void AutostartStateChanged_Enabled_AfterSync_ClearsStartupSyncError()
+    {
+        var h = new Harness();
+        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
+        h.Controller.AutostartSyncError.Returns((string?)null);
+        var vm = h.CreateVm();
+
+        // First a failure was published; then a verified state resets the error.
+        h.Controller.AutostartSyncError.Returns("previous error");
+        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
+        h.Controller.AutostartStateChanged += Raise.Event();
+        vm.AutostartError.Should().Contain("previous error");
+
+        // Re-publish with no error.
+        h.Controller.AutostartSyncError.Returns((string?)null);
+        h.Controller.AutostartStateChanged += Raise.Event();
+        vm.AutostartError.Should().BeEmpty("a verified state clears the stale startup-sync error");
     }
 
     [Fact]
@@ -261,77 +225,6 @@ public class MainViewModelRecoveryTests
         // the user's own toggle reaches the controller — no save loop.
         await Task.Delay(700); // ample room for any spurious debounce to fire
         commitCount.Should().Be(1, "the failed-enable revert must not schedule a save loop");
-    }
-
-    // ------------------------------------------------------------------
-    // 2.1 — checkbox locked while a reset notice is pending.
-    // ------------------------------------------------------------------
-
-    [Fact]
-    public void ResetNoticePending_LocksAutostartCheckbox_ShowsNoVerifiedState()
-    {
-        var vm = new Harness(hasPin: false).CreateVm();
-        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
-
-        vm.IsAutostartEditable.Should().BeFalse("the checkbox is locked until the recovery resolution completes");
-        vm.AutostartEffective.Should().BeFalse("no verified autostart state may be displayed while pending");
-    }
-
-    // ------------------------------------------------------------------
-    // 2.5 — checkbox follows the controller's verified actual state; Unknown/Error is
-    // never shown as verified-off, and a failed enable reverts the checkbox without loops.
-    // ------------------------------------------------------------------
-
-    [Fact]
-    public void AutostartStateChanged_Enabled_ChecksCheckbox()
-    {
-        var h = new Harness();
-        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
-        var vm = h.CreateVm();
-
-        h.Controller.AutostartStateChanged += Raise.Event();
-
-        vm.AutostartEffective.Should().BeTrue("the checkbox reflects the verified enabled registration");
-        vm.AutostartError.Should().BeEmpty();
-    }
-
-    [Fact]
-    public void AutostartStateChanged_Unknown_NeverShowsVerifiedOffAndSurfacesError()
-    {
-        var h = new Harness();
-        h.Controller.AutostartActualState.Returns(AutostartState.Unknown);
-        h.Controller.AutostartSyncError.Returns(
-            "the autostart registration state could not be verified; no change was made");
-        var vm = h.CreateVm();
-
-        h.Controller.AutostartStateChanged += Raise.Event();
-
-        vm.AutostartEffective.Should().BeFalse("Unknown must not be displayed as a verified-off checkbox");
-        vm.AutostartError.Should().NotBeEmpty("the startup-sync error must be surfaced in the UI");
-        h.Notifications.Received(1).ShowAsync(
-            Arg.Is<string>(t => t == "Autostart Error"),
-            Arg.Is<string>(m => m.Contains("could not be verified")),
-            Arg.Any<CancellationToken>());
-    }
-
-    [Fact]
-    public void AutostartStateChanged_Enabled_AfterSync_ClearsStartupSyncError()
-    {
-        var h = new Harness();
-        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
-        h.Controller.AutostartSyncError.Returns((string?)null);
-        var vm = h.CreateVm();
-
-        // First a failure was published; then a verified state resets the error.
-        h.Controller.AutostartSyncError.Returns("previous error");
-        h.Controller.AutostartActualState.Returns(AutostartState.Enabled);
-        h.Controller.AutostartStateChanged += Raise.Event();
-        vm.AutostartError.Should().Contain("previous error");
-
-        // Re-publish with no error.
-        h.Controller.AutostartSyncError.Returns((string?)null);
-        h.Controller.AutostartStateChanged += Raise.Event();
-        vm.AutostartError.Should().BeEmpty("a verified state clears the stale startup-sync error");
     }
 
     [Fact]

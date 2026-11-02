@@ -283,6 +283,51 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             actual);
     }
 
+    // Recovery primitive (v2.5 R-AS-AUTO): unconditional, verified removal of the app-owned
+    // task. Unlike SetEnabledAsync(false), it does NOT gate the delete behind a pre-query: the
+    // recovery policy is always "task absent", so the exact app-owned task name is deleted
+    // directly, and only then is the actual state positively verified as Absent. A nonzero
+    // delete is never proof of either outcome (the task may already be gone, access may be
+    // denied): only a follow-up read that confirms Absent reports success. Unknown / still
+    // present / Misconfigured all fail closed so the recovery stays pending. This method never
+    // enables a registration and never touches anything but the exact app-owned task name.
+    public async Task<AutostartResult> RemoveRegistrationAsync(CancellationToken ct = default)
+    {
+        var delete = await RunSchTasksAsync(BuildDeleteArguments(), ct).ConfigureAwait(false);
+        if (delete.InvocationFailed)
+        {
+            LogCommandFailure("delete", delete);
+            return AutostartResult.Failure(
+                $"task deletion failed: {delete.InvocationException!.GetType().Name}: {delete.InvocationException.Message}",
+                AutostartState.Unknown);
+        }
+
+        // A nonzero /Delete exit code alone proves nothing (not-found is expected when the task was
+        // already removed by a previous, interrupted recovery). The exit code is recorded for
+        // diagnostics; success is decided only by the positive Absent verification below.
+        if (delete.ExitCode != 0)
+            LogCommandFailure("delete", delete);
+        else
+            _logger.LogInformation("Autostart task delete command reported success (exit 0); verifying actual absence");
+
+        // Positive verification: /Delete's exit code does not prove the task is gone. Query the
+        // machine-readable XML state and require Absent; Unknown/access/service/other failures and
+        // a still-present or Misconfigured task all keep the recovery pending (fail-closed).
+        var (actual, _) = await ReadStateDetailedAsync(ct).ConfigureAwait(false);
+        if (actual == AutostartState.Absent)
+        {
+            _logger.LogInformation("Autostart task removal verified; the task is absent");
+            return AutostartResult.Success(AutostartState.Absent);
+        }
+
+        _logger.LogWarning("Autostart task removal could not be verified (actual state: {Actual}); recovery stays pending", actual);
+        return AutostartResult.Failure(
+            actual == AutostartState.Unknown
+                ? "the autostart task removal could not be verified; the state is unknown"
+                : $"the autostart task is still present after the delete (state: {actual})",
+            actual);
+    }
+
     // ---------------------------------------------------------------------
     // Typed configuration evaluation (machine-readable task XML, not localized text parsing)
     // ---------------------------------------------------------------------

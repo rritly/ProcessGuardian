@@ -115,6 +115,41 @@ public sealed class RegistryAutostartService : IAutostartService
             actual);
     }
 
+    // Recovery primitive (v2.5 R-AS-AUTO): unconditional, verified removal of the app-owned HKCU
+    // Run value. Unlike SetEnabledAsync(false), it does not gate the delete behind a pre-query:
+    // the recovery policy is always "absent", so the exact app-owned value name is deleted
+    // directly, and then the actual state is positively verified as Absent. A value that was
+    // already absent (a previous, interrupted recovery) is still verified, not assumed from the
+    // delete call. Unknown / still-present states fail closed so the recovery stays pending.
+    public async Task<AutostartResult> RemoveRegistrationAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(_registryPath, true);
+            if (key is not null)
+                key.DeleteValue(KeyName, false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to delete the autostart registry value");
+            return AutostartResult.Failure(
+                $"an error occurred while removing the autostart registry value: {ex.Message}",
+                AutostartState.Unknown);
+        }
+
+        var actual = await ReadStateAsync(ct).ConfigureAwait(false);
+        if (actual == AutostartState.Absent)
+            return AutostartResult.Success(AutostartState.Absent);
+        if (actual == AutostartState.Unknown)
+            return AutostartResult.Failure(
+                "the removal completed but the resulting autostart state could not be verified",
+                AutostartState.Unknown);
+
+        return AutostartResult.Failure(
+            "the autostart registry value is still present after the removal",
+            actual);
+    }
+
     // The expected Run value is "\"<currentExe>\" --background". A value that does not point at
     // the running executable (a moved/old install, or a foreign entry) is Misconfigured.
     internal static bool MatchesExpected(string value)
