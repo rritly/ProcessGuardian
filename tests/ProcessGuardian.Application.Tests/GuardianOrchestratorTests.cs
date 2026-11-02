@@ -1003,6 +1003,51 @@ public class GuardianOrchestratorTests
         _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
     }
 
+    // R-A2: a ConfigurationUnavailableException thrown by the post-init LoadAsync (not by
+    // InitializeAsync) must also flip the controller-level refusal flag — the one R-A1 branch that was
+    // still observable-as-refused. After the load-time refusal every mutation entry point stays
+    // blocked: no SaveAsync, no autostart mutation, no hash read, no process start and no session.
+    [Fact]
+    public async Task LoadThrowsConfigurationUnavailable_ObservableAsRefused_MutationsBlocked()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<AppSettings>(new ConfigurationUnavailableException(
+                "refused", "An administrator must repair the elevated configuration.")));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeFalse();
+
+        // CommitSettingsAsync is rejected: no settings write reaches the store.
+        var commit = await controller.CommitSettingsAsync(
+            CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = true }), @"C:\app.exe");
+        commit.Saved.Should().BeFalse();
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+
+        // Start is rejected before any hash read and before any autostart mutation or process launch.
+        var start = await controller.StartAsync(h.Request());
+        start.Started.Should().BeFalse();
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Integrity.DidNotReceive().ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        // Recovery resolution is rejected: no autostart mutation on an unavailable store.
+        var recovery = await controller.ResolveRecoveryAsync(RecoveryResolutionChoice.RemoveAutostart, null);
+        recovery.Resolved.Should().BeFalse();
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+
+        // Stop does not persist and touches no autostart; a stopped session cannot be started.
+        await controller.StopAsync();
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+    }
+
     // R-autostart rollback: a failed autostart ENABLE on a settings commit must not leave a stale
     // AutostartEnabled=true in the persisted config or the controller's committed snapshot — a
     // later launch (or a follow-up persist from the committed state) would repeat the failed

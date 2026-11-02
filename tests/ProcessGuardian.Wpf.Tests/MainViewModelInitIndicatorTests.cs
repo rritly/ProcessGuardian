@@ -87,6 +87,8 @@ public class MainViewModelInitIndicatorTests
 
         vm.IsTargetPathEditable.Should().BeFalse("the target path must not be editable after a refusal");
         vm.IsAutostartEditable.Should().BeFalse("the autostart checkbox must be locked after a refusal");
+        vm.IsSettingsEditable.Should().BeFalse(
+            "every settings control is disabled after a refusal — numeric fields and EnableToasts too (R-A2)");
         vm.StartCommand.CanExecute(null).Should().BeFalse();
         vm.StopCommand.CanExecute(null).Should().BeFalse();
         vm.Status.Should().Be(GuardianStatus.Error);

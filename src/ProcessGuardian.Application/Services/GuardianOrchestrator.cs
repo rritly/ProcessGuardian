@@ -197,7 +197,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             {
                 _logger.LogError(ex, "Configuration unavailable at startup; monitoring will not run");
                 // A refused/unavailable configuration is Error with a reason, never degraded:
-                // IsDegraded is reserved for active session states (R-F).
+                // IsDegraded is reserved for active session states (R-F). The controller-level
+                // refusal flag is set here too, exactly like the InitializeAsync branches, so every
+                // mutation entry point (CommitSettings/Start/Stop/Suspend/recovery) is blocked for
+                // a load-time refusal as well — not only for an initialization refusal (R-A2).
+                _configRefused = true;
                 Publish(new MonitorState(GuardianStatus.Error, false, ex.Guidance ?? "Configuration is unavailable", false));
                 return;
             }

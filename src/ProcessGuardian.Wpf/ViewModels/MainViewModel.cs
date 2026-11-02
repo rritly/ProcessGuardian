@@ -58,6 +58,7 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(StartCommand))]
     [NotifyPropertyChangedFor(nameof(HasStatusGuidance))]
+    [NotifyPropertyChangedFor(nameof(IsSettingsEditable))]
     private string _configurationError = string.Empty;
 
     [ObservableProperty]
@@ -334,6 +335,12 @@ public partial class MainViewModel : ObservableObject
     public bool IsTargetPathEditable =>
         Status is GuardianStatus.Stopped or GuardianStatus.Error
         && string.IsNullOrEmpty(ConfigurationError);
+
+    // R-A2: every settings control is genuinely disabled while the configuration store is
+    // refused, so no numeric field or toast toggle remains editable (and thus schedulable for a
+    // persistence commit) in a refused state. Numeric settings stay editable during active
+    // monitoring per C+D; only a refused/unsafe configuration locks the whole Settings card.
+    public bool IsSettingsEditable => string.IsNullOrEmpty(ConfigurationError);
 
     // Explicitly commits the TextBox draft as the controller-owned committed path (called on
     // focus-lost / commit command; Browse commits directly). Only a committed path change is

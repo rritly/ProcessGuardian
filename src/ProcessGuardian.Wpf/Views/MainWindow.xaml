@@ -664,6 +664,7 @@
                     <TextBox Grid.Column="1" Width="33" Height="19"
                              Style="{StaticResource MiniBoxStyle}"
                              VerticalAlignment="Center"
+                             IsEnabled="{Binding IsSettingsEditable}"
                              Text="{Binding Settings.CheckIntervalSeconds, Mode=TwoWay, ValidatesOnExceptions=True, UpdateSourceTrigger=PropertyChanged}" />
                     <TextBlock Grid.Column="2" Text="Verify timeout (s)"
                                Margin="27,0,0,0" VerticalAlignment="Center"
@@ -671,6 +672,7 @@
                     <TextBox Grid.Column="3" Width="33" Height="19"
                              Style="{StaticResource MiniBoxStyle}"
                              VerticalAlignment="Center"
+                             IsEnabled="{Binding IsSettingsEditable}"
                              Text="{Binding Settings.StartupVerificationTimeoutSeconds, Mode=TwoWay, ValidatesOnExceptions=True, UpdateSourceTrigger=PropertyChanged}" />
                     <TextBlock Grid.Column="4" Text="Max restart attempts"
                                Margin="26,0,0,0" VerticalAlignment="Center"
@@ -678,6 +680,7 @@
                     <TextBox Grid.Column="5" Width="33" Height="19" Margin="-3,0,0,0"
                              Style="{StaticResource MiniBoxStyle}"
                              VerticalAlignment="Center"
+                             IsEnabled="{Binding IsSettingsEditable}"
                              Text="{Binding Settings.MaxRestartAttempts, Mode=TwoWay, ValidatesOnExceptions=True, UpdateSourceTrigger=PropertyChanged}" />
                 </Grid>
 
@@ -697,6 +700,7 @@
                     <TextBox Grid.Column="1" Width="33" Height="19"
                              Style="{StaticResource MiniBoxStyle}"
                              VerticalAlignment="Center"
+                             IsEnabled="{Binding IsSettingsEditable}"
                              Text="{Binding Settings.InitialDelaySeconds, Mode=TwoWay, ValidatesOnExceptions=True, UpdateSourceTrigger=PropertyChanged}" />
                     <TextBlock Grid.Column="2" Text="Restart delay (s)"
                                Margin="27,0,0,0" VerticalAlignment="Center"
@@ -704,6 +708,7 @@
                     <TextBox Grid.Column="3" Width="33" Height="19"
                              Style="{StaticResource MiniBoxStyle}"
                              VerticalAlignment="Center"
+                             IsEnabled="{Binding IsSettingsEditable}"
                              Text="{Binding Settings.RestartDelaySeconds, Mode=TwoWay, ValidatesOnExceptions=True, UpdateSourceTrigger=PropertyChanged}" />
                     <TextBlock Grid.Column="4" Text="Autostart with Windows"
                                Margin="26,-1,0,0" VerticalAlignment="Center"
@@ -758,6 +763,7 @@
                           Margin="1,0,0,0"
                           VerticalAlignment="Center"
                           Style="{StaticResource DarkCheckBoxStyle}"
+                          IsEnabled="{Binding IsSettingsEditable}"
                           IsChecked="{Binding Settings.EnableToasts, Mode=TwoWay}" />
 
                 <TextBlock Text="status"
