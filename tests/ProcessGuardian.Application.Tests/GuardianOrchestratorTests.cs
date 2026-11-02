@@ -1124,6 +1124,87 @@ public class GuardianOrchestratorTests
             "a disable failure must keep the persisted AutostartEnabled=false (the requested off state)");
     }
 
+    // R-AS-TXN §4.2 #1: a failed initial settings save must never be followed by an autostart
+    // side effect based on an uncommitted desired value — the external task is only touched after
+    // a confirmed settings write.
+    [Fact]
+    public async Task CommitSettings_InitialSaveFails_AutostartNeverCalled_NotSaved()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException(new InvalidOperationException("disk full")));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = true });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        result.Saved.Should().BeFalse("the initial settings save failed, so the commit is not persisted");
+        // The external scheduled task is never mutated on the back of a failed settings save.
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
+    }
+
+    // R-AS-TXN §4.2 #3: initial save succeeds, enable fails, but the compensating rollback save
+    // ALSO fails — the commit must NOT report a fully persisted outcome. It stays Saved=false (not
+    // silently converted to "saved"), the autostart failure is still distinguishable, the in-memory
+    // committed intent is reverted to false, and a later Stop persists false (not the stale true).
+    [Fact]
+    public async Task CommitSettings_EnableFails_RollbackSaveFails_NotReportedSaved_InMemoryFalse()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Autostart.SetEnabledAsync(true, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(AutostartResult.Failure(
+                "task registration failed (exit 1)", AutostartState.Absent)));
+
+        // Reconcile performs no save for an off/empty doc, so within CommitSettingsAsync the save
+        // order is: #1 initial (AutostartEnabled=true), #2 compensating rollback (false). The
+        // rollback (#2) is rejected; the subsequent Stop save (#3) succeeds.
+        var savedDocs = new List<AppSettings>();
+        var saveCalls = 0;
+        h.Config.SaveAsync(Arg.Do<AppSettings>(d =>
+        {
+            savedDocs.Add(d);
+            saveCalls++;
+            if (saveCalls == 2)
+                throw new InvalidOperationException("rollback write failed");
+        }), Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings
+        {
+            AutostartEnabled = true,
+            CheckIntervalSeconds = 5,
+            EnableToasts = false,
+        });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        // The rollback save failed: the commit is NOT reported as fully persisted.
+        result.Saved.Should().BeFalse(
+            "the final rollback save failed, so the commit must not report a persisted outcome");
+        // The autostart failure is still carried, distinguishing this from a plain initial-save
+        // failure (which carries no autostart outcome).
+        result.Autostart.Should().NotBeNull("the autostart failure stays distinguishable");
+        result.Autostart!.Value.Succeeded.Should().BeFalse();
+
+        _ = h.Autostart.Received(1).SetEnabledAsync(true, Arg.Any<CancellationToken>());
+
+        // The in-memory controller intent was reverted to false despite the rollback-save failure:
+        // a follow-up Stop persists false, not the stale true.
+        var stop = await controller.StopAsync();
+        stop.RuntimeStopped.Should().BeTrue();
+        savedDocs.Last().AutostartEnabled.Should().BeFalse(
+            "the committed snapshot must keep AutostartEnabled=false even though the rollback save failed");
+    }
+
     [Fact]
     public async Task Reconcile_EmptyPin_EditionScoped()
     {

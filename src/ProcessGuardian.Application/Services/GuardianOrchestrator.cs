@@ -350,30 +350,47 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 _latestPin = string.Empty; // a committed path change clears the pin through the controller
             }
 
+            // 1) Initial settings save. A failed initial save must NOT be followed by an autostart
+            //    side effect based on an uncommitted desired value (R-AS-TXN): the external
+            //    scheduled task is only touched after a confirmed settings write.
             var saved = await PersistEnabledAsync(enabled: sessionActive, ct).ConfigureAwait(false);
             if (!sessionActive && saved)
                 Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
+            if (!saved)
+                return CommitSettingsResult.SaveFailed();
 
-            // The autostart result is surfaced with the commit so a registration failure is
-            // never masked by a successful settings save (the UI shows the error explicitly).
+            // 2) Autostart sync only after a successful initial save. The autostart result is
+            //    surfaced with the commit so a registration failure is never masked by a successful
+            //    settings save (the UI shows the error explicitly).
             var autostart = await SyncAutostartAsync(snapshot.AutostartEnabled, ct).ConfigureAwait(false);
 
-            // [R-autostart rollback] A requested enable that the scheduler rejected must not leave
-            // a stale AutostartEnabled=true in the persisted config or the committed snapshot: a
-            // later launch would repeat the failed registration. Revert both to the value the UI
-            // also reverts its checkbox to (false) and re-persist as one consistent rollback — this
-            // is a re-persist of the corrected flag, never a fresh enable attempt. The autostart
-            // failure itself is still surfaced, not masked.
+            // 3) [R-AS-TXN rollback] A requested enable that the scheduler rejected must not leave
+            //    a stale AutostartEnabled=true in the persisted config or the committed snapshot: a
+            //    later launch would repeat the failed registration. Revert both to the value the UI
+            //    also reverts its checkbox to (false) and re-persist as one consistent rollback —
+            //    this is a re-persist of the corrected flag, never a fresh enable attempt. The
+            //    compensating save result is checked: if the rollback save itself fails, the commit
+            //    must NOT claim a fully persisted outcome (entity exception 3), the in-memory intent
+            //    stays at the safe desired value false, and the failure is surfaced (not the disk's
+            //    true, which we cannot confirm was rewritten). The autostart failure itself is still
+            //    surfaced, not masked.
             if (autostart is { Succeeded: false } && snapshot.AutostartEnabled)
             {
                 _committed = snapshot with { AutostartEnabled = false };
-                if (saved)
-                    await PersistEnabledAsync(enabled: sessionActive, ct).ConfigureAwait(false);
+                var rollbackSaved = await PersistEnabledAsync(enabled: sessionActive, ct).ConfigureAwait(false);
+                if (!rollbackSaved)
+                {
+                    _logger.LogError("Settings commit: autostart enable failed and the rollback persistence of AutostartEnabled=false also failed; in-memory intent retained as false, disk not confirmed false");
+                    // Not persisted, but the autostart failure is still carried so the caller can
+                    // distinguish "rollback save failed" (Saved=false + an autostart failure) from
+                    // a plain initial-save failure (Saved=false, no autostart outcome).
+                    return new CommitSettingsResult(false, autostart);
+                }
+                _logger.LogWarning("Settings commit: autostart enable failed; persisted intent reverted to AutostartEnabled=false");
+                return CommitSettingsResult.Persisted(autostart);
             }
 
-            return saved
-                ? CommitSettingsResult.Persisted(autostart)
-                : CommitSettingsResult.SaveFailed();
+            return CommitSettingsResult.Persisted(autostart);
         }
         finally
         {
