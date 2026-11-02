@@ -23,16 +23,90 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     {
     }
 
-    // Internal seam so CI can script schtasks.exe results (exit code, output, exceptions)
-    // without touching the real scheduled-task store; production leaves it null and runs
-    // the real process.
+    // Internal seam so CI can script schtasks.exe results (exit code, stdout, stderr, invocation
+    // exception) without touching the real scheduled-task store; production leaves it null and
+    // runs the real process.
     internal ScheduledTaskAutostartService(ILogger<ScheduledTaskAutostartService> logger, SchTasksInvoker? invoker)
     {
         _logger = logger;
         _invoker = invoker;
     }
 
-    internal delegate Task<(int ExitCode, string Output)> SchTasksInvoker(string arguments, CancellationToken ct);
+    internal delegate Task<SchTasksCommandResult> SchTasksInvoker(string arguments, CancellationToken ct);
+
+    /// <summary>
+    /// A single schtasks.exe invocation outcome that keeps exit code, stdout and stderr separate
+    /// so they are never collapsed before diagnostic recording/classification (v2.5 R-AS-DIAG).
+    /// A non-null <see cref="InvocationException"/> means the executable could not be started at
+    /// all; it is a failure result, never a silent throw.
+    /// </summary>
+    internal readonly record struct SchTasksCommandResult(
+        int ExitCode,
+        string StandardOutput,
+        string StandardError,
+        Exception? InvocationException)
+    {
+        // Per-stream cap for diagnostic captures so a hostile or huge output can never flood the
+        // log. A full exported task XML is never logged, even when bounded.
+        internal const int MaxStreamChars = 4096;
+
+        public bool InvocationFailed => InvocationException is not null;
+
+        // Combined text used ONLY for classification (the "not found"/"access denied"/"service
+        // unavailable" markers can be written to either stdout or stderr). The raw streams are
+        // kept separate for diagnostic capture and logging; this does not merge the stored values.
+        public string Text => $"{StandardOutput}{Environment.NewLine}{StandardError}".Trim();
+
+        // Bounded diagnostic text (each stream capped independently) for failure messages.
+        public string BoundedText
+        {
+            get
+            {
+                var stdout = Bound(StandardOutput);
+                var stderr = Bound(StandardError);
+                if (string.IsNullOrEmpty(stdout))
+                    return stderr;
+                if (string.IsNullOrEmpty(stderr))
+                    return stdout;
+                return $"{stdout} {stderr}";
+            }
+        }
+
+        internal static string Bound(string? value, int maxChars = MaxStreamChars)
+        {
+            if (string.IsNullOrEmpty(value))
+                return string.Empty;
+            return value.Length <= maxChars
+                ? value
+                : value[..maxChars] + $"...[truncated at {maxChars}]";
+        }
+    }
+
+    /// <summary>Distinct, fail-closed classifications of a nonzero command result.</summary>
+    internal enum SchTasksQueryFailure
+    {
+        None,
+        InvocationFailure,
+        MissingTask,
+        AccessDenied,
+        ServiceUnavailable,
+        Unknown,
+    }
+
+    internal static SchTasksQueryFailure ClassifyQueryResult(SchTasksCommandResult result)
+    {
+        if (result.InvocationFailed)
+            return SchTasksQueryFailure.InvocationFailure;
+        if (result.ExitCode == 0)
+            return SchTasksQueryFailure.None;
+        if (LooksLikeMissingTask(result.Text))
+            return SchTasksQueryFailure.MissingTask;
+        if (LooksLikeAccessDenied(result.Text))
+            return SchTasksQueryFailure.AccessDenied;
+        if (LooksLikeServiceUnavailable(result.Text))
+            return SchTasksQueryFailure.ServiceUnavailable;
+        return SchTasksQueryFailure.Unknown;
+    }
 
     // The expected <Command> of the autostart task: the current executable. A task that points
     // at a different (e.g. moved, old) install path is Misconfigured, not Enabled.
@@ -52,13 +126,23 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     /// </summary>
     internal async Task<(AutostartState State, TaskDescriptor? Descriptor)> ReadStateDetailedAsync(CancellationToken ct = default)
     {
-        var (exitCode, output) = await RunSchTasksAsync(BuildQueryXmlArguments(), ct).ConfigureAwait(false);
-        if (exitCode == 0)
+        var query = await RunSchTasksAsync(BuildQueryXmlArguments(), ct).ConfigureAwait(false);
+        if (query.InvocationFailed)
         {
-            var config = ParseTaskXml(output);
+            LogCommandFailure("query-xml", query);
+            return (AutostartState.Unknown, null);
+        }
+
+        if (query.ExitCode == 0)
+        {
+            var config = ParseTaskXml(query.StandardOutput);
             if (config is null)
             {
-                _logger.LogWarning("Autostart task query succeeded but the task XML could not be parsed");
+                // Exit 0 but the XML is unparsable/unverifiable: a task we cannot describe is a
+                // task we cannot call enabled — fail-closed Unknown, never Absent.
+                _logger.LogWarning(
+                    "Autostart task query succeeded but the task XML could not be parsed; stderr: {Stderr}",
+                    SchTasksCommandResult.Bound(query.StandardError));
                 return (AutostartState.Unknown, null);
             }
 
@@ -69,16 +153,35 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         }
 
         // A nonzero /Query exit code is NOT proof the task is absent: schtasks returns nonzero
-        // for a missing task, for access-denied, and for other query failures alike. Only a
-        // clean "task not found" result is Absent; every other failure is Unknown so the caller
-        // can never mistake a read error for a verified "off" registration.
-        if (LooksLikeMissingTask(output))
-            return (AutostartState.Absent, null);
-
-        _logger.LogWarning(
-            "Autostart task query failed (exit {Code}) and the cause is not a clean missing task; state cannot be verified",
-            exitCode);
-        return (AutostartState.Unknown, null);
+        // for a missing task, for access-denied, and for other query failures alike. Only a clean
+        // "task not found" result is Absent; access denied, an unavailable Task Scheduler
+        // service, an invocation failure, malformed XML and any unknown cause all classify as
+        // Unknown so the caller can never mistake a read error for a verified "off" registration
+        // (v2.5 R-AS-DIAG). The precise cause is recorded to the log first, never lost.
+        switch (ClassifyQueryResult(query))
+        {
+            case SchTasksQueryFailure.MissingTask:
+                _logger.LogInformation(
+                    "Autostart task not found (exit {Code}); stdout: {StdOut}; stderr: {StdErr}",
+                    query.ExitCode,
+                    SchTasksCommandResult.Bound(query.StandardOutput),
+                    SchTasksCommandResult.Bound(query.StandardError));
+                return (AutostartState.Absent, null);
+            case SchTasksQueryFailure.AccessDenied:
+                LogCommandFailure("query-xml", query);
+                _logger.LogWarning("Autostart task query indicated access was denied; state cannot be verified");
+                return (AutostartState.Unknown, null);
+            case SchTasksQueryFailure.ServiceUnavailable:
+                LogCommandFailure("query-xml", query);
+                _logger.LogWarning("Autostart task query indicated the Task Scheduler service is unavailable; state cannot be verified");
+                return (AutostartState.Unknown, null);
+            default:
+                LogCommandFailure("query-xml", query);
+                _logger.LogWarning(
+                    "Autostart task query failed (exit {Code}) and the cause is not a clean missing task; state cannot be verified",
+                    query.ExitCode);
+                return (AutostartState.Unknown, null);
+        }
     }
 
     // Per-check diagnostic for a Misconfigured task: which field, what was expected, what was
@@ -120,12 +223,18 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                 return AutostartResult.Failure("the current executable path is unavailable for the autostart task", state);
             }
 
-            var (code, output) = await RunSchTasksAsync(BuildCreateArguments(exePath), ct).ConfigureAwait(false);
-            if (code != 0)
+            var create = await RunSchTasksAsync(BuildCreateArguments(exePath), ct).ConfigureAwait(false);
+            if (create.InvocationFailed)
             {
-                // A nonzero exit code is an operation error; the diagnostic must not be lost.
-                _logger.LogError("Failed to create autostart task (exit {Code}): {Output}", code, output);
-                return AutostartResult.Failure($"task creation failed (exit {code}): {output}", state);
+                LogCommandFailure("create", create);
+                return AutostartResult.Failure(
+                    $"task creation failed: {create.InvocationException!.GetType().Name}: {create.InvocationException.Message}",
+                    state);
+            }
+            if (create.ExitCode != 0)
+            {
+                LogCommandFailure("create", create);
+                return AutostartResult.Failure($"task creation failed (exit {create.ExitCode}): {create.BoundedText}", state);
             }
         }
         else
@@ -133,11 +242,18 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             if (state == AutostartState.Absent)
                 return AutostartResult.Success(AutostartState.Absent);
 
-            var (deleteCode, deleteOutput) = await RunSchTasksAsync(BuildDeleteArguments(), ct).ConfigureAwait(false);
-            if (deleteCode != 0)
+            var delete = await RunSchTasksAsync(BuildDeleteArguments(), ct).ConfigureAwait(false);
+            if (delete.InvocationFailed)
             {
-                _logger.LogError("Failed to delete autostart task (exit {Code}): {Output}", deleteCode, deleteOutput);
-                return AutostartResult.Failure($"task deletion failed (exit {deleteCode}): {deleteOutput}", state);
+                LogCommandFailure("delete", delete);
+                return AutostartResult.Failure(
+                    $"task deletion failed: {delete.InvocationException!.GetType().Name}: {delete.InvocationException.Message}",
+                    state);
+            }
+            if (delete.ExitCode != 0)
+            {
+                LogCommandFailure("delete", delete);
+                return AutostartResult.Failure($"task deletion failed (exit {delete.ExitCode}): {delete.BoundedText}", state);
             }
         }
 
@@ -336,6 +452,54 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             || t.Contains("指定されたファイルが見つかりません", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Matches an access-denied query/delete failure (a permission problem on the Task Scheduler
+    /// store, not a missing task). Only concrete, tested markers are matched; anything else is
+    /// left unclassified and therefore Unknown.
+    /// </summary>
+    internal static bool LooksLikeAccessDenied(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+        return text.Contains("access is denied", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("отказано в доступе", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("拒绝访问", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("アクセスが拒否され", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Matches an unavailable/not-started Task Scheduler service. Only concrete, tested markers
+    /// are matched; anything else stays unclassified (Unknown).
+    /// </summary>
+    internal static bool LooksLikeServiceUnavailable(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+        return text.Contains("service is not available", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("the service has not been started", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("служба недоступна", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("the rpc server is unavailable", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Logs a failed schtasks invocation/operation with the operation name, exit code and each
+    // stream bounded, plus the invocation exception when present. Never logs a successful full
+    // task XML. The streams are logged separately, never collapsed before logging.
+    private void LogCommandFailure(string operation, SchTasksCommandResult result)
+    {
+        if (result.InvocationFailed)
+        {
+            _logger.LogError(result.InvocationException,
+                "Autostart {Operation} failed: schtasks.exe could not be invoked", operation);
+            return;
+        }
+        _logger.LogError(
+            "Autostart {Operation} failed (exit {Code}); stdout: {StdOut}; stderr: {StdErr}",
+            operation,
+            result.ExitCode,
+            SchTasksCommandResult.Bound(result.StandardOutput),
+            SchTasksCommandResult.Bound(result.StandardError));
+    }
+
     internal static string BuildCreateArguments(string exePath) =>
         $"/Create /TN \"{AppEdition.ScheduledTaskName}\" /TR \"\\\"{exePath}\\\" --background\" /SC ONLOGON /RL HIGHEST /F";
 
@@ -367,8 +531,9 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
 
     // Runs schtasks.exe through the injected seam when present, otherwise the real process.
     // Both paths share the same exception handling so a seam-thrown error behaves exactly like
-    // a real process-start failure (surfaced as a failure result, never lost).
-    private async Task<(int ExitCode, string Output)> RunSchTasksAsync(string arguments, CancellationToken ct)
+    // a real process-start failure (surfaced as a failure result with the exception captured,
+    // never lost and never silently thrown). stdout and stderr stay separate in the result.
+    private async Task<SchTasksCommandResult> RunSchTasksAsync(string arguments, CancellationToken ct)
     {
         try
         {
@@ -380,7 +545,8 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             if (process is null)
             {
                 _logger.LogError("schtasks.exe could not be started");
-                return (-1, string.Empty);
+                return new SchTasksCommandResult(-1, string.Empty, string.Empty,
+                    new InvalidOperationException("schtasks.exe could not be started"));
             }
 
             // Read both streams concurrently: a sequential read can deadlock if
@@ -389,7 +555,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             var errorTask = process.StandardError.ReadToEndAsync(ct);
             await Task.WhenAll(outputTask, errorTask).ConfigureAwait(false);
             await process.WaitForExitAsync(ct).ConfigureAwait(false);
-            return (process.ExitCode, $"{outputTask.Result} {errorTask.Result}".Trim());
+            return new SchTasksCommandResult(process.ExitCode, outputTask.Result, errorTask.Result, null);
         }
         catch (OperationCanceledException)
         {
@@ -400,7 +566,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             // A process-start/invocation failure is surfaced as a failure result, never lost:
             // the caller must be able to distinguish "operation failed" from "operation ok".
             _logger.LogError(ex, "schtasks.exe invocation failed");
-            return (-1, $"{ex.GetType().Name}: {ex.Message}");
+            return new SchTasksCommandResult(-1, string.Empty, string.Empty, ex);
         }
     }
 }

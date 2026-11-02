@@ -63,16 +63,18 @@ public class ScheduledTaskAutostartServiceErrorTests
         public required int MutatingExitCode { get; init; }
         public Exception? ThrowOnMutate { get; init; }
 
-        public (int ExitCode, string Output) For(string arguments)
+        public ScheduledTaskAutostartService.SchTasksCommandResult For(string arguments)
         {
             if (arguments.Contains("/Query", StringComparison.Ordinal))
                 return QueryExitCode == 0
-                    ? (0, QueryXml)
-                    : (QueryExitCode, QueryError);
+                    ? new ScheduledTaskAutostartService.SchTasksCommandResult(0, QueryXml, string.Empty, null)
+                    : new ScheduledTaskAutostartService.SchTasksCommandResult(QueryExitCode, string.Empty, QueryError, null);
 
             if (ThrowOnMutate is { } ex)
-                throw ex;
-            return (MutatingExitCode, MutatingExitCode == 0 ? "SUCCESS" : "ERROR: The parameter is incorrect.");
+                return new ScheduledTaskAutostartService.SchTasksCommandResult(-1, string.Empty, string.Empty, ex);
+            return MutatingExitCode == 0
+                ? new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null)
+                : new ScheduledTaskAutostartService.SchTasksCommandResult(MutatingExitCode, string.Empty, "ERROR: The parameter is incorrect.", null);
         }
     }
 
@@ -266,6 +268,124 @@ public class ScheduledTaskAutostartServiceErrorTests
     }
 
     // ---------------------------------------------------------------------
+    // Diagnosable failure classification (R-AS-DIAG): separate stdout/stderr, exception capture,
+    // bounded logging, and distinct fail-closed causes. The typed state remains Unknown for every
+    // cause except a clean verified task-not-found; diagnostics never weaken fail-closed behavior.
+    // ---------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("", "ERROR: The system cannot find the file specified.")]
+    [InlineData("ERROR: The system cannot find the file specified.", "")]
+    [InlineData("ERROR: System cannot find the file specified.", "")]
+    public async Task ReadState_NonZeroQueryNotFoundMarkerOnEitherStream_IsAbsent(string stdout, string stderr)
+    {
+        // stdout and stderr are kept separate in the result; the "not found" marker may arrive on
+        // either stream and must still classify as Absent — never as Unknown just because it did
+        // not land on the stream a caller happened to inspect.
+        ScheduledTaskAutostartService.SchTasksInvoker invoker = (_, _) =>
+            System.Threading.Tasks.Task.FromResult(
+                new ScheduledTaskAutostartService.SchTasksCommandResult(1, stdout, stderr, null));
+        var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+
+        var state = await service.ReadStateAsync();
+
+        state.Should().Be(AutostartState.Absent);
+    }
+
+    [Fact]
+    public async Task ReadState_NonZeroQueryAccessDeniedOnStderr_IsUnknown_AndClassifiedAccessDenied()
+    {
+        var result = new ScheduledTaskAutostartService.SchTasksCommandResult(
+            1, string.Empty, "ERROR: Access is denied.", null);
+
+        ScheduledTaskAutostartService.ClassifyQueryResult(result)
+            .Should().Be(ScheduledTaskAutostartService.SchTasksQueryFailure.AccessDenied);
+
+        ScheduledTaskAutostartService.SchTasksInvoker invoker = (_, _) =>
+            System.Threading.Tasks.Task.FromResult(result);
+        var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+
+        (await service.ReadStateAsync()).Should().Be(AutostartState.Unknown,
+            "an access-denied read must stay Unknown, never Absent");
+    }
+
+    [Fact]
+    public async Task ReadState_NonZeroQueryServiceUnavailable_IsUnknown_AndClassifiedServiceUnavailable()
+    {
+        var result = new ScheduledTaskAutostartService.SchTasksCommandResult(
+            2, string.Empty, "ERROR: The service has not been started.", null);
+
+        ScheduledTaskAutostartService.ClassifyQueryResult(result)
+            .Should().Be(ScheduledTaskAutostartService.SchTasksQueryFailure.ServiceUnavailable);
+
+        ScheduledTaskAutostartService.SchTasksInvoker invoker = (_, _) =>
+            System.Threading.Tasks.Task.FromResult(result);
+        var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+
+        (await service.ReadStateAsync()).Should().Be(AutostartState.Unknown);
+    }
+
+    [Fact]
+    public async Task ReadState_QueryInvocationException_IsUnknown_AndClassifiedInvocationFailure()
+    {
+        var result = new ScheduledTaskAutostartService.SchTasksCommandResult(
+            -1, string.Empty, string.Empty, new InvalidOperationException("schtasks.exe could not be started"));
+
+        ScheduledTaskAutostartService.ClassifyQueryResult(result)
+            .Should().Be(ScheduledTaskAutostartService.SchTasksQueryFailure.InvocationFailure);
+
+        ScheduledTaskAutostartService.SchTasksInvoker invoker = (_, _) =>
+            System.Threading.Tasks.Task.FromResult(result);
+        var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+
+        (await service.ReadStateAsync()).Should().Be(AutostartState.Unknown,
+            "an invocation failure must stay Unknown, never Absent");
+    }
+
+    [Fact]
+    public async Task ReadState_NonZeroQueryLocalizedNotFound_IsAbsent()
+    {
+        // Concrete, tested localized not-found markers must classify as Absent; anything else
+        // stays Unknown (fail-closed) and is never guessed.
+        var result = new ScheduledTaskAutostartService.SchTasksCommandResult(
+            1, string.Empty, "ОШИБКА: Не удается найти указанный файл.", null);
+
+        ScheduledTaskAutostartService.ClassifyQueryResult(result)
+            .Should().Be(ScheduledTaskAutostartService.SchTasksQueryFailure.MissingTask);
+    }
+
+    [Fact]
+    public async Task ReadState_NonZeroQueryUnknownText_IsUnknown_AndClassifiedUnknown()
+    {
+        var result = new ScheduledTaskAutostartService.SchTasksCommandResult(
+            1, string.Empty, "ERROR: Something completely unexpected happened.", null);
+
+        ScheduledTaskAutostartService.ClassifyQueryResult(result)
+            .Should().Be(ScheduledTaskAutostartService.SchTasksQueryFailure.Unknown);
+
+        ScheduledTaskAutostartService.SchTasksInvoker invoker = (_, _) =>
+            System.Threading.Tasks.Task.FromResult(result);
+        var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+
+        (await service.ReadStateAsync()).Should().Be(AutostartState.Unknown);
+    }
+
+    [Fact]
+    public void CommandResult_BoundedText_CapsEachStreamIndependently()
+    {
+        var big = new string('x', 6000);
+        var result = new ScheduledTaskAutostartService.SchTasksCommandResult(1, big, "ERR", null);
+
+        var bounded = result.BoundedText;
+
+        bounded.Should().NotContain(new string('x', 6000), "streams must be bounded before logging");
+        bounded.Should().Contain("[truncated");
+        bounded.Should().Contain("ERR", "the small stream is preserved, not swallowed by the large one");
+        bounded.Length.Should().BeLessThan(6000);
+        ScheduledTaskAutostartService.SchTasksCommandResult.Bound(null).Should().BeEmpty();
+    }
+
+    // ---------------------------------------------------------------------
     // SetEnabledAsync: verified outcomes with the typed state
     // ---------------------------------------------------------------------
 
@@ -277,7 +397,8 @@ public class ScheduledTaskAutostartServiceErrorTests
         {
             if (!arguments.Contains("/Query", StringComparison.Ordinal))
                 mutateCalled = true;
-            return System.Threading.Tasks.Task.FromResult((1, "ERROR: Access is denied."));
+            return System.Threading.Tasks.Task.FromResult(
+                new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty, "ERROR: Access is denied.", null));
         };
         var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
 
@@ -304,11 +425,14 @@ public class ScheduledTaskAutostartServiceErrorTests
             if (arguments.Contains("/Query", StringComparison.Ordinal))
             {
                 if (verifyCalled)
-                    return System.Threading.Tasks.Task.FromResult((0, TaskXml(command: ExpectedCommand())));
+                    return System.Threading.Tasks.Task.FromResult(
+                        new ScheduledTaskAutostartService.SchTasksCommandResult(0, TaskXml(command: ExpectedCommand()), string.Empty, null));
                 verifyCalled = true;
-                return System.Threading.Tasks.Task.FromResult((1, "ERROR: The system cannot find the file specified."));
+                return System.Threading.Tasks.Task.FromResult(
+                    new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty, "ERROR: The system cannot find the file specified.", null));
             }
-            return System.Threading.Tasks.Task.FromResult((0, "SUCCESS"));
+            return System.Threading.Tasks.Task.FromResult(
+                new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
         var svc = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
 
@@ -345,11 +469,14 @@ public class ScheduledTaskAutostartServiceErrorTests
             if (arguments.Contains("/Query", StringComparison.Ordinal))
             {
                 if (verifyCalled)
-                    return System.Threading.Tasks.Task.FromResult((1, "ERROR: The system cannot find the file specified."));
+                    return System.Threading.Tasks.Task.FromResult(
+                        new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty, "ERROR: The system cannot find the file specified.", null));
                 verifyCalled = true;
-                return System.Threading.Tasks.Task.FromResult((1, "ERROR: The system cannot find the file specified."));
+                return System.Threading.Tasks.Task.FromResult(
+                    new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty, "ERROR: The system cannot find the file specified.", null));
             }
-            return System.Threading.Tasks.Task.FromResult((0, "SUCCESS"));
+            return System.Threading.Tasks.Task.FromResult(
+                new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
         var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
 
@@ -385,7 +512,8 @@ public class ScheduledTaskAutostartServiceErrorTests
         {
             if (!arguments.Contains("/Query", StringComparison.Ordinal))
                 mutateCalled = true;
-            return System.Threading.Tasks.Task.FromResult((1, "ERROR: The system cannot find the file specified."));
+            return System.Threading.Tasks.Task.FromResult(
+                new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty, "ERROR: The system cannot find the file specified.", null));
         };
         var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
 
@@ -534,11 +662,14 @@ public class ScheduledTaskAutostartServiceErrorTests
             {
                 if (verifyCalled)
                     return System.Threading.Tasks.Task.FromResult(
-                        (0, RealXmlWith(command: ExpectedCommand(), logonType: "Password")));
+                        new ScheduledTaskAutostartService.SchTasksCommandResult(
+                            0, RealXmlWith(command: ExpectedCommand(), logonType: "Password"), string.Empty, null));
                 verifyCalled = true;
-                return System.Threading.Tasks.Task.FromResult((1, "ERROR: The system cannot find the file specified."));
+                return System.Threading.Tasks.Task.FromResult(
+                    new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty, "ERROR: The system cannot find the file specified.", null));
             }
-            return System.Threading.Tasks.Task.FromResult((0, "SUCCESS"));
+            return System.Threading.Tasks.Task.FromResult(
+                new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
         var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
 
