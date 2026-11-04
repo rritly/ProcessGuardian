@@ -235,7 +235,6 @@ Toast card types:
 |------|-------|------------|
 | **Monitoring Started** | white | Monitoring was enabled (Start). |
 | **Monitoring Stopped** | white | Monitoring was disabled (Disable). |
-| **Target Unreadable** | white | Start was aborted: the target file could not be read/hashed. Monitoring stays off, the previous pin is kept. |
 | **Process Recovered** | green | A recovery launch succeeded and the process is running. |
 | **Recovery Failed** | red | The restart budget is exhausted; monitoring is disabled. |
 | **Target Changed** | red | The target binary's hash no longer matches the pin; the recovery relaunch was blocked and monitoring is disabled. Press Start again to re-confirm the binary. |
@@ -252,8 +251,10 @@ is started:
 * **Binary changed** → the launch is blocked, a red *Target Changed* toast is shown, and
   monitoring is disabled. Enabling monitoring again (Start) is the explicit re-confirmation
   and re-pins the hash.
-* **Target unreadable at Start** → Start aborts fail-closed (*Target Unreadable*): no
-  monitoring without a valid pin, and the previous pin is kept.
+* **Target unreadable at Start** → Start aborts fail-closed: no monitoring
+  without a valid pin, and the previous pin is kept. No toast is emitted for this
+  case — the Start rejection is surfaced by the status badge and button state
+  only (the toast set is fixed to the five titles listed above).
 
 A transparently missing or unreadable target *during an active session* is **not** a pin
 mismatch: it is treated as degraded (see [Status Badge](#status-badge)) — the target stays
