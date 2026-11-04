@@ -941,7 +941,7 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
-    public async Task ConfigRefused_StopAndSuspend_DoNotPersist_DoNotTouchAutostart_StoppedPublished()
+    public async Task ConfigRefused_StopAndSuspend_DoNotPersist_DoNotTouchAutostart_ErrorPreserved()
     {
         using var h = new Harness();
         h.Config.InitializeAsync(Arg.Any<CancellationToken>())
@@ -949,18 +949,31 @@ public class GuardianOrchestratorTests
 
         var controller = h.CreateController();
         await controller.ReconcileAsync();
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        var refusedReason = controller.CurrentState.Reason;
+        refusedReason.Should().NotBeNullOrWhiteSpace("the refused boot publishes Error with a stable reason");
 
+        // [v2.6 Amendment E / R-A-ERROR-STATE] Stop and Suspend must not overwrite the refused
+        // Error with Stopped: the state and its reason stay intact, nothing is persisted and
+        // autostart is never touched.
         var stop = await controller.StopAsync();
         stop.RuntimeStopped.Should().BeTrue("nothing is running after a refused boot");
-        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
-        controller.CurrentState.IsDegraded.Should().BeFalse("Stopped is never degraded (R-F)");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.Reason.Should().Be(refusedReason, "the refused Error reason is preserved");
+        controller.CurrentState.IsDegraded.Should().BeFalse("a refused config is never a degraded session (R-F)");
+        controller.CurrentState.SaveFailed.Should().BeFalse("a refused Stop performs no persistence at all");
         _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
         _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
 
         await controller.SuspendAsync();
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.Reason.Should().Be(refusedReason, "the refused Error reason is preserved");
+        controller.CurrentState.IsDegraded.Should().BeFalse();
+        controller.CurrentState.SaveFailed.Should().BeFalse();
         _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
         _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
-        controller.CurrentState.IsDegraded.Should().BeFalse();
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
     }
 
     // R-AS-AUTO: a refused configuration never reaches automatic recovery (Refused and

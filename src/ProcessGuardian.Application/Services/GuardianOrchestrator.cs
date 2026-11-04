@@ -649,9 +649,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             if (_configRefused)
             {
                 // [R-A] A refused store cannot be written; nothing is running and nothing may be
-                // persisted or synced. Publish a clean Stopped state so the UI stays coherent.
+                // persisted or synced.
+                // [v2.6 Amendment E / R-A-ERROR-STATE] The refused Error state stays intact: the
+                // existing reason is preserved, IsDegraded stays false, and Stopped is never
+                // published over it.
                 _logger.LogWarning("Stop: configuration initialization was refused; no persistence attempted");
-                Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
+                Publish(new MonitorState(GuardianStatus.Error, false,
+                    _state.Reason ?? "Configuration is unavailable", false));
                 return StopResult.AlreadyStopped();
             }
 
@@ -734,7 +738,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             if (_configRefused)
             {
                 // [R-A] Nothing to cancel and nothing to persist in a refused state.
-                Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
+                // [v2.6 Amendment E / R-A-ERROR-STATE] The refused Error state stays intact: the
+                // existing reason is preserved, IsDegraded stays false, and Stopped is never
+                // published over it.
+                Publish(new MonitorState(GuardianStatus.Error, false,
+                    _state.Reason ?? "Configuration is unavailable", false));
                 return;
             }
 
