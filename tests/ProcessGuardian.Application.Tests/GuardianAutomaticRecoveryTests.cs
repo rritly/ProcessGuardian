@@ -302,9 +302,52 @@ public class GuardianAutomaticRecoveryTests
         h.Autostart.SetCalls.Should().Be(0, "a rejected Start must never enable autostart");
     }
 
+    // [v2.6 Amendment B / R-AS-GATE] While recovery is pending, a direct (user-originated)
+    // CommitSettingsAsync call is rejected: no SaveAsync, no SetEnabledAsync /
+    // RemoveRegistrationAsync, and no change to the committed path/pin state — verified by the
+    // controller-owned persistence that a subsequent successful recovery performs.
     [Fact]
-    public async Task Start_AfterSuccessfulRecovery_IsAllowed()
+    public async Task CommitSettings_DuringPendingRecovery_IsRejected_NoSaveNoAutostart_NoPathOrPinChange()
     {
+        using var h = new Harness();
+        h.ResetNoticePendingInit();
+        h.Autostart.State = AutostartState.Enabled;
+        h.Autostart.RemoveResult = AutostartResult.Failure(
+            "the autostart task is still present after the delete (state: Enabled)", AutostartState.Enabled);
+
+        var controller = h.Create();
+        await controller.ReconcileAsync();
+        controller.RecoveryPending.Should().BeTrue();
+        h.Config.ClearReceivedCalls();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = true });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\rejected\new-target.exe");
+
+        result.Saved.Should().BeFalse("a user-originated commit must be rejected while recovery is pending");
+        _ = h.Config.DidNotReceive().SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>());
+        h.Autostart.SetCalls.Should().Be(0, "no autostart enable may run for a rejected commit");
+        h.Autostart.RemoveCalls.Should().Be(3, "only the recovery's own bounded removal attempts ran");
+        controller.RecoveryPending.Should().BeTrue("a rejected commit must not clear the pending gate");
+        _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped,
+            "a rejected commit must not republish any state over the pending recovery");
+
+        // The committed path/pin state was not touched: the controller-owned recovery save that
+        // runs after the recovery finally succeeds persists the ORIGINAL (safe default) values,
+        // never the rejected commit's path or the snapshot's settings.
+        h.Autostart.RemoveResult = null;
+        await controller.ReconcileAsync();
+        controller.RecoveryPending.Should().BeFalse();
+        h.LastSaved.Should().NotBeNull();
+        h.LastSaved!.TargetProcessPath.Should().BeEmpty(
+            "the rejected commit's path never reached the committed controller state");
+        h.LastSaved.TargetHashSha256.Should().BeEmpty();
+        h.LastSaved.CheckIntervalSeconds.Should().Be(new AppSettings().CheckIntervalSeconds,
+            "the rejected snapshot's values never leaked into the recovery-owned save");
+    }
+
+    [Fact]
+    public async Task Start_AfterSuccessfulRecovery_IsAllowed()    {
         using var h = new Harness();
         h.ResetNoticePendingInit();
         h.Autostart.State = AutostartState.Enabled;

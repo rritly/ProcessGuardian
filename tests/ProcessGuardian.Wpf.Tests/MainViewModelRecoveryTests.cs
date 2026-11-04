@@ -69,6 +69,82 @@ public class MainViewModelRecoveryTests
             "Start is disabled while the automatic recovery is pending (R-AS-AUTO)");
     }
 
+    // [v2.6 Amendment B / R-AS-GATE] While recovery is pending, every settings edit/commit gate
+    // is closed: the whole Settings card and the target path/Browse are disabled, and Browse,
+    // an explicit path commit and a settings-property change never reach the controller.
+    [Fact]
+    public void ResetNoticePending_DisablesSettingsAndTargetPathGates()
+    {
+        var vm = new Harness().CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+
+        vm.IsSettingsEditable.Should().BeFalse("all numeric/toast settings are locked while pending");
+        vm.IsTargetPathEditable.Should().BeFalse("the path TextBox and Browse are locked while pending");
+        vm.IsAutostartEditable.Should().BeFalse();
+        vm.StartCommand.CanExecute(null).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task ResetNoticePending_BrowseAndPathCommitAndDebounce_NeverReachTheController()
+    {
+        var h = new Harness();
+        var vm = h.CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+
+        // Browse rejects before any dialog opens; an explicit draft commit changes nothing.
+        vm.BrowseExecutableCommand.Execute(null);
+        vm.CommitTargetPathDraft();
+        // A settings property change must not schedule the debounced commit either.
+        vm.Settings.CheckIntervalSeconds = 42;
+
+        // Give any (incorrectly) scheduled debounce time to fire: none must reach the controller.
+        await Task.Delay(900);
+        _ = h.Controller.DidNotReceive().CommitSettingsAsync(
+            Arg.Any<CommittedSettingsSnapshot>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ResetNoticePending_SettingsChange_DoesNotScheduleDebouncedCommit()
+    {
+        var h = new Harness();
+        var vm = h.CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+
+        vm.Settings.CheckIntervalSeconds = 42;
+
+        // Longer than the 500 ms debounce: nothing may reach the controller/store.
+        await Task.Delay(900);
+        _ = h.Controller.DidNotReceive().CommitSettingsAsync(
+            Arg.Any<CommittedSettingsSnapshot>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public void ResetNoticePending_GatesReopenOnlyAfterFullyVerifiedRecovery()
+    {
+        var h = new Harness();
+        var vm = h.CreateVm();
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.ResetNoticePending);
+        vm.IsSettingsEditable.Should().BeFalse();
+        vm.IsTargetPathEditable.Should().BeFalse();
+
+        // A failed recovery publishes Error but never raises RecoveryPendingChanged: every gate
+        // stays closed for the remainder of the process lifetime.
+        h.Controller.StateChanged += Raise.Event<EventHandler<MonitorState>>(
+            h.Controller, new MonitorState(GuardianStatus.Error, false, "recovery failed", false));
+
+        vm.Status.Should().Be(GuardianStatus.Error);
+        vm.IsSettingsEditable.Should().BeFalse("a failed recovery keeps every settings gate closed");
+        vm.IsTargetPathEditable.Should().BeFalse();
+        vm.StartCommand.CanExecute(null).Should().BeFalse(
+            "Start stays blocked after recovery exhaustion even though the status is Error");
+
+        // Only the controller's fully-verified outcome (RecoveryPendingChanged) reopens the gates.
+        h.Controller.RecoveryPendingChanged += Raise.Event();
+        vm.IsSettingsEditable.Should().BeTrue();
+        vm.IsTargetPathEditable.Should().BeTrue();
+        vm.StartCommand.CanExecute(null).Should().BeTrue();
+    }
+
     [Fact]
     public void RecoveryPendingChanged_UnlocksAutostartAndStart_ClearsNotice()
     {

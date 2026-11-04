@@ -310,32 +310,16 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
             if (_recoveryPending)
             {
-                // [recovery policy] While automatic recovery is pending (journal not yet cleared),
-                // an ordinary settings commit must NOT enable/disable autostart (the pre-existing
-                // scheduler task is never touched by a plain save) and must NOT overwrite the
-                // persisted AutostartEnabled with a value from a UI snapshot: only the controller-
-                // owned recovery steps may change the flag. Other settings are still saved
-                // normally, and a committed path change still clears the pin (which is exactly
-                // what re-selecting the target must do).
-                _committed = snapshot;
-                var pendingNewTarget = string.IsNullOrWhiteSpace(targetPath) ? string.Empty : targetPath;
-                var pendingPathChanged =
-                    !string.Equals(pendingNewTarget, _committedTargetPath, StringComparison.OrdinalIgnoreCase);
-                if (!sessionActive && pendingPathChanged)
-                {
-                    _committedTargetPath = pendingNewTarget;
-                    _latestPin = string.Empty;
-                }
-
-                var pendingSaved = await PersistEnabledAsync(enabled: sessionActive, ct, applyAutostart: false)
-                    .ConfigureAwait(false);
-                if (!sessionActive && pendingSaved)
-                    Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
-
-                // Autostart was intentionally not attempted while the notice is pending.
-                return pendingSaved
-                    ? CommitSettingsResult.Persisted(autostart: null)
-                    : CommitSettingsResult.SaveFailed();
+                // [v2.6 Amendment B / R-AS-GATE] While automatic recovery is pending, EVERY
+                // user-originated settings commit is rejected: no SaveAsync, no autostart
+                // SetEnabledAsync/RemoveRegistrationAsync, and no change to _committed,
+                // _committedTargetPath or _latestPin (the controller-owned recovery save of the
+                // safe disabled state runs through its own dedicated path,
+                // PersistRecoveryStateAsync, and never routes through this method). The ordinary
+                // settings/card controls are disabled in the UI while pending; this check is the
+                // authoritative controller-level gate.
+                _logger.LogWarning("Settings commit rejected: an automatic recovery is pending");
+                return CommitSettingsResult.SaveFailed();
             }
 
             _committed = snapshot;

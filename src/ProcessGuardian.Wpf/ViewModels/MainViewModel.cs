@@ -312,6 +312,12 @@ public partial class MainViewModel : ObservableObject
                 // Until the automatic recovery completes and the journal is cleared, autostart edits
                 // and Start stay locked and the checkbox shows no verified state (2.1/2.5 / R-AS-AUTO).
                 _recoveryPending = true;
+                // [v2.6 Amendment B / R-AS-GATE] Cancel an already scheduled debounce and raise the
+                // derived-gate notifications so every settings binding and command CanExecute
+                // updates immediately (the pending flag is not itself an observable property).
+                _saveCts?.Cancel();
+                OnPropertyChanged(nameof(IsSettingsEditable));
+                OnPropertyChanged(nameof(IsTargetPathEditable));
                 IsAutostartEditable = false;
                 _updatingAutostartEffective = true;
                 try
@@ -342,20 +348,27 @@ public partial class MainViewModel : ObservableObject
     // save incapable of retargeting or clearing the pin.
     public bool IsTargetPathEditable =>
         Status is GuardianStatus.Stopped or GuardianStatus.Error
-        && string.IsNullOrEmpty(ConfigurationError);
+        && string.IsNullOrEmpty(ConfigurationError)
+        // [v2.6 Amendment B / R-AS-GATE] The path draft and Browse are locked while the
+        // automatic recovery is pending, exactly like a refused configuration.
+        && !_recoveryPending;
 
     // R-A2: every settings control is genuinely disabled while the configuration store is
     // refused, so no numeric field or toast toggle remains editable (and thus schedulable for a
     // persistence commit) in a refused state. Numeric settings stay editable during active
     // monitoring per C+D; only a refused/unsafe configuration locks the whole Settings card.
-    public bool IsSettingsEditable => string.IsNullOrEmpty(ConfigurationError);
+    // [v2.6 Amendment B / R-AS-GATE] The same lock applies while an automatic recovery is
+    // pending: no settings edit or commit may reach the store until the recovery is fully
+    // verified.
+    public bool IsSettingsEditable =>
+        string.IsNullOrEmpty(ConfigurationError) && !_recoveryPending;
 
     // Explicitly commits the TextBox draft as the controller-owned committed path (called on
     // focus-lost / commit command; Browse commits directly). Only a committed path change is
     // sent to the controller, so it is the sole thing that can clear the pin while stopped.
     public void CommitTargetPathDraft()
     {
-        if (_configRefused)
+        if (_configRefused || _recoveryPending)
             return;
         _committedTargetPath = Settings.TargetProcessPath ?? string.Empty;
         _ = CommitNowAsync();
@@ -372,6 +385,13 @@ public partial class MainViewModel : ObservableObject
         {
             // A refused configuration admits no autostart intent and no scheduler mutation.
             _logger.LogWarning("Autostart change ignored: configuration initialization was refused");
+            return;
+        }
+        if (_recoveryPending)
+        {
+            // [v2.6 Amendment B / R-AS-GATE] No autostart intent change while the automatic
+            // recovery is pending; the checkbox is disabled and shows no verified state.
+            _logger.LogWarning("Autostart change ignored: an automatic recovery is pending");
             return;
         }
         _suppressSave = true;
@@ -426,6 +446,11 @@ public partial class MainViewModel : ObservableObject
         _recoveryPending = false;
         ResetNotice = string.Empty;
         AutostartError = string.Empty;
+        // [v2.6 Amendment B / R-AS-GATE] The gate reopens only after the controller reports the
+        // fully verified recovery outcome (RecoveryPendingChanged fires on success only); raise
+        // the derived-gate notifications so all settings bindings update immediately.
+        OnPropertyChanged(nameof(IsSettingsEditable));
+        OnPropertyChanged(nameof(IsTargetPathEditable));
         IsAutostartEditable = true;
         NotifyStartStopCanExecuteChanged();
         _logger.LogInformation("Automatic recovery completed; recovery gate reopened");
@@ -433,7 +458,7 @@ public partial class MainViewModel : ObservableObject
 
     private void OnSettingsPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (_suppressSave || _configRefused)
+        if (_suppressSave || _configRefused || _recoveryPending)
             return;
         ScheduleSave();
     }
@@ -547,7 +572,7 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void BrowseExecutable()
     {
-        if (_configRefused)
+        if (_configRefused || _recoveryPending)
             return;
         try
         {
@@ -650,6 +675,15 @@ public partial class MainViewModel : ObservableObject
             // Defensive re-entry guard on top of OnSettingsChanged/OnSettingsPropertyChanged:
             // a refused store must never be reached by the debounce/save pipeline (R-A).
             _logger.LogWarning("Settings commit skipped: configuration initialization was refused");
+            return;
+        }
+
+        if (_recoveryPending)
+        {
+            // [v2.6 Amendment B / R-AS-GATE] Defensive re-entry guard: a debounce task already
+            // in flight when the pending gate engaged must never reach the store, and a direct
+            // CommitNowAsync caller is rejected the same way.
+            _logger.LogWarning("Settings commit skipped: an automatic recovery is pending");
             return;
         }
 
