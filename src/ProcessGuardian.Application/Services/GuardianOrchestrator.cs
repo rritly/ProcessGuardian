@@ -200,8 +200,27 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 _configRefused = false;
                 _recoveryPending = true;
                 _logger.LogWarning("Reset notice pending; running automatic recovery (remove autostart, save disabled, clear journal)");
-                await RunAutomaticRecoveryAsync(ct).ConfigureAwait(false);
-                Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
+                var recovery = await RunAutomaticRecoveryAsync(ct).ConfigureAwait(false);
+                if (recovery.Completed)
+                {
+                    // [v2.6 Amendment A] Fully verified recovery (task absent + disabled state
+                    // persisted + journal cleared): publish the clean stopped state; the UI may
+                    // unlock the ordinary controls (the pending gate re-opened above).
+                    Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
+                }
+                else
+                {
+                    // [v2.6 Amendment A] All bounded attempts are exhausted and the journal is
+                    // still pending: a locked recovery-failure Error, never a Stopped look-alike.
+                    // IsDegraded=false — IsDegraded is reserved for active session states (R-F).
+                    // Start must remain unavailable although the status is Error (Error alone
+                    // would normally allow a new Start): the independent _recoveryPending gate
+                    // stays set and both the ViewModel and the controller block Start. The next
+                    // application startup retries the same idempotent flow; SaveFailed=true only
+                    // when the recovery settings persistence itself failed, never as a generic
+                    // recovery-failure flag.
+                    Publish(new MonitorState(GuardianStatus.Error, false, RecoveryFailedReason, recovery.SaveFailed));
+                }
                 return;
             }
 
@@ -389,12 +408,47 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     // Bounded to MaxRecoveryAttempts per startup; each step is verified and each failure leaves
     // the journal pending so the next startup re-runs the same idempotent flow (a crash after
     // the delete, after the save, or before the journal clear never recreates the task).
-    private async Task RunAutomaticRecoveryAsync(CancellationToken ct)
+    // [v2.6 Amendment A] Returns an explicit outcome so ReconcileAsync can publish Stopped on
+    // success and a locked recovery-failure Error on exhaustion without inferring it from the
+    // last published status.
+    /// <summary>
+    /// Explicit outcome of the controller-owned automatic recovery (v2.6 Amendment A).
+    /// <see cref="SaveFailed"/> is true only when the recovery settings persistence itself
+    /// failed at least once during this startup's attempts — never a generic recovery-failure
+    /// flag.
+    /// </summary>
+    internal readonly record struct AutomaticRecoveryResult(bool Completed, bool SaveFailed)
     {
+        public static AutomaticRecoveryResult CompletedSuccessfully() => new(true, false);
+        public static AutomaticRecoveryResult Exhausted(bool saveFailed) => new(false, saveFailed);
+    }
+
+    // Stable, bounded status reason published after recovery exhaustion (v2.6 Amendment A).
+    // Raw command output and diagnostics stay in the log, never in the status text.
+    internal const string RecoveryFailedReason = "Automatic recovery is incomplete; see the log for details.";
+
+    // [v2.6 Amendment C] One-second cancellable delay between failed recovery attempts: exactly
+    // one delay between each pair of failed attempts — never before the first attempt, never
+    // after success, and never after the final failed attempt. Resolved through the injected
+    // TimeProvider so tests stay deterministic (no wall-clock sleeps). Cancellation propagates
+    // and is NOT an exhausted-recovery failure: the journal stays pending and the next startup
+    // retries the same flow.
+    private static readonly TimeSpan RecoveryRetryDelay = TimeSpan.FromSeconds(1);
+
+    private async Task<AutomaticRecoveryResult> RunAutomaticRecoveryAsync(CancellationToken ct)
+    {
+        var saveFailed = false;
         for (var attempt = 1; attempt <= MaxRecoveryAttempts; attempt++)
         {
             if (attempt > 1)
+            {
                 _logger.LogWarning("Automatic recovery attempt {Attempt}/{Max} after a previous failure", attempt, MaxRecoveryAttempts);
+                // Cancellable, TimeProvider-resolved delay (v2.6 Amendment C). Reaching attempt>1
+                // implies the previous attempt failed, so this is exactly the between-attempts
+                // delay; a successful recovery returned below and the final failed attempt ends
+                // the loop, so neither gets a delay after it.
+                await Task.Delay(RecoveryRetryDelay, _time, ct).ConfigureAwait(false);
+            }
 
             // 1) Unconditional, positively-verified removal of the app-owned task. The service
             //    scopes the delete to the exact app task name; a not-found delete still confirms
@@ -439,12 +493,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Automatic recovery attempt {Attempt}: persisting the disabled state failed", attempt);
+                saveFailed = true;
                 continue;
             }
 
             if (!saved)
             {
                 _logger.LogError("Automatic recovery attempt {Attempt}: settings save failed; journal stays pending", attempt);
+                saveFailed = true;
                 continue;
             }
 
@@ -472,11 +528,12 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             _recoveryPending = false;
             _logger.LogInformation("Automatic recovery completed: task verified absent, monitoring disabled, journal cleared");
             RecoveryPendingChanged?.Invoke(this, EventArgs.Empty);
-            return;
+            return AutomaticRecoveryResult.CompletedSuccessfully();
         }
 
         _logger.LogError("Automatic recovery failed after {Max} attempts; journal stays pending and Start stays blocked until a later startup retries",
             MaxRecoveryAttempts);
+        return AutomaticRecoveryResult.Exhausted(saveFailed);
     }
 
     // Persists the post-recovery snapshot with explicit AutostartEnabled=false and

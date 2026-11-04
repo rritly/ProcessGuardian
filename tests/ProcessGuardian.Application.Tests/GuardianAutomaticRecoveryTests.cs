@@ -26,6 +26,11 @@ public class GuardianAutomaticRecoveryTests
     {
         public AutostartState State { get; set; } = AutostartState.Absent;
         public AutostartResult? RemoveResult { get; set; }
+
+        // When > 0, the next N removal attempts fail (using RemoveResult when set), then
+        // succeed — for testing recovery that completes on a later attempt.
+        public int FailFirstRemovalAttempts { get; set; }
+
         public int SetCalls { get; private set; }
         public int RemoveCalls { get; private set; }
 
@@ -41,8 +46,16 @@ public class GuardianAutomaticRecoveryTests
         public Task<AutostartResult> RemoveRegistrationAsync(CancellationToken ct = default)
         {
             RemoveCalls++;
-            if (RemoveResult is { } result)
-                return Task.FromResult(result); // requested removal did not take effect / unverifiable
+            if (FailFirstRemovalAttempts > 0)
+            {
+                FailFirstRemovalAttempts--;
+                return Task.FromResult(RemoveResult is { } result
+                    ? result
+                    : AutostartResult.Failure("the autostart task removal could not be verified", State));
+            }
+
+            if (RemoveResult is { } configured)
+                return Task.FromResult(configured); // requested removal did not take effect / unverifiable
             State = AutostartState.Absent;
             return Task.FromResult(AutostartResult.Success(AutostartState.Absent));
         }
@@ -75,6 +88,13 @@ public class GuardianAutomaticRecoveryTests
         public FakeResetNoticeAck ResetNoticeAck { get; } = new();
         public AppSettings? LastSaved { get; set; }
 
+        // Deterministic time (v2.6 Amendment C): the inter-attempt Task.Delay resolves through the
+        // injected TimeProvider; the fake records each requested delay and fires the timer
+        // immediately (or holds it, for the cancellation test), so no test ever sleeps in real time.
+        public InstantFireTimeProvider Time { get; } = new();
+
+        public IReadOnlyList<TimeSpan> RecoveryDelays => Time.RequestedDelays;
+
         public void Dispose()
         {
         }
@@ -103,7 +123,35 @@ public class GuardianAutomaticRecoveryTests
 
         public GuardianOrchestrator Create() => new(
             Monitor, Config, Notifications, NullLogger<GuardianOrchestrator>.Instance,
-            Status, Integrity, Autostart, null, ResetNoticeAck);
+            Status, Integrity, Autostart, Time, ResetNoticeAck);
+    }
+
+    // TimeProvider fake for the inter-attempt recovery delay (v2.6 Amendment C):
+    // Task.Delay(dueTime, timeProvider, ct) creates its timer through CreateTimer; the fake
+    // records each requested due time and (unless HoldTimers is set) fires the timer callback
+    // synchronously, so the delay completes deterministically without any real wall-clock wait.
+    // With HoldTimers set, the delay never completes until its cancellation token fires, which
+    // lets a test exercise the cancellable-delay path end to end.
+    internal sealed class InstantFireTimeProvider : TimeProvider
+    {
+        public List<TimeSpan> RequestedDelays { get; } = new();
+
+        public bool HoldTimers { get; set; }
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            RequestedDelays.Add(dueTime);
+            if (!HoldTimers)
+                callback?.Invoke(state);
+            return new NeverFiringTimer();
+        }
+
+        private sealed class NeverFiringTimer : ITimer
+        {
+            public bool Change(TimeSpan dueTime, TimeSpan period) => true;
+            public void Dispose() { }
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 
     [Fact]
@@ -169,7 +217,12 @@ public class GuardianAutomaticRecoveryTests
         h.ResetNoticeAck.ClearCalls.Should().Be(0, "nothing is cleared until the task is verified absent");
         h.LastSaved.Should().BeNull("no disabled-state save happens while the task is still present");
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        // [v2.6 Amendment A] Exhausted recovery publishes a locked recovery-failure Error,
+        // never a Stopped look-alike.
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeFalse("IsDegraded is reserved for active session states");
+        controller.CurrentState.Reason.Should().Be(GuardianOrchestrator.RecoveryFailedReason);
+        controller.CurrentState.SaveFailed.Should().BeFalse("the settings persistence itself never failed in this scenario");
     }
 
     [Fact]
@@ -188,6 +241,11 @@ public class GuardianAutomaticRecoveryTests
         h.ResetNoticeAck.ClearCalls.Should().Be(0);
         h.LastSaved.Should().BeNull();
         controller.AutostartActualState.Should().Be(AutostartState.Unknown);
+        // [v2.6 Amendment A] Exhausted recovery publishes a locked recovery-failure Error.
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeFalse();
+        controller.CurrentState.Reason.Should().Be(GuardianOrchestrator.RecoveryFailedReason);
+        controller.CurrentState.SaveFailed.Should().BeFalse();
     }
 
     [Fact]
@@ -206,6 +264,11 @@ public class GuardianAutomaticRecoveryTests
         first.RecoveryPending.Should().BeTrue();
         h.ResetNoticeAck.ClearCalls.Should().Be(0, "journal is not cleared when the save failed");
         h.Autostart.State.Should().Be(AutostartState.Absent, "the task was already removed");
+        // [v2.6 Amendment A] Exhausted recovery with a failing persistence step publishes Error
+        // with SaveFailed=true — the SaveFailed flag is reserved for exactly this case.
+        first.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        first.CurrentState.SaveFailed.Should().BeTrue("the recovery settings persistence itself failed on every attempt");
+        first.CurrentState.Reason.Should().Be(GuardianOrchestrator.RecoveryFailedReason);
 
         // Next startup: the same idempotent flow finishes — removal re-verifies the already-absent
         // task (no recreate), the save succeeds, and the journal is cleared.
@@ -237,6 +300,11 @@ public class GuardianAutomaticRecoveryTests
         first.RecoveryPending.Should().BeTrue();
         h.ResetNoticeAck.ClearCalls.Should().Be(3, "the clear was attempted on each of the three bounded attempts but threw");
         h.LastSaved!.AutostartEnabled.Should().BeFalse();
+        // [v2.6 Amendment A] Exhausted recovery after journal-clear failures: Error with
+        // SaveFailed=false — the settings save itself succeeded on every attempt.
+        first.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        first.CurrentState.SaveFailed.Should().BeFalse("the settings save succeeded; only the journal clear failed");
+        first.CurrentState.Reason.Should().Be(GuardianOrchestrator.RecoveryFailedReason);
 
         h.ResetNoticeAck.ThrowOnClear = null;
         var second = h.Create();
@@ -277,6 +345,15 @@ public class GuardianAutomaticRecoveryTests
         h.Autostart.RemoveCalls.Should().Be(3, "recovery is bounded to exactly three attempts per startup");
         controller.RecoveryPending.Should().BeTrue();
         h.ResetNoticeAck.ClearCalls.Should().Be(0);
+        // [v2.6 Amendment A] Exhausted recovery publishes a locked recovery-failure Error.
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.IsDegraded.Should().BeFalse();
+        controller.CurrentState.Reason.Should().Be(GuardianOrchestrator.RecoveryFailedReason);
+        controller.CurrentState.SaveFailed.Should().BeFalse();
+        // [v2.6 Amendment C] Exactly one delay between each pair of failed attempts: 3 attempts
+        // → exactly 2 delays of one second each, none before the first or after the final one.
+        h.RecoveryDelays.Should().HaveCount(2);
+        h.RecoveryDelays.Should().OnlyContain(d => d == TimeSpan.FromSeconds(1));
     }
 
     [Fact]
@@ -329,8 +406,8 @@ public class GuardianAutomaticRecoveryTests
         h.Autostart.RemoveCalls.Should().Be(3, "only the recovery's own bounded removal attempts ran");
         controller.RecoveryPending.Should().BeTrue("a rejected commit must not clear the pending gate");
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped,
-            "a rejected commit must not republish any state over the pending recovery");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error,
+            "the recovery was exhausted; a rejected commit must not republish any state over the failure");
 
         // The committed path/pin state was not touched: the controller-owned recovery save that
         // runs after the recovery finally succeeds persists the ORIGINAL (safe default) values,
@@ -346,8 +423,86 @@ public class GuardianAutomaticRecoveryTests
             "the rejected snapshot's values never leaked into the recovery-owned save");
     }
 
+    // [v2.6 Amendment A / C] Recovery that succeeds on a later attempt after exactly one failed
+    // attempt: exactly one one-second delay was requested (only between attempts), the journal
+    // was cleared, the pending gate reopened, and the clean Stopped state was published.
     [Fact]
-    public async Task Start_AfterSuccessfulRecovery_IsAllowed()    {
+    public async Task Reconcile_RecoverySucceedsOnSecondAttempt_OneDelay_StoppedPublished()
+    {
+        using var h = new Harness();
+        h.ResetNoticePendingInit();
+        h.Autostart.State = AutostartState.Enabled;
+        h.Autostart.FailFirstRemovalAttempts = 1;
+
+        var controller = h.Create();
+        await controller.ReconcileAsync();
+
+        h.Autostart.RemoveCalls.Should().Be(2, "the first removal failed and the second succeeded");
+        controller.RecoveryPending.Should().BeFalse();
+        h.ResetNoticeAck.ClearCalls.Should().Be(1);
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        controller.CurrentState.SaveFailed.Should().BeFalse();
+        h.RecoveryDelays.Should().ContainSingle("exactly one delay sits between the two attempts")
+            .Which.Should().Be(TimeSpan.FromSeconds(1));
+    }
+
+    // [v2.6 Amendment A / C] Recovery that succeeds on the third (final) attempt: exactly two
+    // one-second delays were requested and none after the successful attempt.
+    [Fact]
+    public async Task Reconcile_RecoverySucceedsOnThirdAttempt_TwoDelaysBetweenAttemptsOnly()
+    {
+        using var h = new Harness();
+        h.ResetNoticePendingInit();
+        h.Autostart.State = AutostartState.Enabled;
+        h.Autostart.FailFirstRemovalAttempts = 2;
+
+        var controller = h.Create();
+        await controller.ReconcileAsync();
+
+        h.Autostart.RemoveCalls.Should().Be(3);
+        controller.RecoveryPending.Should().BeFalse();
+        h.ResetNoticeAck.ClearCalls.Should().Be(1);
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        h.RecoveryDelays.Should().HaveCount(2, "one delay between each pair of attempts");
+        h.RecoveryDelays.Should().OnlyContain(d => d == TimeSpan.FromSeconds(1));
+    }
+
+    // [v2.6 Amendment C] The inter-attempt delay is cancellable: while the second attempt's
+    // delay is held open, cancelling ReconcileAsync's token aborts the recovery mid-flow — the
+    // journal stays pending, the pending gate stays set, and no further removal attempt runs.
+    [Fact]
+    public async Task Reconcile_CancelledDuringInterAttemptDelay_Aborts_JournalStaysPending_NoFurtherAttempts()
+    {
+        using var h = new Harness();
+        h.ResetNoticePendingInit();
+        h.Autostart.State = AutostartState.Enabled;
+        h.Autostart.RemoveResult = AutostartResult.Failure(
+            "the autostart task is still present after the delete (state: Enabled)", AutostartState.Enabled);
+        h.Time.HoldTimers = true;
+
+        using var cts = new CancellationTokenSource();
+        var controller = h.Create();
+        var reconcile = controller.ReconcileAsync(cts.Token);
+
+        // Wait until the flow is parked on the second attempt's held delay (first attempt done).
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (h.Autostart.RemoveCalls < 1 && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
+        h.Autostart.RemoveCalls.Should().Be(1, "the first attempt completed before the held delay");
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => reconcile);
+
+        h.Autostart.RemoveCalls.Should().Be(1, "no further attempt may run after cancellation");
+        h.ResetNoticeAck.ClearCalls.Should().Be(0, "cancellation must never clear the journal");
+        controller.RecoveryPending.Should().BeTrue("the recovery never completed");
+        h.RecoveryDelays.Should().ContainSingle().Which.Should().Be(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task Start_AfterSuccessfulRecovery_IsAllowed()
+    {
         using var h = new Harness();
         h.ResetNoticePendingInit();
         h.Autostart.State = AutostartState.Enabled;
