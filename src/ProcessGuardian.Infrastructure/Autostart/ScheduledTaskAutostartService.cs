@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Xml.Linq;
 using Microsoft.Extensions.Logging;
 using ProcessGuardian.Domain;
@@ -545,6 +547,52 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             SchTasksCommandResult.Bound(result.StandardError));
     }
 
+    // ---------------------------------------------------------------------
+    // Command output decoding (v2.6 Amendment D / R-AS-ENC)
+    // ---------------------------------------------------------------------
+
+    // P/Invoke used to resolve the system OEM code page at runtime. The system locale's OEM
+    // page governs the child's own console default; a hard-coded locale-specific page is
+    // intentionally never used.
+    [DllImport("kernel32.dll", EntryPoint = "GetOEMCP", SetLastError = false)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static extern uint GetOemCodePage();
+
+    /// <summary>The raw system OEM code page number reported by <c>GetOEMCP</c>.</summary>
+    internal static int OemCodePage => (int)GetOemCodePage();
+
+    /// <summary>
+    /// The encoding both redirected schtasks.exe streams are decoded with. Live Windows evidence
+    /// (raw-byte capture on Windows 10.0.26300, ru-RU, ACP 1251 / OEMCP 866, 2026-11-03) showed
+    /// that schtasks.exe writes its redirected output using its own fresh (windowless) console's
+    /// default code page — the system OEM code page — and NOT the parent console's code page
+    /// (a parent console switched to 1251 still produced CP866 bytes). The page is therefore
+    /// resolved via <c>GetOEMCP</c> at runtime instead of hard-coding a locale-specific value.
+    /// Without an explicit encoding, the app's windowless process has <c>Console.OutputEncoding</c>
+    /// with code page 0, and the localized task-not-found message decodes as mojibake that the
+    /// classifier cannot recognize — which silently downgraded verified Absent states to Unknown.
+    /// </summary>
+    internal static readonly Encoding CommandOutputEncoding = CreateCommandOutputEncoding();
+
+    private static Encoding CreateCommandOutputEncoding()
+    {
+        // Legacy Windows code pages (e.g. the OEM page) require the code-pages provider on .NET.
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        try
+        {
+            return Encoding.GetEncoding(OemCodePage);
+        }
+        catch (ArgumentException ex)
+        {
+            // The OEM page could not be resolved in this environment. Decoding must stay
+            // functional, so fall back to UTF-8 explicitly and record why; classification remains
+            // fail-closed (unrecognized output is Unknown), so a wrong page can never produce a
+            // false "task absent".
+            Debug.Fail($"System OEM code page {OemCodePage} could not be resolved: {ex.Message}");
+            return Encoding.UTF8;
+        }
+    }
+
     internal static string BuildCreateArguments(string exePath) =>
         $"/Create /TN \"{AppEdition.ScheduledTaskName}\" /TR \"\\\"{exePath}\\\" --background\" /SC ONLOGON /RL HIGHEST /F";
 
@@ -572,6 +620,12 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+
+            // Both streams are decoded with the verified OEM code page before classification
+            // (v2.6 Amendment D / R-AS-ENC): without this, a windowless process decodes with
+            // code page 0 and localized messages become mojibake.
+            StandardOutputEncoding = CommandOutputEncoding,
+            StandardErrorEncoding = CommandOutputEncoding,
         };
 
     // Runs schtasks.exe through the injected seam when present, otherwise the real process.
