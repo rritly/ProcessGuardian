@@ -104,10 +104,23 @@ public class RegistryRecoveryJournalTests
         // trust then needs an ACL read. On a clean runner the key is absent, which is the case this
         // test covers — if a key is present, it was created by the manual elevated checklist and the
         // real-ACL behavior is verified there, not asserted blindly from a non-elevated context.
+        // An access-denied existence probe means the key (or its protected parent) exists but is
+        // unreadable without elevation — the same manual-checklist case, so the test yields instead
+        // of failing on the guard itself. The assertion below still runs on every clean runner.
         using (var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
-        using (var existing = baseKey.OpenSubKey(@"SOFTWARE\ProcessGuardianAdmin\Recovery"))
         {
-            if (existing is not null)
+            bool keyPresent;
+            try
+            {
+                using var existing = baseKey.OpenSubKey(@"SOFTWARE\ProcessGuardianAdmin\Recovery");
+                keyPresent = existing is not null;
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                return;
+            }
+
+            if (keyPresent)
                 return;
         }
 
