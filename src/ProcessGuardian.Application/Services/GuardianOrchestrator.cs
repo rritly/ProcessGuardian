@@ -852,7 +852,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         string? fatalReason = outcome switch
         {
             SessionEnd.HashMismatch => "the target binary no longer matches the recorded pin; monitoring stopped",
-            SessionEnd.BudgetExhausted => "monitoring stopped after repeated failed recovery attempts",
+            SessionEnd.BudgetExhausted => "the per-session automatic restart budget is exhausted; monitoring stopped",
             _ => null,
         };
         if (fatalReason is null)
@@ -908,7 +908,8 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                     var result = await _monitor.CheckAsync(target, ct).ConfigureAwait(false);
                     if (result.Outcome == ProcessOutcome.Running)
                     {
-                        counters.RestartAttempts = 0;
+                        // Observing Running clears degraded-state tracking only; it must NOT
+                        // refund or reset the cumulative per-session restart budget (v2.7).
                         counters.InitialLaunchPending = false;
                         ResetDegraded(counters);
                         Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
@@ -968,12 +969,17 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         Cancelled,
         /// <summary>Fatal: the target binary no longer matches the recorded pin.</summary>
         HashMismatch,
-        /// <summary>Fatal: the consecutive restart budget was exhausted.</summary>
+        /// <summary>Fatal: the cumulative per-session automatic-restart budget was exhausted (v2.7).</summary>
         BudgetExhausted,
     }
 
     private sealed class SessionCounters
     {
+        /// <summary>Cumulative per-session count of budgeted automatic launch attempts (v2.7).
+        /// Every genuine automatic process-creation attempt increments it exactly once,
+        /// regardless of whether the attempt succeeded or failed; it never decreases during
+        /// the session and is never reset by <c>ProcessOutcome.Running</c> observations.
+        /// Only a newly created monitoring session starts it at zero.</summary>
         public int RestartAttempts;
         public bool InitialLaunchPending = true;
 
@@ -1038,9 +1044,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             return SessionEnd.Continue;
         }
 
+        // Cumulative per-session budget (v2.7): the counter is monotonically increasing for the
+        // whole session, so a non-zero exhausted budget blocks every further automatic launch
+        // regardless of how many Running observations happened in between.
         if (knobs.MaxRestartAttempts > 0 && counters.RestartAttempts >= knobs.MaxRestartAttempts)
         {
-            _logger.LogError("Max restart attempts ({Max}) reached for {Target}", knobs.MaxRestartAttempts, target.NameWithoutExtension);
+            _logger.LogError("Per-session automatic restart budget ({Max}) exhausted for {Target}",
+                knobs.MaxRestartAttempts, target.NameWithoutExtension);
             try
             {
                 if (knobs.EnableToasts)
@@ -1067,23 +1077,28 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             return SessionEnd.HashMismatch;
         if (started == StartOutcome.Degraded)
         {
-            // A degraded (missing/unreadable) relaunch spends no budget and sleeps no restart
-            // delay; the session keeps polling and feeds the degraded indicator. Only a genuine
-            // launch that ran and failed advances the consecutive counter (budget-charge rule, E).
+            // A degraded (missing/unreadable) relaunch never reached the OS process-creation
+            // boundary: it spends no budget and sleeps no restart delay; the session keeps
+            // polling and feeds the degraded indicator (v2.7 §2.3).
             MarkDegraded(counters);
             return SessionEnd.Continue;
         }
 
-        // Budget-charge rule (E): only a genuine launched-but-failed attempt advances the
-        // consecutive counter; a successful automatic relaunch counts only toward the window
-        // (I, not in Stage 1) and is reset when the target is observed Running. So Verified
-        // must not consume the consecutive budget.
-        if (started == StartOutcome.NotStarted || started == StartOutcome.VerifyFailed)
+        // Budget-charge rule (v2.7 §2.2): the per-session budget is cumulative — every genuine
+        // automatic process-creation attempt consumes exactly one unit exactly once, after the
+        // typed launch outcome is known, regardless of success or failure: a verified relaunch
+        // (Verified), a failed startup verification (VerifyFailed), and a genuine creation
+        // failure (NotStarted; ProcessStartStatus.Failed) all charge here. A successful restart
+        // is NOT free: observing Running later must not refund a spent unit. Mismatch,
+        // cancellation, and pre-creation-boundary outcomes never reach this point and stay
+        // uncharged (Degraded returned above; SessionEnded/Mismatch returned earlier).
+        if (started is StartOutcome.NotStarted or StartOutcome.Verified or StartOutcome.VerifyFailed)
             counters.RestartAttempts++;
         if (started == StartOutcome.Verified)
             ResetDegraded(counters); // a genuinely-restarted target clears the degraded indicator
         var hasMoreAttempts = counters.RestartAttempts < knobs.MaxRestartAttempts || knobs.MaxRestartAttempts == 0;
-        if (started == StartOutcome.NotStarted || (started == StartOutcome.VerifyFailed && hasMoreAttempts))
+        if (started == StartOutcome.NotStarted || started == StartOutcome.LaunchError ||
+            (started == StartOutcome.VerifyFailed && hasMoreAttempts))
         {
             try
             {
@@ -1098,7 +1113,20 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         return SessionEnd.Continue;
     }
 
-    private enum StartOutcome { NotStarted, Verified, VerifyFailed, Blocked, Degraded, SessionEnded, Mismatch }
+    /// <summary>Typed outcome of a launch+verify sequence. Only <see cref="NotStarted"/>,
+    /// <see cref="Verified"/>, and <see cref="VerifyFailed"/> imply a genuine OS process-creation
+    /// attempt was made and consume the per-session restart budget (v2.7).
+    /// <see cref="Degraded"/> means the launch was blocked before process creation
+    /// (missing/unreadable target); <see cref="SessionEnded"/>/<see cref="Blocked"/> mean
+    /// cancellation; <see cref="Mismatch"/> is the separate fatal integrity path.
+    /// <see cref="LaunchError"/> means the process-start adapter threw an unexpected exception:
+    /// by code inspection the concrete adapter converts every exception inside its launch
+    /// boundary (including the <c>Process.Start</c> call itself) into a typed
+    /// <see cref="ProcessStartStatus"/> result before propagating, so an exception reaching the
+    /// orchestrator cannot be a genuine failed creation call — it is treated as indeterminate,
+    /// stays uncharged, and keeps the session alive with the restart delay (fail-safe: never
+    /// spends the budget on an unobserved attempt).</summary>
+    private enum StartOutcome { NotStarted, Verified, VerifyFailed, Blocked, Degraded, SessionEnded, Mismatch, LaunchError }
 
     private async Task<StartOutcome> StartAndVerifyAsync(
         ProcessTarget target, CommittedSettingsSnapshot knobs, bool showRecoveryToast, CancellationToken ct)
@@ -1154,8 +1182,12 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         }
         catch (Exception ex)
         {
+            // Indeterminate adapter exception (v2.7 §2.3): the concrete adapter converts every
+            // exception inside its launch boundary into a typed result, so an exception here is
+            // not an observed genuine creation failure — LaunchError stays uncharged (see the
+            // StartOutcome documentation) and keeps the session alive.
             _logger.LogError(ex, "TryStart threw for {Target}", target.NameWithoutExtension);
-            return StartOutcome.NotStarted;
+            return StartOutcome.LaunchError;
         }
         finally
         {

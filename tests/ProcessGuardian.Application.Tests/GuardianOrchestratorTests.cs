@@ -1800,16 +1800,24 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
-    public async Task SuccessfulRelaunch_DoesNotAdvanceConsecutiveBudget_NoPrematureError()
+    public async Task SuccessfulRestart_ConsumesBudget_RunningDoesNotRefund_SecondExitExhausts()
     {
         using var h = new Harness();
-        // Every launch genuinely runs and verifies (Verified). Under the E budget-charge rule a
-        // successful automatic relaunch must NOT consume the consecutive budget (MaxRestartAttempts),
-        // so a fast-crash-then-successfully-relaunched target must not trip premature exhaustion.
+        // v2.7 cumulative budget semantics: a successful automatic restart DOES consume one
+        // per-session unit (the superseded consecutive-failure rule is gone), and repeated
+        // Running observations never refund a spent unit. Max=1: free initial launch, one
+        // budgeted successful restart, then the next down-state terminates with Error and
+        // no second automatic TryStart.
+        bool running = false;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Started(); });
+            .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
         h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
@@ -1817,13 +1825,153 @@ public class GuardianOrchestratorTests
         var start = await controller.StartAsync(h.Request(maxRestarts: 1));
         start.Started.Should().BeTrue();
 
-        // Free initial launch + two budgeted successful relaunches (MaxRestartAttempts=1 would have
-        // exhausted already if a successful relaunch wrongly consumed the consecutive budget).
-        await WaitUntilAsync(() => h.StartCallCount >= 3, "the free launch plus two successful relaunches to run");
+        // The free initial launch is Verified; observe it Running for several check cycles.
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Monitoring status after the free initial launch");
+        await WaitUntilAsync(() => h.CheckCount >= 3, "several Running observations after the initial launch");
+
+        // First exit: the only budgeted automatic restart (charged once, Verified).
+        running = false;
+        await WaitUntilAsync(() => h.StartCallCount == 2, "the single budgeted restart to launch");
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Monitoring status after the successful restart");
+
+        // Several Running observations must not refund the spent unit.
+        await WaitUntilAsync(() => h.CheckCount >= 6, "more Running observations after the restart");
+
+        // Second exit: the budget is already exhausted (Running never refunds it), so the
+        // session terminates with Error and no second automatic TryStart may occur.
+        running = false;
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
+            "the exhausted per-session budget to terminate the session with Error");
+
+        h.Statuses.Should().Contain(GuardianStatus.Error,
+            "a second exit after Max=1 must exhaust the cumulative budget (v2.7)");
+        // Free initial launch + exactly one budgeted restart; no third launch after exhaustion.
+        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task InitialRunningTarget_DoesNotConsumeBudget_FirstExitAllowsOneRestart()
+    {
+        using var h = new Harness();
+        // The target is already Running when the session begins: neither the free initial
+        // launch nor the automatic-restart budget is consumed; its first later exit still
+        // allows one automatic restart for Max=1, and the second exit exhausts (v2.7).
+        bool running = true;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
+        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(true));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1));
+        start.Started.Should().BeTrue();
+
+        // The target is observed Running without any launch: nothing is consumed.
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Monitoring status for the already-running target");
+        await WaitUntilAsync(() => h.CheckCount >= 2, "several Running observations with no launch");
+        h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        // First exit: the one allowed automatic restart for Max=1 (charged).
+        running = false;
+        await WaitUntilAsync(() => h.StartCallCount == 1, "the first exit to allow one automatic restart");
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Monitoring status after the restart");
+        await WaitUntilAsync(() => h.CheckCount >= 5, "several Running observations after the restart");
+
+        // Second exit: budget already spent, no refund from Running — Error, no second launch.
+        running = false;
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
+            "the exhausted budget to terminate the session with Error");
+
+        h.Statuses.Should().Contain(GuardianStatus.Error);
+        h.Monitor.Received(1).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Max2_AllowsExactlyTwoAutomaticAttempts_ThenExhausts()
+    {
+        using var h = new Harness();
+        // Every automatic attempt fails (genuine process-creation failure): Max=2 allows the
+        // free initial launch plus exactly two budgeted attempts, then the next down-state
+        // exhausts the cumulative budget and terminates with Error.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Failed("launch failed"); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 2, restartDelay: 0));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
+            "the exhausted Max=2 budget to terminate the session with Error");
+
+        h.Statuses.Should().Contain(GuardianStatus.Error);
+        // Free initial launch + exactly two budgeted attempts; no fourth launch after exhaustion.
+        h.Monitor.Received(3).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        // R-F settlement: the desired enabled=false was persisted best-effort on the fatal path.
+        h.Config.ReceivedCalls().Should().Contain(c =>
+            c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync),
+            "budget exhaustion must persist the desired disabled state (R-F)");
+    }
+
+    [Fact]
+    public async Task Max0_BudgetNeverExhausts()
+    {
+        using var h = new Harness();
+        // MaxRestartAttempts=0 disables the per-session budget: always-failing automatic
+        // attempts never exhaust it and never publish Error, while other protections
+        // (restart delay, typed outcomes) stay in force.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Failed("launch failed"); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 0, restartDelay: 0));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 5,
+            "far more than the Max=1 budget of automatic attempts to run");
 
         h.Statuses.Should().NotContain(GuardianStatus.Error,
-            "a successful automatic relaunch must not advance the consecutive budget (E)");
-        h.StartCallCount.Should().BeGreaterThanOrEqualTo(3);
+            "MaxRestartAttempts=0 means the per-session budget never exhausts");
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task LaunchError_AdapterThrows_Uncharged_SessionSurvives()
+    {
+        using var h = new Harness();
+        // Indeterminate adapter exception (v2.7 §2.3): the concrete adapter converts every
+        // exception inside its launch boundary into a typed result, so an exception reaching
+        // the orchestrator cannot be an observed genuine creation failure — it stays uncharged
+        // (fail-safe: the budget is never spent on an unobserved attempt) and the session
+        // survives with the restart delay between attempts.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; throw new InvalidOperationException("adapter fault"); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, restartDelay: 0));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 3,
+            "the adapter exception to be retried without consuming the budget");
+
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "an indeterminate adapter exception must not spend the budget or exhaust it");
         await controller.StopAsync();
     }
 
@@ -1832,7 +1980,7 @@ public class GuardianOrchestratorTests
     {
         using var h = new Harness();
         // Every launch fails (NotStarted): the free initial + MaxRestartAttempts=1 budgeted attempt
-        // exhaust the consecutive budget, and the final Save(false) fails on the fatal path.
+        // exhaust the cumulative per-session budget, and the final Save(false) fails on the fatal path.
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
