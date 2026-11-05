@@ -15,16 +15,25 @@ namespace ProcessGuardian.Infrastructure.Tests;
 public class ScheduledTaskAutostartServiceErrorTests
 {
     // A valid task export with the given parameter overrides, so /Query /XML results can be
-    // scripted as Enabled/Disabled/Misconfigured. Defaults match the expected autostart task.
+    // scripted as Enabled/Disabled/Misconfigured. Defaults match the expected autostart task,
+    // including the required explicit-false battery power policy (R-AS-POWER-POLICY).
     private static string TaskXml(
         string? command = null,
         string? arguments = " --background ",
         bool logonTrigger = true,
         string? logonType = "InteractiveToken",
         string? runLevel = "HighestAvailable",
-        string? enabled = "true")
+        string? enabled = "true",
+        string? disallowStartIfOnBatteries = "false",
+        string? stopIfGoingOnBatteries = "false")
     {
         var trigger = logonTrigger ? "<LogonTrigger />" : "<BootTrigger />";
+        var disallowEl = disallowStartIfOnBatteries is null
+            ? string.Empty
+            : $"<DisallowStartIfOnBatteries>{disallowStartIfOnBatteries}</DisallowStartIfOnBatteries>";
+        var stopEl = stopIfGoingOnBatteries is null
+            ? string.Empty
+            : $"<StopIfGoingOnBatteries>{stopIfGoingOnBatteries}</StopIfGoingOnBatteries>";
         return $"""
             <?xml version="1.0" encoding="UTF-16"?>
             <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -44,6 +53,8 @@ public class ScheduledTaskAutostartServiceErrorTests
                 </Exec>
               </Actions>
               <Settings>
+                {disallowEl}
+                {stopEl}
                 <Enabled>{enabled}</Enabled>
               </Settings>
             </Task>
@@ -224,10 +235,12 @@ public class ScheduledTaskAutostartServiceErrorTests
     }
 
     [Fact]
-    public async Task ReadState_MissingSettingsElement_IsUnknown_NotAutoEnabled()
+    public async Task ReadState_MissingSettingsElement_IsMisconfigured_BatteryFlagsUnverifiable()
     {
-        // The schema default applies only when <Settings> itself exists; a task without the
-        // whole <Settings> block stays fail-closed Unknown through the typed read.
+        // [R-AS-POWER-POLICY] A missing battery power flag is a mismatch (absence is never proof
+        // that the task is unrestricted — Windows defaults both flags to true), so a task without
+        // any <Settings> block reads as Misconfigured through the typed read. It is never
+        // auto-Enabled: the <Settings/Enabled> schema default does not apply without a Settings.
         var xml = System.Text.RegularExpressions.Regex.Replace(
             TaskXml(command: ExpectedCommand()),
             @"\s*<Settings>.*?</Settings>\s*",
@@ -237,7 +250,7 @@ public class ScheduledTaskAutostartServiceErrorTests
 
         var state = await service.ReadStateAsync();
 
-        state.Should().Be(AutostartState.Unknown);
+        state.Should().Be(AutostartState.Misconfigured);
     }
 
     [Fact]

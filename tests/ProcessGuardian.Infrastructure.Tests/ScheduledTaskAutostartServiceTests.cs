@@ -14,15 +14,25 @@ namespace ProcessGuardian.Infrastructure.Tests;
 public class ScheduledTaskAutostartServiceTests
 {
     // A valid task export matching the expected autostart registration, with optional overrides.
+    // The battery power flags default to the required explicit-false policy (R-AS-POWER-POLICY);
+    // pass null to omit an element or a string to override its value.
     private static string TaskXml(
         string? command = null,
         string? arguments = " --background ",
         bool logonTrigger = true,
         string? logonType = "InteractiveToken",
         string? runLevel = "HighestAvailable",
-        string? enabled = "true")
+        string? enabled = "true",
+        string? disallowStartIfOnBatteries = "false",
+        string? stopIfGoingOnBatteries = "false")
     {
         var trigger = logonTrigger ? "<LogonTrigger />" : "<BootTrigger />";
+        var disallowEl = disallowStartIfOnBatteries is null
+            ? string.Empty
+            : $"<DisallowStartIfOnBatteries>{disallowStartIfOnBatteries}</DisallowStartIfOnBatteries>";
+        var stopEl = stopIfGoingOnBatteries is null
+            ? string.Empty
+            : $"<StopIfGoingOnBatteries>{stopIfGoingOnBatteries}</StopIfGoingOnBatteries>";
         return $"""
             <?xml version="1.0" encoding="UTF-16"?>
             <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -42,6 +52,8 @@ public class ScheduledTaskAutostartServiceTests
                 </Exec>
               </Actions>
               <Settings>
+                {disallowEl}
+                {stopEl}
                 <Enabled>{enabled}</Enabled>
               </Settings>
             </Task>
@@ -51,21 +63,16 @@ public class ScheduledTaskAutostartServiceTests
     private static string ExpectedCommand() =>
         Process.GetCurrentProcess().MainModule?.FileName ?? "C:\\Unknown\\app.exe";
 
+    // [R-AS-POWER-POLICY] The registration imports the definition XML built by
+    // BuildTaskDefinitionXml; /F force-overwrites an existing (e.g. battery-restricted) task.
     [Fact]
-    public void BuildCreateArguments_CreatesOnLogonTaskWithHighestRunLevel()
+    public void BuildCreateArguments_ImportsTaskDefinitionXml_FromTheGivenPath()
     {
-        var args = ScheduledTaskAutostartService.BuildCreateArguments(@"C:\Tools\app.exe");
+        var args = ScheduledTaskAutostartService.BuildCreateArguments(@"C:\Temp\def.xml");
 
         args.Should().Be(
-            $"/Create /TN \"{AppEdition.ScheduledTaskName}\" /TR \"\\\"C:\\Tools\\app.exe\\\" --background\" /SC ONLOGON /RL HIGHEST /F");
-    }
-
-    [Fact]
-    public void BuildCreateArguments_QuotesTaskTrigger_WithBackgroundFlag()
-    {
-        var args = ScheduledTaskAutostartService.BuildCreateArguments(@"C:\My Tools\app.exe");
-
-        args.Should().Contain("/TR \"\\\"C:\\My Tools\\app.exe\\\" --background\"");
+            $"/Create /TN \"{AppEdition.ScheduledTaskName}\" /XML \"C:\\Temp\\def.xml\" /F");
+        args.Should().NotContain("/TR", "the definition comes from the imported XML, not the /TR command line");
     }
 
     [Fact]
@@ -135,6 +142,8 @@ public class ScheduledTaskAutostartServiceTests
         descriptor.Value.LogonType.Should().Be("InteractiveToken");
         descriptor.Value.RunLevel.Should().Be("HighestAvailable");
         descriptor.Value.Enabled.Should().BeTrue();
+        descriptor.Value.DisallowStartIfOnBatteries.Should().BeFalse();
+        descriptor.Value.StopIfGoingOnBatteries.Should().BeFalse();
     }
 
     [Fact]
@@ -251,10 +260,12 @@ public class ScheduledTaskAutostartServiceTests
     }
 
     [Fact]
-    public void Evaluate_MissingSettingsElement_IsUnknown_NotAutoEnabled()
+    public void Evaluate_MissingSettingsElement_IsMisconfigured_BatteryFlagsUnverifiable()
     {
-        // The schema-default rule applies only when the <Settings> element itself exists; a task
-        // without any <Settings> block stays fail-closed Unknown (never auto-Enabled).
+        // [R-AS-POWER-POLICY] A missing battery power flag is a mismatch (absence is never proof
+        // that the task is unrestricted — Windows defaults both flags to true), so a task without
+        // any <Settings> block is Misconfigured. The R-AS-XML-VERIFY invariant is preserved: it
+        // is never auto-Enabled (its <Settings/Enabled> schema default does not apply here).
         var xml = System.Text.RegularExpressions.Regex.Replace(
             TaskXml(command: ExpectedCommand()),
             @"\s*<Settings>.*?</Settings>\s*",
@@ -266,7 +277,11 @@ public class ScheduledTaskAutostartServiceTests
         d!.Value.Enabled.Should().BeNull("no <Settings> element means no verified enabled value");
 
         ScheduledTaskAutostartService.Evaluate(d.Value, ExpectedCommand())
-            .Should().Be(AutostartState.Unknown);
+            .Should().Be(AutostartState.Misconfigured);
+        var checks = ScheduledTaskAutostartService.GetMismatches(d.Value, ExpectedCommand())
+            .Select(m => m.Check).ToList();
+        checks.Should().Contain("DisallowStartIfOnBatteries");
+        checks.Should().Contain("StopIfGoingOnBatteries");
     }
 
     // ------------------------------------------------------------------

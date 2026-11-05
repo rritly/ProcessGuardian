@@ -10,8 +10,10 @@ using ProcessGuardian.Domain.Interfaces;
 namespace ProcessGuardian.Infrastructure.Autostart;
 
 // HKCU Run keys cannot auto-elevate (UAC would prompt on every logon). The admin
-// edition therefore registers a scheduled task (ONLOGON, RunLevel HIGHEST), which
-// starts elevated silently. Created via schtasks.exe: no COM/WMI dependency.
+// edition therefore registers a scheduled task (LogonTrigger, RunLevel HIGHEST), which
+// starts elevated silently. Registered via "schtasks.exe /Create /XML" import (no COM/WMI
+// dependency): the /Create command line has no switches for the Task Settings power
+// restrictions, so the imported definition explicitly sets both battery flags to false.
 public sealed class ScheduledTaskAutostartService : IAutostartService
 {
     // Task Scheduler 2.0 export XML namespace.
@@ -225,7 +227,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                 return AutostartResult.Failure("the current executable path is unavailable for the autostart task", state);
             }
 
-            var create = await RunSchTasksAsync(BuildCreateArguments(exePath), ct).ConfigureAwait(false);
+            var create = await CreateTaskAsync(exePath, ct).ConfigureAwait(false);
             if (create.InvocationFailed)
             {
                 LogCommandFailure("create", create);
@@ -341,7 +343,9 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         bool HasLogonTrigger,
         string? LogonType,
         string? RunLevel,
-        bool? Enabled);
+        bool? Enabled,
+        bool? DisallowStartIfOnBatteries,
+        bool? StopIfGoingOnBatteries);
 
     /// <summary>A single failed verification check: which field, what was expected, what was found.</summary>
     internal readonly record struct TaskMismatch(string Check, string Expected, string Actual);
@@ -369,7 +373,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             return null;
 
         string? Command = null, Arguments = null, LogonType = null, RunLevel = null;
-        bool? Enabled = null;
+        bool? Enabled = null, DisallowStartIfOnBatteries = null, StopIfGoingOnBatteries = null;
         var hasLogonTrigger = false;
 
         XElement? FindChild(XElement parent, string localName) =>
@@ -426,9 +430,39 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                     "Autostart task XML has an unparsable <Enabled> value ({Value}); the enabled state stays unknown",
                     enabledEl.Value);
             }
+
+            // [R-AS-POWER-POLICY] The battery power restrictions must be explicitly false for the
+            // task to be power-source independent. Unlike <Enabled>, NO schema default is applied
+            // here: Windows defaults both flags to true, so a missing element is never proof that
+            // the task is unrestricted. A missing or unparsable value stays null (unverified),
+            // which GetMismatches classifies as a mismatch (fail-closed). Only the raw element
+            // value is logged — never the whole exported task XML.
+            var disallowEl = FindChild(settings, "DisallowStartIfOnBatteries");
+            if (disallowEl is not null)
+            {
+                if (bool.TryParse(disallowEl.Value, out var disallow))
+                    DisallowStartIfOnBatteries = disallow;
+                else
+                    logger?.LogWarning(
+                        "Autostart task XML has an unparsable <DisallowStartIfOnBatteries> value ({Value}); the flag stays unverified",
+                        disallowEl.Value);
+            }
+
+            var stopEl = FindChild(settings, "StopIfGoingOnBatteries");
+            if (stopEl is not null)
+            {
+                if (bool.TryParse(stopEl.Value, out var stop))
+                    StopIfGoingOnBatteries = stop;
+                else
+                    logger?.LogWarning(
+                        "Autostart task XML has an unparsable <StopIfGoingOnBatteries> value ({Value}); the flag stays unverified",
+                        stopEl.Value);
+            }
         }
 
-        return new TaskDescriptor(Command, Arguments, hasLogonTrigger, LogonType, RunLevel, Enabled);
+        return new TaskDescriptor(
+            Command, Arguments, hasLogonTrigger, LogonType, RunLevel, Enabled,
+            DisallowStartIfOnBatteries, StopIfGoingOnBatteries);
     }
 
     /// <summary>
@@ -451,8 +485,9 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     /// The set of verification checks that fail for the parsed task definition. An empty result
     /// means the task matches every autostart invariant (it may still be Disabled, or its Enabled
     /// flag may be unreadable, which Evaluate reports separately as Unknown). The security
-    /// invariants — LogonTrigger, InteractiveToken, HighestAvailable, the --background flag and
-    /// the exact-command requirement — are never relaxed by this classification.
+    /// invariants — LogonTrigger, InteractiveToken, HighestAvailable, the --background flag, the
+    /// exact-command requirement and the battery power policy — are never relaxed by this
+    /// classification.
     /// </summary>
     internal static IReadOnlyList<TaskMismatch> GetMismatches(TaskDescriptor d, string expectedCommand)
     {
@@ -475,6 +510,22 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
 
         if (!string.Equals(d.RunLevel, "HighestAvailable", StringComparison.OrdinalIgnoreCase))
             mismatches.Add(new TaskMismatch("RunLevel", "HighestAvailable", d.RunLevel ?? "<missing>"));
+
+        // [R-AS-POWER-POLICY] Battery independence: both Task Scheduler power restrictions must
+        // be explicitly false. A missing element or an unparsable value fails the check as well —
+        // absence is never proof that the task is unrestricted (Windows defaults both flags to
+        // true), so the task cannot be trusted as power-source independent unless the exported
+        // XML proves both flags false.
+        if (d.DisallowStartIfOnBatteries is not false)
+            mismatches.Add(new TaskMismatch(
+                "DisallowStartIfOnBatteries",
+                "false",
+                d.DisallowStartIfOnBatteries?.ToString() ?? "<missing>"));
+        if (d.StopIfGoingOnBatteries is not false)
+            mismatches.Add(new TaskMismatch(
+                "StopIfGoingOnBatteries",
+                "false",
+                d.StopIfGoingOnBatteries?.ToString() ?? "<missing>"));
 
         return mismatches;
     }
@@ -614,8 +665,98 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         }
     }
 
-    internal static string BuildCreateArguments(string exePath) =>
-        $"/Create /TN \"{AppEdition.ScheduledTaskName}\" /TR \"\\\"{exePath}\\\" --background\" /SC ONLOGON /RL HIGHEST /F";
+    // [R-AS-POWER-POLICY] Registers the autostart task by importing a full task-definition XML.
+    // "schtasks.exe /Create" has no command-line switches for the Task Settings power
+    // restrictions, and Windows defaults both <DisallowStartIfOnBatteries> and
+    // <StopIfGoingOnBatteries> to true — live evidence: the task created by the previous
+    // /TR command line exports both flags as true, which blocks the logon autostart on battery
+    // power and stops the running app when the charger is unplugged. A /Create /XML import with
+    // both flags explicitly false is the only schtasks.exe facility that can set them; no COM/WMI
+    // dependency is introduced. The definition file is written to a per-call temporary path and
+    // always deleted in a finally block — on success, on failure and on cancellation alike.
+    private async Task<SchTasksCommandResult> CreateTaskAsync(string exePath, CancellationToken ct)
+    {
+        var definitionPath = Path.Combine(
+            Path.GetTempPath(), $"ProcessGuardian-task-{Guid.NewGuid():N}.xml");
+        try
+        {
+            await File.WriteAllTextAsync(
+                definitionPath, BuildTaskDefinitionXml(exePath), Encoding.Unicode, ct)
+                .ConfigureAwait(false);
+            return await RunSchTasksAsync(BuildCreateArguments(definitionPath), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            TryDeleteDefinitionFile(definitionPath);
+        }
+    }
+
+    // Best-effort cleanup of the temporary task-definition file. A leftover file in the user's
+    // temp directory is non-consequential; a failed delete is logged and never thrown, so the
+    // create/verify outcome above is never masked by a cleanup error.
+    private void TryDeleteDefinitionFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "The temporary task-definition file could not be deleted: {Path}", path);
+        }
+    }
+
+    // [R-AS-POWER-POLICY] Builds the full Task Scheduler 2.0 definition XML imported by
+    // CreateTaskAsync. Every value — including the executable path — is escaped by the XElement
+    // construction itself; nothing machine-specific is hard-coded (the principal UserId is the
+    // identity the process actually runs under, resolved at runtime). All the autostart
+    // invariants are preserved: LogonTrigger, InteractiveToken, HighestAvailable, the quoted
+    // executable with the --background argument, the interactive user session. The power
+    // restrictions are explicitly false — Windows defaults are never relied upon.
+    internal static string BuildTaskDefinitionXml(string exePath)
+    {
+        var ns = TaskNs;
+        var doc = new XDocument(
+            new XDeclaration("1.0", "utf-16", null),
+            new XElement(ns + "Task",
+                new XAttribute("version", "1.2"),
+                new XElement(ns + "RegistrationInfo"),
+                new XElement(ns + "Triggers",
+                    new XElement(ns + "LogonTrigger")),
+                new XElement(ns + "Principals",
+                    new XElement(ns + "Principal",
+                        new XAttribute("id", "Author"),
+                        new XElement(ns + "UserId",
+                            $"{Environment.UserDomainName}\\{Environment.UserName}"),
+                        new XElement(ns + "LogonType", "InteractiveToken"),
+                        new XElement(ns + "RunLevel", "HighestAvailable"))),
+                new XElement(ns + "Settings",
+                    new XElement(ns + "DisallowStartIfOnBatteries", "false"),
+                    new XElement(ns + "StopIfGoingOnBatteries", "false"),
+                    new XElement(ns + "MultipleInstancesPolicy", "IgnoreNew"),
+                    new XElement(ns + "IdleSettings",
+                        new XElement(ns + "Duration", "PT10M"),
+                        new XElement(ns + "WaitTimeout", "PT1H"),
+                        new XElement(ns + "StopOnIdleEnd", "true"),
+                        new XElement(ns + "RestartOnIdle", "false")),
+                    new XElement(ns + "Enabled", "true")),
+                new XElement(ns + "Actions",
+                    new XAttribute("Context", "Author"),
+                    new XElement(ns + "Exec",
+                        new XElement(ns + "Command", $"\"{exePath}\""),
+                        new XElement(ns + "Arguments", "--background")))));
+
+        // XDocument.ToString() omits the XML declaration; it is prepended explicitly so the
+        // declared utf-16 encoding matches the Encoding.Unicode bytes the file is written with.
+        return $"{doc.Declaration}{Environment.NewLine}{doc}";
+    }
+
+    // The task definition is imported from the temporary XML file built by
+    // BuildTaskDefinitionXml ("schtasks.exe /Create" has no command-line switches for the Task
+    // Settings power restrictions). /F force-overwrites an existing registration so the repair
+    // path can replace a task with incorrect settings in place.
+    internal static string BuildCreateArguments(string definitionXmlPath) =>
+        $"/Create /TN \"{AppEdition.ScheduledTaskName}\" /XML \"{definitionXmlPath}\" /F";
 
     internal static string BuildDeleteArguments() =>
         $"/Delete /TN \"{AppEdition.ScheduledTaskName}\" /F";

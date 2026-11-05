@@ -75,6 +75,16 @@ public class ScheduledTaskAutostartXmlVerifyTests
     private static string RealWindowsTaskXmlWithEnabled(string value) =>
         RealWindowsTaskXml.Replace("<Settings>", $"<Settings>{Environment.NewLine}    <Enabled>{value}</Enabled>", StringComparison.Ordinal);
 
+    // Overrides the battery power flags of a real-export variant (R-AS-POWER-POLICY). The
+    // verbatim fixture keeps both flags true — the live evidence of the /TR-created task — so
+    // battery-compliant variants are derived explicitly.
+    private static string WithPowerPolicy(string xml, string disallow, string stop) =>
+        xml
+            .Replace("<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>",
+                $"<DisallowStartIfOnBatteries>{disallow}</DisallowStartIfOnBatteries>", StringComparison.Ordinal)
+            .Replace("<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>",
+                $"<StopIfGoingOnBatteries>{stop}</StopIfGoingOnBatteries>", StringComparison.Ordinal);
+
     private static string RealWindowsTaskXmlWithoutSettingsBlock() =>
         Regex.Replace(
             RealWindowsTaskXml,
@@ -116,26 +126,40 @@ public class ScheduledTaskAutostartXmlVerifyTests
         d.Value.LogonType.Should().Be("InteractiveToken");
         d.Value.RunLevel.Should().Be("HighestAvailable");
         d.Value.Arguments.Should().Contain("--background");
+        // R-AS-POWER-POLICY: the battery flags of the live /TR-created export are parsed and
+        // surface as explicitly true — the evidence of the power-policy defect.
+        d.Value.DisallowStartIfOnBatteries.Should().BeTrue(
+            "the live export proves the task was created with DisallowStartIfOnBatteries=true");
+        d.Value.StopIfGoingOnBatteries.Should().BeTrue(
+            "the live export proves the task was created with StopIfGoingOnBatteries=true");
     }
 
     [Fact]
-    public void ParseTaskXml_RealWindowsExportWithoutEnabledElement_AllVerificationChecksPass()
+    public void ParseTaskXml_RealWindowsExportWithoutEnabledElement_BatteryRestrictionsAreTheOnlyMismatches()
     {
+        // [R-AS-POWER-POLICY] The verbatim real export (both battery flags true) must fail the
+        // two battery power checks — and nothing else. Before R-AS-POWER-POLICY this task was
+        // (wrongly) considered fully compliant.
         var d = ScheduledTaskAutostartService.ParseTaskXml(RealWindowsTaskXml)!.Value;
 
         ScheduledTaskAutostartService.NormalizeCommand(d.Command).Should().Be(RealWindowsTaskExePath);
-        ScheduledTaskAutostartService.GetMismatches(d, RealWindowsTaskExePath)
-            .Should().BeEmpty("every autostart invariant except the optional Enabled flag matches the real export");
+        var mismatches = ScheduledTaskAutostartService.GetMismatches(d, RealWindowsTaskExePath);
+        mismatches.Should().HaveCount(2, "only the two battery power restrictions violate the policy");
+        mismatches.Select(m => m.Check).Should().BeEquivalentTo(
+            ["DisallowStartIfOnBatteries", "StopIfGoingOnBatteries"]);
+        mismatches.Should().OnlyContain(m => m.Expected == "false" && m.Actual == "True");
     }
 
     [Fact]
-    public void Evaluate_RealWindowsExportWithoutEnabledElement_IsEnabled()
+    public void Evaluate_RealWindowsExportWithoutEnabledElement_IsMisconfigured_BatteryRestrictionsTrue()
     {
+        // [R-AS-POWER-POLICY] The live /TR-created task (battery restrictions true) is
+        // Misconfigured even though it is enabled and every other invariant matches.
         var d = ScheduledTaskAutostartService.ParseTaskXml(RealWindowsTaskXml)!.Value;
 
         ScheduledTaskAutostartService.Evaluate(d, RealWindowsTaskExePath)
-            .Should().Be(AutostartState.Enabled,
-                "a successfully created task whose export omits the optional Enabled element is enabled");
+            .Should().Be(AutostartState.Misconfigured,
+                "a battery-restricted task cannot be trusted as the correct autostart entry");
     }
 
     // ------------------------------------------------------------------
@@ -146,7 +170,7 @@ public class ScheduledTaskAutostartXmlVerifyTests
     public void Evaluate_ExplicitEnabledTrue_IsEnabled()
     {
         var d = ScheduledTaskAutostartService.ParseTaskXml(
-            RealWindowsTaskXmlWithEnabled("true"))!.Value;
+            WithPowerPolicy(RealWindowsTaskXmlWithEnabled("true"), "false", "false"))!.Value;
 
         ScheduledTaskAutostartService.Evaluate(d, RealWindowsTaskExePath)
             .Should().Be(AutostartState.Enabled);
@@ -156,7 +180,7 @@ public class ScheduledTaskAutostartXmlVerifyTests
     public void Evaluate_ExplicitEnabledFalse_IsDisabled()
     {
         var d = ScheduledTaskAutostartService.ParseTaskXml(
-            RealWindowsTaskXmlWithEnabled("false"))!.Value;
+            WithPowerPolicy(RealWindowsTaskXmlWithEnabled("false"), "false", "false"))!.Value;
 
         ScheduledTaskAutostartService.Evaluate(d, RealWindowsTaskExePath)
             .Should().Be(AutostartState.Disabled);
@@ -170,8 +194,11 @@ public class ScheduledTaskAutostartXmlVerifyTests
     public void Evaluate_UnparsableEnabledValue_StaysUnknown_AndLogsBoundedDiagnostic()
     {
         var logger = new CapturingLogger();
+        // The battery flags are set to the compliant policy so this test isolates the Enabled
+        // failure mode (the verbatim export itself is Misconfigured by battery policy since
+        // R-AS-POWER-POLICY).
         var d = ScheduledTaskAutostartService.ParseTaskXml(
-            RealWindowsTaskXmlWithEnabled("maybe"), logger)!.Value;
+            WithPowerPolicy(RealWindowsTaskXmlWithEnabled("maybe"), "false", "false"), logger)!.Value;
 
         d.Enabled.Should().BeNull("an unparsable boolean must never be guessed");
         ScheduledTaskAutostartService.Evaluate(d, RealWindowsTaskExePath)
@@ -185,18 +212,19 @@ public class ScheduledTaskAutostartXmlVerifyTests
     }
 
     [Fact]
-    public void Evaluate_RealWindowsExportWithoutSettingsElement_IsUnknown_NotAutoEnabled()
+    public void Evaluate_RealWindowsExportWithoutSettingsElement_IsMisconfigured_NotAutoEnabled()
     {
-        // The schema-default rule covers only a missing <Enabled> inside an existing <Settings>
-        // element. A task without any <Settings> block is not covered by that rule and stays
-        // fail-closed Unknown.
+        // The <Settings/Enabled> schema-default rule covers only a missing <Enabled> inside an
+        // existing <Settings> element. A task without any <Settings> block has no verified
+        // enabled flag AND no verifiable battery policy — the missing battery flags are a
+        // mismatch (R-AS-POWER-POLICY), so the task is Misconfigured, never auto-Enabled.
         var d = ScheduledTaskAutostartService.ParseTaskXml(
             RealWindowsTaskXmlWithoutSettingsBlock())!;
 
         d.Should().NotBeNull("the task itself is still parsable without a Settings block");
         d!.Value.Enabled.Should().BeNull("no <Settings> element means no verified enabled value");
         ScheduledTaskAutostartService.Evaluate(d.Value, RealWindowsTaskExePath)
-            .Should().Be(AutostartState.Unknown);
+            .Should().Be(AutostartState.Misconfigured);
     }
 
     // ------------------------------------------------------------------
@@ -207,14 +235,17 @@ public class ScheduledTaskAutostartXmlVerifyTests
     public async Task Enable_FromAbsent_CreateExitsZero_VerifyQueryXmlWithoutEnabledElement_ReportsSuccessEnabled()
     {
         // The full SetEnabledAsync(true) flow against the real export shape: the pre-state read
-        // finds the task absent, /Create exits 0, and the post-operation /Query /XML returns the
-        // real export WITHOUT a <Settings/Enabled> element. In reality the created task points at
-        // the current executable, so the verification export's <Command> is substituted with the
-        // current process path; the rest of the export (including the absent <Enabled> element)
-        // stays verbatim. The enable must succeed with the verified Enabled state — not report
-        // the task as unverifiable.
-        var verificationXml = RealWindowsTaskXml.Replace(
-            RealWindowsTaskExePath, ExpectedCommand(), StringComparison.Ordinal);
+        // finds the task absent, /Create /XML exits 0, and the post-operation /Query /XML returns
+        // an export WITHOUT a <Settings/Enabled> element and WITH both battery flags explicitly
+        // false — exactly what the R-AS-POWER-POLICY XML import produces (the schema default for
+        // a battery flag is true, so the created XML sets both explicitly). In reality the
+        // created task points at the current executable, so the verification export's <Command>
+        // is substituted with the current process path; the rest of the export stays verbatim.
+        // The enable must succeed with the verified Enabled state — not report the task as
+        // unverifiable or Misconfigured.
+        var verificationXml = WithPowerPolicy(
+            RealWindowsTaskXml.Replace(RealWindowsTaskExePath, ExpectedCommand(), StringComparison.Ordinal),
+            "false", "false");
         var queryCalls = 0;
         ScheduledTaskAutostartService.SchTasksInvoker invoker = (arguments, _) =>
         {
