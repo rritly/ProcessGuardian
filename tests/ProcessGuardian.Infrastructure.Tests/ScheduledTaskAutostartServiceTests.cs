@@ -236,15 +236,37 @@ public class ScheduledTaskAutostartServiceTests
     }
 
     [Fact]
-    public void Evaluate_MissingEnabledFlag_IsUnknown_NotEnabled()
+    public void Evaluate_MissingEnabledElement_WithinSettings_DefaultsToEnabled()
     {
+        // [R-AS-XML-VERIFY] <Settings/Enabled> is optional in the Task Scheduler schema and
+        // defaults to true when the <Settings> element itself is present: a task without an
+        // <Enabled> child must verify as Enabled, not Unknown.
         var xml = TaskXml(command: ExpectedCommand(), enabled: "true")
             .Replace("<Enabled>true</Enabled>", string.Empty, StringComparison.Ordinal);
         var d = ScheduledTaskAutostartService.ParseTaskXml(xml)!.Value;
 
         var state = ScheduledTaskAutostartService.Evaluate(d, ExpectedCommand());
 
-        state.Should().Be(AutostartState.Unknown);
+        state.Should().Be(AutostartState.Enabled);
+    }
+
+    [Fact]
+    public void Evaluate_MissingSettingsElement_IsUnknown_NotAutoEnabled()
+    {
+        // The schema-default rule applies only when the <Settings> element itself exists; a task
+        // without any <Settings> block stays fail-closed Unknown (never auto-Enabled).
+        var xml = System.Text.RegularExpressions.Regex.Replace(
+            TaskXml(command: ExpectedCommand()),
+            @"\s*<Settings>.*?</Settings>\s*",
+            string.Empty,
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+        var d = ScheduledTaskAutostartService.ParseTaskXml(xml)!;
+
+        d.Should().NotBeNull("the task itself is still parsable without a Settings block");
+        d!.Value.Enabled.Should().BeNull("no <Settings> element means no verified enabled value");
+
+        ScheduledTaskAutostartService.Evaluate(d.Value, ExpectedCommand())
+            .Should().Be(AutostartState.Unknown);
     }
 
     // ------------------------------------------------------------------
@@ -470,15 +492,17 @@ public class ScheduledTaskAutostartServiceTests
     }
 
     [Fact]
-    public void Evaluate_RealSchedulerExport_MissingEnabledElement_IsUnknown_NotEnabled()
+    public void Evaluate_RealSchedulerExport_MissingEnabledElement_DefaultsToEnabled()
     {
+        // [R-AS-XML-VERIFY] A real Windows export without <Settings/Enabled> defaults to true
+        // (schema default); the previous behavior (Unknown) made a verified task unverifiable.
         var xml = RealTaskXml(command: ExpectedCommand(), enabled: "true")
             .Replace("<Enabled>true</Enabled>", string.Empty, StringComparison.Ordinal);
         var d = ScheduledTaskAutostartService.ParseTaskXml(xml)!;
 
         var state = ScheduledTaskAutostartService.Evaluate(d.Value, ExpectedCommand());
 
-        state.Should().Be(AutostartState.Unknown);
+        state.Should().Be(AutostartState.Enabled);
     }
 
     // ------------------------------------------------------------------

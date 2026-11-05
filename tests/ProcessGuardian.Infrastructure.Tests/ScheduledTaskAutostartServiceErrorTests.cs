@@ -209,11 +209,30 @@ public class ScheduledTaskAutostartServiceErrorTests
     }
 
     [Fact]
-    public async Task ReadState_MissingEnabledFlag_IsUnknown_NotEnabled()
+    public async Task ReadState_MissingEnabledElement_DefaultsToEnabled()
     {
-        // Build XML without the <Enabled> element by stripping it from a parseable document.
+        // [R-AS-XML-VERIFY] The Task Scheduler schema default for the optional <Settings/Enabled>
+        // element is true when <Settings> is present: a verified task without an <Enabled> child
+        // reads as Enabled, not Unknown.
         var xml = TaskXml(command: ExpectedCommand(), enabled: "true")
             .Replace("<Enabled>true</Enabled>", string.Empty, StringComparison.Ordinal);
+        var service = NewService(new Script { QueryExitCode = 0, QueryXml = xml, MutatingExitCode = 0 });
+
+        var state = await service.ReadStateAsync();
+
+        state.Should().Be(AutostartState.Enabled);
+    }
+
+    [Fact]
+    public async Task ReadState_MissingSettingsElement_IsUnknown_NotAutoEnabled()
+    {
+        // The schema default applies only when <Settings> itself exists; a task without the
+        // whole <Settings> block stays fail-closed Unknown through the typed read.
+        var xml = System.Text.RegularExpressions.Regex.Replace(
+            TaskXml(command: ExpectedCommand()),
+            @"\s*<Settings>.*?</Settings>\s*",
+            string.Empty,
+            System.Text.RegularExpressions.RegexOptions.Singleline);
         var service = NewService(new Script { QueryExitCode = 0, QueryXml = xml, MutatingExitCode = 0 });
 
         var state = await service.ReadStateAsync();

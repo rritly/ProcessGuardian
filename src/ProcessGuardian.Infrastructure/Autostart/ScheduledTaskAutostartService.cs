@@ -137,7 +137,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
 
         if (query.ExitCode == 0)
         {
-            var config = ParseTaskXml(query.StandardOutput);
+            var config = ParseTaskXml(query.StandardOutput, _logger);
             if (config is null)
             {
                 // Exit 0 but the XML is unparsable/unverifiable: a task we cannot describe is a
@@ -347,8 +347,9 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     internal readonly record struct TaskMismatch(string Check, string Expected, string Actual);
 
     // Parses the /XML export of a single task. Returns null (Unknown) when the XML cannot be
-    // interpreted — a task we cannot describe is a task we cannot call "enabled".
-    internal static TaskDescriptor? ParseTaskXml(string? xml)
+    // interpreted — a task we cannot describe is a task we cannot call "enabled". The optional
+    // logger receives a bounded diagnostic when an <Enabled> element holds an unparsable value.
+    internal static TaskDescriptor? ParseTaskXml(string? xml, ILogger? logger = null)
     {
         if (string.IsNullOrWhiteSpace(xml))
             return null;
@@ -397,13 +398,33 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             }
         }
 
+        // [R-AS-XML-VERIFY] Per the Windows Task Scheduler schema, <Enabled> under <Settings> is
+        // OPTIONAL and defaults to true when the <Settings> element itself is present (confirmed
+        // against a real /Query /XML export of a successfully created autostart task, which has
+        // no <Enabled> element at all). A missing <Enabled> inside an existing <Settings> block
+        // is therefore Enabled, not Unknown — otherwise a verified, successfully created task is
+        // reported as unverifiable. Fail-closed behavior is preserved: an <Enabled> element with
+        // an unparsable boolean keeps the state Unknown, and the schema-default rule is NOT
+        // extended to a task with no <Settings> element at all (that case stays Unknown).
         foreach (var settings in task.Elements().Where(e => e.Name.LocalName == "Settings"))
         {
             var enabledEl = FindChild(settings, "Enabled");
-            if (enabledEl is not null)
+            if (enabledEl is null)
             {
-                if (bool.TryParse(enabledEl.Value, out var en))
-                    Enabled = en;
+                // Schema default: Enabled = true when <Settings> exists without an <Enabled> child.
+                Enabled = true;
+            }
+            else if (bool.TryParse(enabledEl.Value, out var en))
+            {
+                Enabled = en;
+            }
+            else
+            {
+                // Fail-closed: an unreadable Enabled value must never be guessed. Only the raw
+                // element value is logged — never the whole exported task XML.
+                logger?.LogWarning(
+                    "Autostart task XML has an unparsable <Enabled> value ({Value}); the enabled state stays unknown",
+                    enabledEl.Value);
             }
         }
 
