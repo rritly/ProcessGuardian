@@ -1,6 +1,8 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using ProcessGuardian.Domain.ValueObjects;
 using ProcessGuardian.Infrastructure.ProcessMonitoring;
@@ -224,5 +226,209 @@ public class WindowsProcessMonitorTests : IDisposable
     public void ClassifyWin32Error_MapsDocumentedCodes(int nativeCode, ProcessStartStatus expected)
     {
         WindowsProcessMonitor.ClassifyWin32Error(nativeCode).Should().Be(expected);
+    }
+
+    // ---------------------------------------------------------------------
+    // R-AS-RECOVERY-CORRECTNESS: per-process inspection classification (§5).
+    // ERROR_ACCESS_DENIED (5) and ERROR_PARTIAL_COPY (299) keep their own
+    // meanings; 299 never proves absence — the exit of exactly the inspected
+    // process must be positively established before exclusion.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public void ClassifyInspection_ReadableModulePath_IsReadableCandidate()
+    {
+        var candidate = WindowsProcessMonitor.ClassifyInspection(101, @"C:\App\target.exe", null, null);
+
+        candidate.Should().NotBeNull();
+        candidate!.Value.ProcessId.Should().Be(101);
+        candidate.Value.ModulePath.Should().Be(@"C:\App\target.exe");
+        candidate.Value.Unreadable.Should().BeFalse();
+    }
+
+    [Fact]
+    public void ClassifyInspection_AccessDenied5_IsUnreadable_NeverExcluded()
+    {
+        // Access denied (5): the state is indeterminate even when an exit probe result is
+        // available — the process is never excluded on a denial, only on a positively
+        // established exit through the clean-read or partial-copy discipline.
+        var candidate = WindowsProcessMonitor.ClassifyInspection(101, null, 5, hasExited: true);
+
+        candidate.Should().NotBeNull("an access-denied process is never excluded from the candidates");
+        candidate!.Value.Unreadable.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ClassifyInspection_PartialCopy299_ExitedProcess_IsExcluded()
+    {
+        // §5.2: ERROR_PARTIAL_COPY (299) with the INSPECTED process's own positively
+        // established exit — the process contributes nothing (reliably absent).
+        var candidate = WindowsProcessMonitor.ClassifyInspection(202, null, 299, hasExited: true);
+
+        candidate.Should().BeNull("a positively exited process is excluded from the candidate list");
+    }
+
+    [Fact]
+    public void ClassifyInspection_PartialCopy299_StillAlive_IsUnreadable_NotExcluded()
+    {
+        // §5.2.4: a still-existing process whose full path could not be read stays
+        // conservatively indeterminate (Unknown), never NotRunning.
+        var candidate = WindowsProcessMonitor.ClassifyInspection(202, null, 299, hasExited: false);
+
+        candidate.Should().NotBeNull();
+        candidate!.Value.Unreadable.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ClassifyInspection_PartialCopy299_ExitUnverifiable_IsUnreadable()
+    {
+        // §5.2.5: when the exit could not be determined, the state stays indeterminate —
+        // no automatic inference of absence from 299.
+        var candidate = WindowsProcessMonitor.ClassifyInspection(202, null, 299, hasExited: null);
+
+        candidate.Should().NotBeNull();
+        candidate!.Value.Unreadable.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ClassifyInspection_UnknownWin32Code_IsUnreadable_NotAccessDenied()
+    {
+        // §5.3: an undocumented Win32 code keeps its own meaning — indeterminate, never
+        // silently classified as access denied and never proof of absence.
+        var candidate = WindowsProcessMonitor.ClassifyInspection(303, null, 87, hasExited: null);
+
+        candidate.Should().NotBeNull();
+        candidate!.Value.Unreadable.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ClassifyInspection_CleanRead_NoPath_Exited_IsExcluded()
+    {
+        // The existing positive-exit discipline for a clean read with no module path.
+        var candidate = WindowsProcessMonitor.ClassifyInspection(404, null, null, hasExited: true);
+
+        candidate.Should().BeNull();
+    }
+
+    [Fact]
+    public void ClassifyInspection_CleanRead_NoPath_AliveOrUnverifiable_IsUnreadable()
+    {
+        var alive = WindowsProcessMonitor.ClassifyInspection(404, null, null, hasExited: false);
+        alive.Should().NotBeNull();
+        alive!.Value.Unreadable.Should().BeTrue();
+
+        var unverifiable = WindowsProcessMonitor.ClassifyInspection(404, null, null, hasExited: null);
+        unverifiable.Should().NotBeNull();
+        unverifiable!.Value.Unreadable.Should().BeTrue();
+    }
+
+    // §5.2/§5.6: one of several same-name processes exited during the inspection — the exited
+    // one contributes nothing while a remaining readable match still means Running, and a
+    // live-but-unreadable candidate never becomes a false NotRunning.
+    [Fact]
+    public void EvaluateCandidates_OneExitedDuringInspection_RemainingReadableMatch_IsRunning()
+    {
+        // The exited process is excluded at the inspection seam (299 with a positively
+        // established exit of the inspected process itself).
+        var exited = WindowsProcessMonitor.ClassifyInspection(202, null, 299, hasExited: true);
+        exited.Should().BeNull("the exited process contributes nothing to the candidate list");
+
+        var result = WindowsProcessMonitor.EvaluateCandidates(@"C:\app\target.exe", new[]
+        {
+            new WindowsProcessMonitor.ProcessCandidate(101, @"C:\App\target.exe", Unreadable: false),
+        });
+
+        result.Outcome.Should().Be(ProcessOutcome.Running,
+            "one exited PID never proves the absence of every process with the same path");
+        result.ProcessId.Should().Be(101);
+    }
+
+    [Fact]
+    public void EvaluateCandidates_LiveButUnreadable299Candidate_IsUnknown_NotNotRunning()
+    {
+        // §5.2.6: a live process with 299 stays indeterminate — no false NotRunning.
+        var alive = WindowsProcessMonitor.ClassifyInspection(202, null, 299, hasExited: false);
+        alive.Should().NotBeNull();
+
+        var result = WindowsProcessMonitor.EvaluateCandidates(@"C:\app\target.exe", new[] { alive!.Value });
+
+        result.Outcome.Should().Be(ProcessOutcome.Unknown);
+    }
+
+    // §5.4: rate-limited inspection diagnostics — one full diagnostic at the first detection
+    // of a (PID, code) pair, bounded structured warnings without a repeated stack trace on
+    // later repeats, and a recovery entry that restores full diagnostics.
+    private sealed class CapturingLogger : ILogger<WindowsProcessMonitor>
+    {
+        public sealed record Entry(LogLevel Level, Exception? Exception, string Message);
+
+        public List<Entry> Entries { get; } = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add(new Entry(logLevel, exception, formatter(state, exception)));
+    }
+
+    [Fact]
+    public void InspectionDiagnostics_FirstOccurrenceFull_RepeatsRateLimited_RecoveryResets()
+    {
+        var logger = new CapturingLogger();
+        var monitor = new WindowsProcessMonitor(logger);
+        var ex299 = new Win32Exception(299, "partial copy");
+        var ex5 = new Win32Exception(5, "access denied");
+
+        // First detection: one full diagnostic — the exception payload (with its stack trace),
+        // the PID, the real native code, the operation and the process name.
+        monitor.LogInspectionFailure(4242, 299, "target", ex299);
+        logger.Entries.Should().HaveCount(1);
+        logger.Entries[0].Level.Should().Be(LogLevel.Warning);
+        logger.Entries[0].Exception.Should().BeSameAs(ex299,
+            "the first diagnostic carries the full exception payload for investigation");
+        logger.Entries[0].Message.Should().Contain("4242").And.Contain("299").And.Contain("target");
+
+        // Nine repeats of the same persistent condition: rate-limited, no additional entries.
+        for (var i = 0; i < 9; i++)
+            monitor.LogInspectionFailure(4242, 299, "target", ex299);
+        logger.Entries.Should().HaveCount(1, "repeats before the diagnostic interval produce no entries");
+
+        // The tenth repeat: one compact structured warning WITHOUT the exception payload —
+        // no repeated stack trace per cycle.
+        monitor.LogInspectionFailure(4242, 299, "target", ex299);
+        logger.Entries.Should().HaveCount(2);
+        logger.Entries[1].Level.Should().Be(LogLevel.Warning);
+        logger.Entries[1].Exception.Should().BeNull("repeated diagnostics carry no repeated stack trace");
+        logger.Entries[1].Message.Should().Contain("still fails").And.Contain("4242");
+
+        // A different (PID, code) pair is diagnosed in full immediately.
+        monitor.LogInspectionFailure(777, 5, "other", ex5);
+        logger.Entries.Should().HaveCount(3);
+        logger.Entries[2].Exception.Should().BeSameAs(ex5);
+        logger.Entries[2].Message.Should().Contain("777");
+
+        // Recovery of PID 4242: a separate diagnostic entry and a rate-limit state reset.
+        monitor.LogInspectionRecovered(4242);
+        logger.Entries.Should().HaveCount(4);
+        logger.Entries[3].Level.Should().Be(LogLevel.Information);
+        logger.Entries[3].Message.Should().Contain("recovered").And.Contain("4242");
+
+        // A new failure of PID 4242 is diagnosed in full again (the state was reset).
+        monitor.LogInspectionFailure(4242, 299, "target", ex299);
+        logger.Entries.Should().HaveCount(5);
+        logger.Entries[4].Exception.Should().BeSameAs(ex299);
+    }
+
+    [Fact]
+    public void InspectionDiagnostics_RecoveredWithoutPriorFailure_LogsNothing()
+    {
+        var logger = new CapturingLogger();
+        var monitor = new WindowsProcessMonitor(logger);
+
+        monitor.LogInspectionRecovered(999);
+
+        logger.Entries.Should().BeEmpty("a recovery entry is only logged for a previously failing PID");
     }
 }

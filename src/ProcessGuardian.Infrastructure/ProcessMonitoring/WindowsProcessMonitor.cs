@@ -8,7 +8,26 @@ namespace ProcessGuardian.Infrastructure.ProcessMonitoring;
 
 public sealed class WindowsProcessMonitor : IProcessMonitor
 {
+    // Win32 error codes of the per-process inspection probe (§5.1): every code must keep its
+    // own meaning — an access denial is not a partial copy, and neither of them is proof of
+    // process absence.
+    private const int ErrorAccessDenied = 5;
+    private const int ErrorPartialCopy = 299;
+
+    // The operation whose Win32 failure the inspection diagnostics report.
+    private const string InspectionOperation = "read the main module path";
+
+    // Rate-limited inspection diagnostics (§5.4): after the first full diagnostic of a
+    // (PID, Win32 code) pair, a compact structured warning is logged only every Nth repeat.
+    private const int InspectionDiagnosticRepeatInterval = 10;
+
     private readonly ILogger<WindowsProcessMonitor> _logger;
+
+    // Rate-limit state of the inspection diagnostics: per PID, per Win32 error code, how many
+    // times the failure has recurred since its first detection. Cleared (with a recovery log
+    // entry) when the inspection of that PID succeeds again.
+    private readonly object _inspectionDiagnosticsGate = new();
+    private readonly Dictionary<long, Dictionary<int, int>> _inspectionFailureCounts = new();
 
     public WindowsProcessMonitor(ILogger<WindowsProcessMonitor> logger)
     {
@@ -25,32 +44,11 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
             {
                 using (p)
                 {
-                    try
-                    {
-                        string? path = p.MainModule?.FileName;
-                        if (path is not null)
-                        {
-                            candidates.Add(new ProcessCandidate(p.Id, path, Unreadable: false));
-                        }
-                        else if (!p.HasExited)
-                        {
-                            // A readable process object with no module path is not proof of
-                            // absence (v2.8 §4.3): while the process may still be alive the
-                            // state is indeterminate, so it must not count as a readable
-                            // non-match (which would look like reliable NotRunning).
-                            candidates.Add(new ProcessCandidate(p.Id, null, Unreadable: true));
-                        }
-                        // A positively-exited process contributes nothing: it is reliably absent.
-                    }
-                    catch (Win32Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Access denied inspecting process {Pid}", p.Id);
-                        candidates.Add(new ProcessCandidate(p.Id, null, Unreadable: true));
-                    }
-                    catch (InvalidOperationException)
-                    {
-                        candidates.Add(new ProcessCandidate(p.Id, null, Unreadable: true));
-                    }
+                    // A positively-exited process contributes nothing (reliably absent); every
+                    // other inspected process yields a candidate snapshot (readable or
+                    // indeterminate).
+                    if (InspectCandidate(p) is { } candidate)
+                        candidates.Add(candidate);
                 }
             }
 
@@ -63,6 +61,171 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
             _logger.LogError(ex, "CheckAsync failed unexpectedly");
             return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
         }
+    }
+
+    // One per-process inspection (v2.8 §4.3 / §5): a readable module path makes the process a
+    // readable candidate; every unreadable probe stays an indeterminate candidate, except a
+    // positively established exit of the inspected process itself. ERROR_PARTIAL_COPY (299)
+    // never proves absence by itself: the exit of exactly the inspected process is verified
+    // through its own Process object (bound to the original handle, so a reused PID cannot
+    // confound the check) before the process may be excluded (§5.2). PID reuse therefore can
+    // never turn a live (or unverifiable) process into a NotRunning outcome.
+    private ProcessCandidate? InspectCandidate(Process p)
+    {
+        string? path = null;
+        int? win32Error = null;
+        try
+        {
+            path = p.MainModule?.FileName;
+        }
+        catch (Win32Exception ex)
+        {
+            win32Error = ex.NativeErrorCode;
+            LogInspectionFailure(p.Id, ex.NativeErrorCode, TryGetProcessName(p), ex);
+        }
+        catch (InvalidOperationException)
+        {
+            // The process object became invalid (it exited during inspection): conservatively
+            // indeterminate (v2.8 §4.3) — never proof of absence.
+            return new ProcessCandidate(p.Id, null, Unreadable: true);
+        }
+
+        if (path is not null)
+        {
+            LogInspectionRecovered(p.Id);
+            return new ProcessCandidate(p.Id, path, Unreadable: false);
+        }
+
+        // The exit is probed only when the module path is unavailable and the failure either
+        // requires exit verification (partial copy, §5.2) or was a clean read with no path
+        // (the existing positive-exit discipline). A non-299 Win32 failure (e.g. access
+        // denied) stays indeterminate without an exit check, as before.
+        bool? exited = win32Error is null || win32Error == ErrorPartialCopy
+            ? TryGetHasExited(p)
+            : null;
+        return ClassifyInspection(p.Id, path, win32Error, exited);
+    }
+
+    // Pure classification of one per-process inspection (testable seam): maps the probe's raw
+    // results to a candidate snapshot without live OS access-control scenarios.
+    // modulePath: the read module path (null when the read failed).
+    // win32ErrorCode: the failing probe's Win32 error code (null when the read succeeded or
+    // failed with a non-Win32 failure).
+    // hasExited: the exit check result (null when it could not be determined).
+    // Returns null when the process is positively exited and contributes nothing to the
+    // candidate list; a single excluded PID never proves the absence of every process with
+    // the same path — the remaining candidates are evaluated as usual.
+    internal static ProcessCandidate? ClassifyInspection(
+        int pid, string? modulePath, int? win32ErrorCode, bool? hasExited)
+    {
+        if (modulePath is not null)
+            return new ProcessCandidate(pid, modulePath, Unreadable: false);
+
+        if (win32ErrorCode == ErrorPartialCopy)
+        {
+            // ERROR_PARTIAL_COPY (299) never proves absence by itself (§5.2): exclusion
+            // requires the inspected process's own positively established exit; a still-alive
+            // process or an unverifiable state stays conservatively indeterminate (Unknown),
+            // never NotRunning.
+            return hasExited == true
+                ? null
+                : new ProcessCandidate(pid, null, Unreadable: true);
+        }
+
+        if (win32ErrorCode is not null)
+        {
+            // Access denied (5) or any other Win32 code: the process state is indeterminate.
+            return new ProcessCandidate(pid, null, Unreadable: true);
+        }
+
+        // No module path and no Win32 failure: a positively established exit is reliably
+        // absent; a still-running (or unverifiable) process stays indeterminate.
+        return hasExited == true
+            ? null
+            : new ProcessCandidate(pid, null, Unreadable: true);
+    }
+
+    // Safe exit check: the result is bound to this Process object's original handle (PID
+    // reuse cannot confound it), and any failure to determine the state yields null — the
+    // caller must then stay conservative (Unknown), never infer absence (§5.2.5).
+    private static bool? TryGetHasExited(Process p)
+    {
+        try
+        {
+            return p.HasExited;
+        }
+        catch (Win32Exception)
+        {
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    private static string? TryGetProcessName(Process p)
+    {
+        try
+        {
+            return p.ProcessName;
+        }
+        catch
+        {
+            // The name is optional diagnostic context; its unavailability must never turn an
+            // inspection failure into a check failure.
+            return null;
+        }
+    }
+
+    // Rate-limited inspection diagnostics (§5.4): the FIRST failure of a (PID, Win32 code)
+    // pair is logged in full — with the exception payload, including its stack trace, plus
+    // the PID, the real native error code, the operation type and the process name when
+    // known — so the diagnostic information stays available for investigation. Further
+    // repeats of the same persistent condition are bounded structured warnings WITHOUT the
+    // exception payload (at most one per repeat interval), so a permanent access restriction
+    // or bitness mismatch cannot flood the log with an identical stack trace on every
+    // inspection cycle. A later successful inspection of the PID logs a recovery entry and
+    // restores full diagnostics.
+    internal void LogInspectionFailure(int pid, int errorCode, string? processName, Win32Exception ex)
+    {
+        var repeatCount = 0;
+        lock (_inspectionDiagnosticsGate)
+        {
+            if (!_inspectionFailureCounts.TryGetValue(pid, out var codes))
+                codes = _inspectionFailureCounts[pid] = new Dictionary<int, int>();
+            codes.TryGetValue(errorCode, out repeatCount);
+            codes[errorCode] = repeatCount + 1;
+        }
+
+        if (repeatCount == 0)
+        {
+            // First detection: the full diagnostic (the exception carries the stack trace).
+            _logger.LogWarning(ex,
+                "Inspecting process {Pid}{Name} failed with Win32 {Code} during {Operation}; the process state requires verification",
+                pid, processName is null ? string.Empty : $" ({processName})", errorCode, InspectionOperation);
+            return;
+        }
+
+        if (repeatCount % InspectionDiagnosticRepeatInterval == 0)
+        {
+            // Rate-limited structured warning without the exception payload (no repeated
+            // stack trace per cycle); the cumulative count keeps the condition observable.
+            _logger.LogWarning(
+                "Inspecting process {Pid} still fails with Win32 {Code} during {Operation} (repeat {Count} since first detection); first-failure details were logged earlier",
+                pid, errorCode, InspectionOperation, repeatCount + 1);
+        }
+    }
+
+    // Recovery of a previously failing inspection (§5.4): a separate diagnostic entry and a
+    // reset of the rate-limit state, so a later failure is diagnosed in full again.
+    internal void LogInspectionRecovered(int pid)
+    {
+        bool hadFailures;
+        lock (_inspectionDiagnosticsGate)
+            hadFailures = _inspectionFailureCounts.Remove(pid);
+        if (hadFailures)
+            _logger.LogInformation("Process {Pid} inspection recovered; the earlier Win32 failure no longer occurs", pid);
     }
 
     // Unknown discipline (E), deterministic unit-test seam: Running only on a readable module

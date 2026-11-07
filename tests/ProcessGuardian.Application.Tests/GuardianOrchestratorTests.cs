@@ -1427,8 +1427,7 @@ public class GuardianOrchestratorTests
         // Fires every virtual timer due within t, in due order, advancing the clock to each
         // timer's due time so timers queued by fired continuations chain correctly.
         public void Advance(TimeSpan t)
-        {
-            var targetTicks = _nowTicks + t.Ticks;
+        {            var targetTicks = _nowTicks + t.Ticks;
             while (true)
             {
                 VirtualTimer? due = null;
@@ -1456,6 +1455,16 @@ public class GuardianOrchestratorTests
 
         public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>
             new VirtualTimer(this, callback, state, dueTime);
+
+        // Advances the raw clock WITHOUT firing queued timers. Models a synchronous blocking
+        // operation (a non-zero-length TryStart) that consumes wall-clock time: no scheduled
+        // wait can observe the intermediate moments and no queued callback fires during the
+        // blocking span, so the post-operation timestamp is deterministic.
+        public void AdvanceClockOnly(TimeSpan t)
+        {
+            lock (_gate)
+                _nowTicks += t.Ticks;
+        }
 
         public override DateTimeOffset GetUtcNow() => DateTimeOffset.UnixEpoch + new TimeSpan(Volatile.Read(ref _nowTicks));
 
@@ -2088,8 +2097,12 @@ public class GuardianOrchestratorTests
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
 
+    // §4.2/§4.3: the terminal Error is published BEFORE the disabled-save completes. The save
+    // runs in the outside-the-task continuation (SettleSessionOutcomeAsync, R-F), which is
+    // reached only after the session task has returned its terminal outcome — but the Error is
+    // already on the state channel while the persist is still parked on this barrier.
     [Fact]
-    public async Task FatalMismatch_ErrorPublishedOnlyAfterSessionTaskBySettleContinuation()
+    public async Task FatalMismatch_ErrorPublishedBeforeParkedDisabledSaveCompletes()
     {
         using var h = new Harness();
         // Pin at Start is "PIN"; at the launch re-verify the target reads "BB" -> fatal Mismatch.
@@ -2103,10 +2116,10 @@ public class GuardianOrchestratorTests
         var start = await controller.StartAsync(h.Request());
         start.Started.Should().BeTrue();
 
-        // Park the fatal disabled-save on a barrier. The persist runs in the outside-the-task
-        // continuation (SettleSessionOutcomeAsync, R-F), which is reached only after the session
-        // task has already returned its terminal outcome — so while the persist is parked, the
-        // session has ended and Error has NOT yet been published.
+        // Park the fatal disabled-save on a barrier. The publish now happens inside the
+        // outside-the-task continuation (SettleSessionOutcomeAsync, R-F) BEFORE the persist,
+        // so while the save is parked the Error must already be on the state channel — the
+        // first Error rendering never waits for disk I/O (§4.2).
         var persistedEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var releasePersist = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
@@ -2119,17 +2132,22 @@ public class GuardianOrchestratorTests
         await WaitUntilAsync(() => persistedEntered.Task.IsCompleted,
             "the fatal disabled-save (outside the session task) to be entered");
 
-        // The session task finished first (it must, for the continuation to be running its
-        // persist), yet the Error is only published after that persist: it is not emitted inside
-        // the session loop (R-F).
-        controller.CurrentState.Status.Should().NotBe(GuardianStatus.Error,
-            "Error is not published until the outside-the-task settle runs after the session task completes");
+        // The session task has finished and the Error was published before the parked save:
+        // the terminal state never waits for the completion of the persistence write.
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error,
+            "the terminal Error is published before the disabled-save completes (§4.2)");
+        controller.CurrentState.Reason.Should().Contain("no longer matches the recorded pin",
+            "the error card receives its final reason on the first display");
+        controller.CurrentState.SaveFailed.Should().BeFalse(
+            "the save has not completed yet, so no SaveFailed flag is known yet");
 
         releasePersist.TrySetResult(true);
-        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
-            "Error to be published once the settle continuation completes");
+        await WaitUntilAsync(() => h.Config.ReceivedCalls().Any(c =>
+                c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync)),
+            "the disabled-save to complete after the Error was already published");
 
-        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error,
+            "the successful persistence never changes the already published terminal reason");
         controller.CurrentState.IsDegraded.Should().BeFalse("a fatal Error is never degraded (R-F)");
     }
 
@@ -2648,12 +2666,11 @@ public class GuardianOrchestratorTests
         h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
 
-    // Required test #3: the recovery toast fires on the FIRST positive Running observation
-    // after an automatic restart — before the stability window completes, never merely because
-    // TryStart returned Started, at most once per attempt, and never duplicated when the
-    // process exits before stability.
+    // §6.2: the recovery toast fires only after the restarted attempt's FULL continuous
+    // stability window completes — the first positive Running observation alone never
+    // notifies, at most once per attempt, never merely because TryStart returned Started.
     [Fact]
-    public async Task RecoveryToast_FirstRunningAfterAutomaticRestart_BeforeStability_AtMostOnce()
+    public async Task RecoveryToast_SentOnlyAfterFullStabilityWindow_AtMostOnce()
     {
         using var h = new Harness();
         h.Time = new VirtualTimeProvider();
@@ -2677,35 +2694,191 @@ public class GuardianOrchestratorTests
         // The free initial attempt stabilizes: no toast — a Started result alone never notifies.
         await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
         await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial stability window to complete");
-        h.ToastTitles.Should().BeEmpty("Process.Start returning Started never notifies (v2.8.1 §D)");
+        h.ToastTitles.Should().BeEmpty("Process.Start returning Started never notifies (§6.2)");
 
-        // Crash: the budgeted automatic restart launches; the toast is pending, not sent.
+        // Crash: the budgeted automatic restart launches. The toast is pending but not sent.
         running = false;
         await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the budgeted automatic restart to launch");
-        h.ToastTitles.Should().BeEmpty("the toast waits for the first positive Running observation");
+        h.ToastTitles.Should().BeEmpty("the toast waits for the full stability window (§6.2)");
 
-        // First positive Running: the toast fires immediately. The virtual clock is not
-        // advanced past this observation afterwards, so the 2 s stability window cannot have
-        // completed — any toast that arrives now was sent before stability.
+        // First positive Running after the restart: still no toast — the stability window has
+        // only begun (the virtual clock is not advanced past it here, so any toast arriving
+        // now was sent before the window completed).
         var checksAtLaunch = h.CheckCount;
         await AdvanceUntilAsync(time, () => h.CheckCount >= checksAtLaunch + 1,
             "the restarted process to be observed Running once");
-        var stableAtToast = h.StableCount;
-        await WaitUntilAsync(() => h.ToastTitles.Contains("Process Recovered"),
-            "the recovery toast on the first positive Running observation");
-        h.StableCount.Should().Be(stableAtToast, "the toast precedes the completed stability window");
+        h.ToastTitles.Should().BeEmpty("the first Running observation alone does not notify (§6.2)");
         h.StableCount.Should().Be(1, "only the initial attempt's window completed so far");
 
-        // The process exits before stability: no duplicate toast, no refund; the unreplenished
-        // budget still terminates the session with Error on a normal tick.
-        running = false;
-        await AdvanceUntilAsync(time, () => h.CheckCount >= checksAtLaunch + 3,
-            "the exit and the follow-up ticks to run");
+        // The process keeps running through the full window: the toast fires exactly once.
+        await AdvanceUntilAsync(time, () => h.StableCount >= 2, "the restart's stability window to complete");
+        await WaitUntilAsync(() => h.ToastTitles.Contains("Process Recovered"),
+            "the recovery toast after the full stability window");
         h.ToastTitles.Count(t => t == "Process Recovered").Should().Be(1,
-            "at most one recovery toast per automatic attempt");
+            "at most one recovery toast per successful attempt (§6.2)");
+
+        // The process crashes again: the full stability window above already replenished the
+        // budget (§6.2), so this crash earns one more budgeted restart. The toast is spent —
+        // it must never fire a second time.
+        running = false;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 3,
+            "the third launch after the replenished budget earned one more restart");
+
+        // One positive observation begins the window, but the process exits BEFORE it
+        // completes: the pending-toast chance for this attempt is cancelled and the now
+        // unreplenished budget terminates the session with Error.
+        var checksAfterThirdLaunch = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= checksAfterThirdLaunch + 1,
+            "the third attempt to be observed Running once");
+        running = false;
         await AdvanceUntilAsync(time, () => controller.CurrentState.Status == GuardianStatus.Error,
-            "the unreplenished budget to terminate the session with Error");
-        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+            "the unreplenished budget to terminate the session with Error after the early exit");
+        h.ToastTitles.Count(t => t == "Process Recovered").Should().Be(1,
+            "no additional toast for the failed attempt (at most once per attempt)");
+        h.Monitor.Received(3).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    // §6.3.2: a process that exits before the stability window completes never yields the
+    // toast; a subsequent successful restart earns its own window and its own single toast.
+    [Fact]
+    public async Task RecoveryToast_CancelledWhenProcessExitsBeforeStabilityCompletes()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        bool running = false;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 2, checkInterval: 1, restartDelay: 1, startupTimeout: 2));
+        start.Started.Should().BeTrue();
+
+        // The free initial attempt stabilizes: no toast.
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial stability window to complete");
+        h.ToastTitles.Should().BeEmpty();
+
+        // First crash: the restart launches, is observed Running once (the window begins),
+        // and then exits BEFORE the window completes — the pending toast is cancelled.
+        running = false;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the first automatic restart to launch");
+        var checksAfterFirstRestart = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= checksAfterFirstRestart + 1,
+            "the restarted process to be observed Running once");
+        running = false;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 3,
+            "the second automatic restart to launch after the early exit");
+        h.ToastTitles.Should().BeEmpty(
+            "an attempt that exited before the full stability window never notifies (§6.3.2)");
+
+        // The second restart holds through the full window: exactly one toast in total.
+        await AdvanceUntilAsync(time, () => h.StableCount >= 2, "the second attempt's stability window to complete");
+        await WaitUntilAsync(() => h.ToastTitles.Contains("Process Recovered"),
+            "the recovery toast only for the fully stable attempt");
+        h.ToastTitles.Count(t => t == "Process Recovered").Should().Be(1,
+            "one toast per fully stable attempt, none for the attempt that died early");
+    }
+
+    // §6.3.3: an Unknown observation during the stability window voids the window without
+    // cancelling the pending toast; a fresh full window must complete before the toast fires.
+    [Fact]
+    public async Task RecoveryToast_UnknownDuringStability_VoidsWindow_NoPrematureToast()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        ProcessOutcome next = ProcessOutcome.NotRunning;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(next, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; next = ProcessOutcome.Running; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 1, restartDelay: 1, startupTimeout: 2));
+        start.Started.Should().BeTrue();
+
+        // The free initial attempt stabilizes: no toast.
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial stability window to complete");
+        h.ToastTitles.Should().BeEmpty();
+
+        // Crash, restart launch, one Running (window begins).
+        next = ProcessOutcome.NotRunning;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the automatic restart to launch");
+        var checksAtLaunch = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= checksAtLaunch + 1,
+            "the restarted process to be observed Running once");
+
+        // Unknown: the open stability window is voided, the toast stays pending — no toast now.
+        next = ProcessOutcome.Unknown;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= checksAtLaunch + 2, "an Unknown cycle to run");
+        h.ToastTitles.Should().BeEmpty("Unknown never confirms stability (§6.3.3)");
+
+        // A fresh Running holds through a full window: the toast fires exactly once.
+        next = ProcessOutcome.Running;
+        await AdvanceUntilAsync(time, () => h.StableCount >= 2, "the fresh stability window to complete");
+        await WaitUntilAsync(() => h.ToastTitles.Contains("Process Recovered"),
+            "the toast only after a fresh full stability window");
+        h.ToastTitles.Count(t => t == "Process Recovered").Should().Be(1);
+    }
+
+    // §6.3.6: a failing toast delivery must never block supervision nor crash the session —
+    // the delivery task is observed and its failure is logged, the checks keep flowing.
+    [Fact]
+    public async Task RecoveryToast_DeliveryFailure_DoesNotBlockMonitoring()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        bool running = false;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
+        h.Notifications.ShowAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromException(new InvalidOperationException("toast bus down")));
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 1, restartDelay: 1, startupTimeout: 2));
+        start.Started.Should().BeTrue();
+
+        // The initial attempt stabilizes, then the crash triggers the budgeted restart.
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial stability window to complete");
+        running = false;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the automatic restart to launch");
+
+        // The restarted attempt holds through the full window: the failing delivery is
+        // swallowed and the session keeps monitoring on subsequent ticks.
+        await AdvanceUntilAsync(time, () => h.StableCount >= 2, "the restart's stability window to complete");
+        var checksAfterStability = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= checksAfterStability + 2,
+            "the monitoring to keep flowing after the failed toast delivery");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Monitoring,
+            "a toast delivery failure never blocks or terminates the session (§6.3.6)");
+        controller.CurrentState.IsDegraded.Should().BeFalse();
+        h.CheckCount.Should().BeGreaterThanOrEqualTo(checksAfterStability + 2,
+            "normal checks continued after the failed delivery");
     }
 
     // Required test #6: RestartDelaySeconds longer than the check interval — no early launch,
@@ -3107,5 +3280,475 @@ public class GuardianOrchestratorTests
         h.Statuses.Should().NotContain(GuardianStatus.Error, "blocked attempts never charge the budget");
 
         await controller.StopAsync();
+    }
+
+    // ---------------------------------------------------------------------
+    // R-AS-RECOVERY-CORRECTNESS required deterministic tests: the spacing
+    // reference is the COMPLETION timestamp of the actual creation attempt
+    // (captured after TryStart returns), the deadline is derived each cycle
+    // from the CURRENT committed RestartDelaySeconds, and the terminal Error
+    // is published immediately without an intermediate Restarting.
+    // ---------------------------------------------------------------------
+
+    // Test A (§8): RestartDelaySeconds = 10; the first TryStart takes 2 virtual seconds; the
+    // completion timestamp is captured at t=2 (inside the TryStart stub, the same point the
+    // orchestrator samples after TryStart returns) and the next attempt cannot start before
+    // t=12 — verified directly at the second TryStart call.
+    [Fact]
+    public async Task RestartDelay_CompletionTimestampAfterNonZeroTryStart_NextLaunchNotBeforeFullDelay()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        long startTicks = time.GetTimestamp();
+        var launchTicks = new long[2];
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.StartCallCount++;
+                if (h.StartCallCount == 1)
+                {
+                    // The first (free) creation attempt consumes 2 virtual seconds of blocking
+                    // TryStart — no queued wait may fire during the blocking span.
+                    time.AdvanceClockOnly(TimeSpan.FromSeconds(2));
+                }
+                launchTicks[h.StartCallCount - 1] = time.GetTimestamp();
+                return ProcessStartResult.Started();
+            });
+
+        var controller = h.CreateController();
+        // Check interval 1 s, restart delay 10 s, unlimited budget; the process never appears.
+        var start = await controller.StartAsync(h.Request(maxRestarts: 0, checkInterval: 1, restartDelay: 10, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2,
+            "the restart to launch after the full spacing interval");
+
+        // The completion timestamp of the first attempt was captured AFTER TryStart returned:
+        // t=2 s (the stub consumed 2 s inside the call), with at most one scheduling step of
+        // jitter if the launch fired on the test's second Advance step.
+        var firstCompletionMs = (launchTicks[0] - startTicks) / TimeSpan.TicksPerMillisecond;
+        firstCompletionMs.Should().BeGreaterThanOrEqualTo(2000,
+            "the attempt timestamp is captured after the 2 s TryStart returned (§3.1)");
+        firstCompletionMs.Should().BeLessThanOrEqualTo(2100,
+            "the free launch happens on the first eligible tick, with at most one Advance step of jitter");
+
+        // The next attempt fires at the first normal tick at/after the deadline
+        // (completion + 10 s) — never earlier (the pre-TryStart anchoring would have allowed
+        // t=10 s); at most one 1 s normal-tick of alignment jitter past the deadline.
+        var completionGapMs = (launchTicks[1] - launchTicks[0]) / TimeSpan.TicksPerMillisecond;
+        completionGapMs.Should().BeGreaterThanOrEqualTo(10000,
+            "no launch before the full RestartDelaySeconds measured from the COMPLETED attempt (§3.1)");
+        completionGapMs.Should().BeLessThanOrEqualTo(13000,
+            "the launch fires on the first eligible normal tick at the deadline");
+        await controller.StopAsync();
+    }
+
+    // Test B (§8): TryStart returns Failed after 2 virtual seconds; the budget is charged
+    // exactly once and the next attempt is spaced a full RestartDelaySeconds from the Failed
+    // return, until the exhausted budget terminates the session with Error.
+    [Fact]
+    public async Task FailedLaunch_NonZeroTryStart_SpacesFromFailedReturn_ChargedOnce_TerminalError()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        long startTicks = time.GetTimestamp();
+        var launchTicks = new long[3];
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.StartCallCount++;
+                // Every actual creation attempt consumes 2 virtual seconds of blocking
+                // TryStart — no queued wait may fire during the blocking span.
+                time.AdvanceClockOnly(TimeSpan.FromSeconds(2));
+                launchTicks[h.StartCallCount - 1] = time.GetTimestamp();
+                return ProcessStartResult.Failed("launch failed");
+            });
+
+        var controller = h.CreateController();
+        // Max=2: the free launch (uncharged) plus two budgeted attempts; delay 10 s between
+        // actual attempts, check interval 1 s.
+        var start = await controller.StartAsync(h.Request(maxRestarts: 2, checkInterval: 1, restartDelay: 10, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the first budgeted attempt");
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 3, "the second budgeted attempt");
+
+        // launchTicks record each attempt's COMPLETION (captured after the 2 s blocking
+        // TryStart returned): the completion-to-completion gap equals RestartDelaySeconds
+        // (10 s, from the previous completion) plus the next attempt's own 2 s TryStart,
+        // with at most one tick of jitter. A pre-TryStart anchor would show a 10 s gap.
+        var firstGapMs = (launchTicks[1] - launchTicks[0]) / TimeSpan.TicksPerMillisecond;
+        var secondGapMs = (launchTicks[2] - launchTicks[1]) / TimeSpan.TicksPerMillisecond;
+        firstGapMs.Should().BeGreaterThanOrEqualTo(12000,
+            "the next attempt is never earlier than RestartDelaySeconds after the Failed attempt returned (§3.1)");
+        firstGapMs.Should().BeLessThanOrEqualTo(13000, "the launch fires on the first eligible normal tick");
+        secondGapMs.Should().BeGreaterThanOrEqualTo(12000,
+            "the spacing reference is re-anchored at the completed Failed attempt");
+        secondGapMs.Should().BeLessThanOrEqualTo(13000, "no extra delay beyond the first eligible normal tick");
+
+        // The budget was charged exactly once per budgeted attempt: after the second one the
+        // budget is exhausted and the session terminates with Error (no fourth TryStart).
+        await AdvanceUntilAsync(time, () => controller.CurrentState.Status == GuardianStatus.Error,
+            "the exhausted budget to terminate the session with Error");
+        h.Monitor.Received(3).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    // Test C (§3.3/§8): the deadline is derived each cycle from the CURRENT committed
+    // RestartDelaySeconds — decreasing it mid-session shortens the remaining interval (a
+    // launch the old 10 s value would have held until t=10 fires at t=6); increasing it
+    // afterwards extends the interval (the next attempt waits for the new 20 s deadline).
+    // The change never allows a launch earlier than the newly computed deadline.
+    [Fact]
+    public async Task RestartDelay_ChangeMidSession_DeadlineDerivedFromCurrentCommittedValue()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        long startTicks = time.GetTimestamp();
+        var launchTicks = new long[3];
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.StartCallCount++;
+                launchTicks[h.StartCallCount - 1] = time.GetTimestamp();
+                return ProcessStartResult.Failed("launch failed");
+            });
+
+        var controller = h.CreateController();
+        // Max=0 (unlimited): the mid-session change alone must control the cadence.
+        var start = await controller.StartAsync(h.Request(maxRestarts: 0, checkInterval: 1, restartDelay: 10, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await AdvanceUntilAsync(time, () => h.StartCallCount >= 1, "the free launch to fail at the first tick");
+
+        // Decrease at t=5 s: 10 -> 2 s. The new deadline (0 + 2 s) is already elapsed, so the
+        // launch is allowed on the first normal tick after the change (t=6 s) — the old 10 s
+        // deadline would have held it until t=10 s.
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - startTicks >= TimeSpan.FromSeconds(5).Ticks,
+            "virtual time to reach t=5 s");
+        var decrease = await controller.CommitSettingsAsync(
+            CommittedSettingsSnapshot.From(new AppSettings
+            {
+                MaxRestartAttempts = 0,
+                CheckIntervalSeconds = 1,
+                RestartDelaySeconds = 2,
+                StartupVerificationTimeoutSeconds = 1,
+            }), h.TargetPath);
+        decrease.Saved.Should().BeTrue();
+
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the restart on the first tick after the decrease");
+        var afterDecreaseMs = (launchTicks[1] - startTicks) / TimeSpan.TicksPerMillisecond;
+        afterDecreaseMs.Should().BeGreaterThanOrEqualTo(6000,
+            "the launch is allowed only on a normal tick (the change was committed at t=5 s)");
+        afterDecreaseMs.Should().BeLessThanOrEqualTo(6100,
+            "the decreased setting shortens the interval: the launch fires at the first normal tick (t=6 s), not at the old t=10 s deadline");
+
+        // Increase at t=7 s: 2 -> 20 s. The previous attempt completed at t=6 s; the new
+        // deadline (6 + 20 = 26 s) extends the wait — no launch before it despite the old
+        // 2 s interval having elapsed many times over.
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - startTicks >= TimeSpan.FromSeconds(7).Ticks,
+            "virtual time to reach t=7 s");
+        var increase = await controller.CommitSettingsAsync(
+            CommittedSettingsSnapshot.From(new AppSettings
+            {
+                MaxRestartAttempts = 0,
+                CheckIntervalSeconds = 1,
+                RestartDelaySeconds = 20,
+                StartupVerificationTimeoutSeconds = 1,
+            }), h.TargetPath);
+        increase.Saved.Should().BeTrue();
+
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - startTicks >= TimeSpan.FromSeconds(25).Ticks,
+            "checks to keep flowing while the extended interval is pending");
+        h.StartCallCount.Should().Be(2, "no launch before the newly computed (extended) deadline");
+
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 3, "the restart at the extended deadline");
+        var afterIncreaseMs = (launchTicks[2] - launchTicks[1]) / TimeSpan.TicksPerMillisecond;
+        afterIncreaseMs.Should().BeGreaterThanOrEqualTo(20000,
+            "the increased setting extends the interval from the previous completed attempt (§3.3)");
+        afterIncreaseMs.Should().BeLessThanOrEqualTo(21100,
+            "the launch fires on the first eligible normal tick at the extended deadline");
+
+        await controller.StopAsync();
+    }
+
+    // Test D (§4.4/§8): budget exhaustion — no intermediate Restarting is published inside the
+    // terminal sequence, the Error carries its final reason on the FIRST display (before the
+    // disabled-save completes), and a successful save preserves the reason with SaveFailed=false.
+    [Fact]
+    public async Task Exhaustion_ErrorWithoutIntermediateRestarting_PublishedBeforeParkedSave()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        // The launches succeed but the process never appears: both attempts die at the
+        // appearance deadline, and the second one exhausts the Max=1 budget.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Started(); });
+
+        var published = new ConcurrentQueue<GuardianStatus>();
+        var controller = h.CreateController();
+        controller.StateChanged += (_, s) => published.Enqueue(s.Status);
+
+        // Save #1 (Start's enabled=true persist) succeeds; the fatal settlement save parks.
+        var persistedEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePersist = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var saveCalls = 0;
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (Interlocked.Increment(ref saveCalls) == 2)
+                {
+                    persistedEntered.TrySetResult(true);
+                    return releasePersist.Task;
+                }
+                return Task.CompletedTask;
+            });
+
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2,
+            "the single budgeted restart to launch after the free attempt's appearance timeout");
+
+        // The budgeted attempt also never appears: the budget is exhausted on that decision
+        // cycle — the terminal Error is published with no additional Restarting state between
+        // the previous legitimate publications and the Error. The virtual clock must advance
+        // for the session loop to run the exhausting cycle (virtual timers fire only in
+        // Advance), hence AdvanceUntilAsync rather than WaitUntilAsync.
+        await AdvanceUntilAsync(time, () => persistedEntered.Task.IsCompleted,
+            "the fatal settlement save to be entered (the session task has already returned)");
+
+        // While the save is parked, the Error is ALREADY published with its final reason:
+        // the first display never waits for the persistence I/O (§4.2/§4.3).
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error,
+            "the terminal Error is published before the disabled-save completes (§4.2)");
+        controller.CurrentState.Reason.Should().Contain("exhausted",
+            "the error card receives its final reason on the first display");
+        controller.CurrentState.SaveFailed.Should().BeFalse("the parked save has not completed yet");
+
+        // Exactly one Restarting was published in the whole trace — the legitimate one for the
+        // budgeted attempt while the budget still allowed it; the exhausted decision cycle
+        // itself published no Restarting before the Error (§4.2).
+        var statuses = published.ToArray();
+        statuses.Count(s => s == GuardianStatus.Restarting).Should().Be(1,
+            "only the budgeted attempt's own Restarting is published; the terminal cycle skips it");
+        statuses.Last().Should().Be(GuardianStatus.Error,
+            "the terminal Error is the last published state while the save is parked");
+
+        var reasonWhileParked = controller.CurrentState.Reason;
+        releasePersist.TrySetResult(true);
+        await WaitUntilAsync(() => controller.CurrentState.SaveFailed is false
+            && h.Config.ReceivedCalls().Any(c => c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync)),
+            "the parked disabled-save to complete");
+
+        // The successful save never changes the already published terminal reason.
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
+        controller.CurrentState.Reason.Should().Be(reasonWhileParked,
+            "a successful save preserves the original Error reason (§4.3)");
+        controller.CurrentState.SaveFailed.Should().BeFalse("the save completed successfully");
+    }
+
+    // Test E (§4.3/§8): Stop during the terminal (budget-exhausted) settlement wins — the
+    // settlement holds the operation lock while its save is parked, the Stop linearizes after
+    // it, and the stale Error is never the final published state.
+    [Fact]
+    public async Task Exhaustion_RaceStop_DuringTerminalSettlement_StopWins_NoStaleError()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Failed("launch failed"); });
+
+        var published = new ConcurrentQueue<GuardianStatus>();
+        var controller = h.CreateController();
+        controller.StateChanged += (_, s) => published.Enqueue(s.Status);
+
+        // Save #1 (Start's enabled=true persist) succeeds; the fatal settlement save parks.
+        var persistedEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePersist = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var saveCalls = 0;
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (Interlocked.Increment(ref saveCalls) == 2)
+                {
+                    persistedEntered.TrySetResult(true);
+                    return releasePersist.Task;
+                }
+                return Task.CompletedTask;
+            });
+
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        // Free launch Failed at t=0 (uncharged); the budgeted attempt fails at t=1 and exhausts.
+        await AdvanceUntilAsync(time, () => persistedEntered.Task.IsCompleted,
+            "the terminal settlement to publish the Error and park its save");
+
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Error,
+            "the Error is published before the parked settlement save");
+
+        // Stop is pending on the operation lock held by the parked settlement.
+        var stopTask = controller.StopAsync();
+        releasePersist.TrySetResult(true);
+
+        var stop = await stopTask;
+        stop.RuntimeStopped.Should().BeTrue();
+
+        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Stopped,
+            "the final state to be Stopped after the Stop linearizes after the settlement");
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+        published.Last().Should().Be(GuardianStatus.Stopped,
+            "the stale terminal Error is never the final published state after a Stop");
+    }
+
+    // Test E (§4.3/§8): Start during the terminal (budget-exhausted) settlement begins a fresh
+    // session only after the settlement settles, and the stale Error never overwrites the new
+    // session's state; the new session re-persists IsMonitoringEnabled=true.
+    [Fact]
+    public async Task Exhaustion_RaceStart_DuringTerminalSettlement_NewSessionStartsClean()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Failed("launch failed"); });
+
+        var published = new ConcurrentQueue<GuardianStatus>();
+        var controller = h.CreateController();
+        controller.StateChanged += (_, s) => published.Enqueue(s.Status);
+
+        var persistedEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePersist = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var savedDocs = new List<AppSettings>();
+        var saveCalls = 0;
+        h.Config.SaveAsync(Arg.Do<AppSettings>(d => savedDocs.Add(d)), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (Interlocked.Increment(ref saveCalls) == 2)
+                {
+                    persistedEntered.TrySetResult(true);
+                    return releasePersist.Task;
+                }
+                return Task.CompletedTask;
+            });
+
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await AdvanceUntilAsync(time, () => persistedEntered.Task.IsCompleted,
+            "the terminal settlement to publish the Error and park its save");
+
+        // A new Start is pending on the operation lock held by the parked settlement.
+        var startTask = controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 1, restartDelay: 1, startupTimeout: 1));
+        releasePersist.TrySetResult(true);
+
+        var result = await startTask;
+        result.Started.Should().BeTrue("a new session may start once the previous settlement has settled");
+
+        await WaitUntilAsync(
+            () => controller.CurrentState.Status is GuardianStatus.Waiting
+                or GuardianStatus.Monitoring
+                or GuardianStatus.Restarting,
+            "the new session to be active");
+        published.Last().Should().BeOneOf(
+            new[] { GuardianStatus.Waiting, GuardianStatus.Monitoring, GuardianStatus.Restarting },
+            "the stale terminal Error from the old settlement must never be the final published state");
+        savedDocs.Last().IsMonitoringEnabled.Should().BeTrue(
+            "the new session re-persists IsMonitoringEnabled=true after the old disabled write");
+    }
+
+    // §4.4: a reliable NotRunning with the budget still permitting the restart still publishes
+    // the user-visible Restarting before the launch — the immediate-Error change only removes
+    // the intermediate state for already-terminal cycles, never the normal restart feedback.
+    // Publish coalesces CONSECUTIVE identical states, so two back-to-back restarts on an
+    // always-NotRunning trace may surface as one Restarting state; the assertion therefore
+    // checks that a Restarting was visibly published BEFORE each budgeted launch, captured
+    // inside the TryStart stub at the launch boundary itself.
+    [Fact]
+    public async Task Loss_WithBudgetRemaining_PublishesRestarting_BeforeLaunch()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        var restartingBeforeBudgetedLaunch = new bool[3];
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.StartCallCount++;
+                restartingBeforeBudgetedLaunch[h.StartCallCount - 1] =
+                    h.Statuses.Contains(GuardianStatus.Restarting);
+                return ProcessStartResult.Failed("launch failed");
+            });
+
+        var published = new ConcurrentQueue<GuardianStatus>();
+        var controller = h.CreateController();
+        controller.StateChanged += (_, s) => published.Enqueue(s.Status);
+
+        // Max=2: the free launch is uncharged; each of the two budgeted attempts is preceded
+        // by a user-visible Restarting and charged once.
+        var start = await controller.StartAsync(h.Request(maxRestarts: 2, checkInterval: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the first budgeted attempt");
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 3, "the second budgeted attempt");
+
+        // The free launch never shows Restarting; every budgeted launch does.
+        restartingBeforeBudgetedLaunch[0].Should().BeFalse(
+            "the free initial launch is never announced as a restart");
+        restartingBeforeBudgetedLaunch[1].Should().BeTrue(
+            "the first budgeted restart publishes Restarting before the launch (§4.4)");
+        restartingBeforeBudgetedLaunch[2].Should().BeTrue(
+            "the second budgeted restart publishes Restarting before the launch (§4.4)");
+
+        // The exhausted budget terminates the session with Error; no third budgeted launch.
+        await AdvanceUntilAsync(time, () => controller.CurrentState.Status == GuardianStatus.Error,
+            "the exhausted budget to terminate the session with Error");
+        published.Last().Should().Be(GuardianStatus.Error, "the exhausted budget terminates the session");
+        h.Monitor.Received(3).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
     }
 }

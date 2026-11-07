@@ -873,8 +873,8 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         // [R-F settlement sync] Settle under the operation lock, with the liveness re-check inside
         // the lock: Stop/Suspend tear the session holder down and a new Start replaces it, so a
         // stale fatal continuation — one that was already in flight past its first await while the
-        // persist ran — observes a stale reference and skips both the persist and the publish.
-        // Serializing the persist-and-publish with Start/Stop means a Stop during the settlement
+        // persist ran — observes a stale reference and skips both the publish and the persist.
+        // Serializing the publish-and-persist with Start/Stop means a Stop during the settlement
         // either wins the lock first (holder nulled -> this continuation skips) or runs after it
         // and publishes Stopped last; either way a stale Error is never the final published state,
         // and a late IsMonitoringEnabled=false / AutostartEnabled=false cannot disable a newer
@@ -885,10 +885,19 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             if (!ReferenceEquals(_sessionTask, sessionTask))
                 return;
 
-            // Persist enabled=false best-effort, then Error — a failed save never turns the
-            // terminal state into degraded, it is surfaced via the independent SaveFailed flag.
+            // Publish the terminal Error IMMEDIATELY (§4.2/§4.3): the final reason is complete on
+            // the first display and the card is never shown with an intermediate text first. The
+            // enabled=false persistence below is best-effort and must never delay the first Error
+            // rendering; a persistence failure only updates the independent SaveFailed flag and
+            // always preserves this original reason.
+            Publish(new MonitorState(GuardianStatus.Error, false, fatalReason, false));
+
+            // Persist enabled=false best-effort — a failed save never turns the terminal state
+            // into degraded; the failure is surfaced via the independent SaveFailed flag while
+            // the Error reason stays intact (§4.3 step 5).
             await TryPersistDisabledBestEffortAsync(_committed).ConfigureAwait(false);
-            Publish(new MonitorState(GuardianStatus.Error, false, fatalReason, _lastPersistFailed));
+            if (_lastPersistFailed)
+                Publish(new MonitorState(GuardianStatus.Error, false, fatalReason, true));
         }
         finally
         {
@@ -906,11 +915,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     //     at the bounded PhasePollMs cadence; a poll landing at/after the next tick's deadline
     //     IS that normal tick, so observation never postpones a normal tick and no separate
     //     observer task exists that could block, postpone or race the supervision loop;
-    //   - monotonic deadlines: the RestartDelaySeconds spacing deadline is armed ONLY at the
-    //     actual creation attempt (Started or a genuine Failed — the free initial attempt
-    //     included) and is never re-armed by an observation event: a fall, an appearance
-    //     timeout or a loss detection never restart the delay clock (v2.8 §3.2). The
-    //     appearance deadline and the stability boundary are computed from TimeProvider
+    //   - monotonic deadlines: the RestartDelaySeconds spacing clock is a single source of
+    //     truth — the completion timestamp of the last actual creation attempt (Started or
+    //     a genuine Failed — the free initial attempt included) — and the deadline is
+    //     derived from it each cycle against the CURRENT committed RestartDelaySeconds
+    //     (§3.3); it is never touched by an observation event: a fall, an appearance
+    //     timeout, a loss detection or an Unknown never change the reference (§3.2).
+    //     The appearance deadline and the stability boundary are computed from TimeProvider
     //     timestamps and are only ever re-evaluated on observations — never awaited inline,
     //     never busy-looped;
     //   - cancellation: the only waits are token-linked Task.Delay waits plus the launch-gate
@@ -942,16 +953,22 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                                                // launch awaiting its first positive appearance
             long? runningSince = null;         // stability-qualification start; null = not qualifying
             bool restartPending = false;       // the target is down and a launch decision is pending
-            long nextLaunchAllowedAt = 0;      // RestartDelaySeconds spacing deadline (0 = no
-                                               // spacing pending = allowed); armed ONLY at the
-                                               // actual creation attempt, never by an observation
-                                               // event (v2.8 §3.2)
-            bool toastPending = false;         // the current automatic attempt has not shown its recovery toast
+            long? lastCreationAttemptAt = null; // completion timestamp of the last actual creation
+                                                // attempt (Started or a genuine Failed, the free
+                                                // initial attempt included); null = no spacing
+                                                // reference = a launch is allowed. The
+                                                // RestartDelaySeconds deadline is derived per cycle
+                                                // from this value and the CURRENT committed
+                                                // RestartDelaySeconds (R-AS-RECOVERY-CORRECTNESS
+                                                // §3.3), so a mid-session setting change extends or
+                                                // shortens the remaining interval; it is the single
+                                                // source of truth for the spacing clock.
+            bool toastPending = false;         // the current automatic attempt has not shown its
+                                               // recovery toast (sent only after the attempt's FULL
+                                               // stability window completes — §6.2)
 
             while (!ct.IsCancellationRequested)
             {
-                knobs = _committed;
-
                 // ---- wait for the earliest event (normal tick, phase poll) ----
                 var phaseActive = attemptLaunchedAt is not null || runningSince is not null;
                 var now = _time.GetTimestamp();
@@ -972,6 +989,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                     return SessionEnd.Cancelled;
 
                 now = _time.GetTimestamp();
+                // Re-read the committed knobs AT THE DECISION POINT (§3.3): a settings commit
+                // that landed while the loop was asleep must take effect on the cycle it wakes
+                // into — the deadline is derived from the CURRENT committed RestartDelaySeconds,
+                // and the budget/timeout/toast knobs are read fresh per cycle as well.
+                knobs = _committed;
                 var stabilityDuration = TimeSpan.FromSeconds(knobs.StartupVerificationTimeoutSeconds);
                 var restartDelay = TimeSpan.FromSeconds(knobs.RestartDelaySeconds);
 
@@ -1015,16 +1037,6 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                             runningSince = now;
                             ResetDegraded(counters);
                             Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
-                            if (toastPending)
-                            {
-                                // v2.8.1 §D: the recovery toast is sent on the first positive
-                                // Running observation after an automatic restart — never merely
-                                // because Process.Start returned Started, at most once per
-                                // attempt, never duplicated for an attempt that exits before
-                                // stability, and never blocking supervision.
-                                toastPending = false;
-                                StartRecoveryToastSafe(knobs, ct);
-                            }
                         }
                         else if (_time.GetElapsedTime(runningSince.GetValueOrDefault()) >= stabilityDuration)
                         {
@@ -1039,26 +1051,46 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                             runningSince = null;
                             ResetDegraded(counters);
                             Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
+                            if (toastPending)
+                            {
+                                // R-AS-RECOVERY-CORRECTNESS §6.2: the recovery toast is sent only
+                                // after the attempt's FULL continuous stability window completes —
+                                // the first positive Running observation alone proves appearance,
+                                // not recovery, so a process that dies inside the window never
+                                // produces a false "Process Recovered". At most once per attempt
+                                // (cleared here), never for a failed attempt (never pending), and
+                                // never blocking supervision (the delivery task is observed).
+                                toastPending = false;
+                                StartRecoveryToastSafe(knobs, ct);
+                            }
                         }
                         break;
 
                     case ProcessOutcome.NotRunning:
+                    {
+                        // Set the decision fields first; the terminal determination (below) and
+                        // the Restarting publication are made only after the whole sub-case state
+                        // is established, so a cycle that is already terminal never publishes the
+                        // intermediate Restarting first (§4.2).
+                        var restartDecided = false;
+                        var publishRestarting = false;
                         if (runningSince is not null)
                         {
                             // Reliable absence during stability qualification: an unstable run,
                             // never a refund (v2.8 §3.3). The launch is decided on the normal
                             // ticks below (v2.8.1 §B.2), never on this phase poll directly, and
-                            // the RestartDelaySeconds clock is NOT re-armed here: it stays
-                            // anchored to the previous actual creation attempt (v2.8 §3.2).
+                            // the spacing clock is NOT touched here: it stays anchored to the
+                            // previous actual creation attempt (§3.2).
                             runningSince = null;
                             toastPending = false;
                             restartPending = true;
+                            restartDecided = true;
+                            publishRestarting = true;
                             // A qualification that began with the target already running (the
                             // free launch unused) resolves here: per v2.8 §3.1.2/§3.4 the first
                             // actual restart of such a session is budgeted, so the free launch
                             // is consumed by the resolved entry observation.
                             counters.InitialLaunchPending = false;
-                            Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
                         }
                         else if (attemptLaunchedAt is not null)
                         {
@@ -1068,39 +1100,75 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                             // (v2.8.1 §B.3); no charge is added — the attempt was already charged
                             // at its creation boundary. The next launch then happens on a normal
                             // tick, constrained only by the remaining budget and the spacing
-                            // deadline armed at that actual attempt — the timeout expiry never
-                            // re-arms the delay clock (v2.8 §3.2).
+                            // reference of that actual attempt — the timeout expiry never touches
+                            // the spacing clock (§3.2 items 6–9).
                             if (now - attemptLaunchedAt.GetValueOrDefault() >= DeadlineTicks(stabilityDuration))
                             {
                                 attemptLaunchedAt = null;
                                 toastPending = false;
                                 restartPending = true;
+                                restartDecided = true;
+                                publishRestarting = true;
                                 _logger.LogInformation(
                                     "Launched process {Target} did not appear within the startup timeout", target.NameWithoutExtension);
                                 counters.InitialLaunchPending = false;
-                                Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
                             }
                         }
                         else
                         {
                             // A loss detected on a check enters the restart decision path on that
-                            // cycle (v2.8.1 §B.1). No inline delay is ever awaited and no new
-                            // RestartDelaySeconds deadline is armed here: the spacing deadline
-                            // was armed at the previous actual creation attempt (the free initial
-                            // attempt included — freeness means no budget charge, not a missing
-                            // attempt, v2.8 §3.2), so the launch evaluation below is gated only
-                            // by that deadline, the budget and this fresh NotRunning observation.
+                            // cycle (v2.8.1 §B.1). No inline delay is ever awaited and the
+                            // spacing clock is NOT re-armed here: the spacing reference is the
+                            // previous actual creation attempt (the free initial attempt
+                            // included — freeness means no budget charge, not a missing
+                            // attempt, §3.2), so the launch evaluation below is gated only by
+                            // that reference, the budget and this fresh NotRunning observation.
                             restartPending = true;
+                            restartDecided = true;
+                            // During the session's free-launch retry the state stays Waiting;
+                            // otherwise the pending restart is user-visible.
+                            publishRestarting = !counters.InitialLaunchPending;
+                        }
 
-                            if (!counters.InitialLaunchPending)
+                        if (restartDecided)
+                        {
+                            // Terminal determination (§4.2): this cycle has just established a
+                            // reliable absence together with a pending restart decision that the
+                            // budget cannot fund — the outcome is already terminal. Publish no
+                            // intermediate Restarting: the settle continuation publishes the
+                            // final Error immediately (before any persistence I/O), and no
+                            // stale Restarting can follow it.
+                            if (knobs.MaxRestartAttempts > 0 && counters.RestartAttempts >= knobs.MaxRestartAttempts)
+                            {
+                                _logger.LogError("Automatic restart budget ({Max}) exhausted for {Target}; no stable run was established",
+                                    knobs.MaxRestartAttempts, target.NameWithoutExtension);
+                                try
+                                {
+                                    if (knobs.EnableToasts)
+                                        await _notifications.ShowAsync("Recovery Failed", string.Empty, ct).ConfigureAwait(false);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to show exhaustion toast");
+                                }
+
+                                return SessionEnd.BudgetExhausted;
+                            }
+
+                            if (publishRestarting)
                                 Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
                         }
+
                         break;
+                    }
 
                     case ProcessOutcome.Unknown:
                         // Prolonged-Unknown discipline (E, v2.8 §3.2/§3.3): never absence, never
                         // proof of stability, never a duplicate launch, never a refund. An open
                         // stability interval is voided; a fresh full interval is required later.
+                        // A pending recovery toast stays pending: the attempt has not completed
+                        // its full stability window (§6.2), and the next fresh positive Running
+                        // starts a new one.
                         _logger.LogWarning("Process state for {Target} could not be determined; skipping this cycle",
                             target.NameWithoutExtension);
                         MarkDegraded(counters);
@@ -1110,42 +1178,22 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
                 // ---- launch evaluation (normal supervision tick only, v2.8.1 §B.2) ----
                 // A pending restart is attempted on a tick whose fresh observation found the
-                // target reliably NotRunning, only after the RestartDelaySeconds deadline —
-                // measured from the previous actual creation attempt, not from the observation
-                // that detected the loss (v2.8 §3.2) — elapsed, and only while the budget
-                // permits — never on a phase deadline and never from a bare wake, so there is
-                // no busy loop and no early launch.
+                // target reliably NotRunning and only after the RestartDelaySeconds spacing
+                // interval — derived from the last COMPLETED actual creation attempt and the
+                // CURRENT committed RestartDelaySeconds (§3.3: a mid-session setting change
+                // extends or shortens the remaining interval, and a change can never allow an
+                // earlier start than the newly computed deadline) — elapsed. The budget
+                // exhaustion decision is made in the observation branch above (§4.2), so the
+                // launch evaluation only runs when the budget still permits the attempt.
+                var restartDelayElapsed = lastCreationAttemptAt is null
+                    || now - lastCreationAttemptAt.GetValueOrDefault() >= DeadlineTicks(restartDelay);
                 if (restartPending
                     && attemptLaunchedAt is null
                     && runningSince is null
                     && outcome == ProcessOutcome.NotRunning
                     && isNormalTick
-                    && now >= nextLaunchAllowedAt)
+                    && restartDelayElapsed)
                 {
-                    // Budget gate (v2.8 §2.1): before invoking another automatic attempt,
-                    // determine whether the next attempt would exceed the non-zero limit —
-                    // terminate immediately, without a delay and without another launch call.
-                    if (knobs.MaxRestartAttempts > 0 && counters.RestartAttempts >= knobs.MaxRestartAttempts)
-                    {
-                        _logger.LogError("Automatic restart budget ({Max}) exhausted for {Target}; no stable run was established",
-                            knobs.MaxRestartAttempts, target.NameWithoutExtension);
-                        try
-                        {
-                            if (knobs.EnableToasts)
-                                await _notifications.ShowAsync("Recovery Failed", string.Empty, ct).ConfigureAwait(false);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Failed to show exhaustion toast");
-                        }
-
-                        // Fatal: the budget is spent. The enabled=false persistence and the Error
-                        // publish happen outside the session task (SettleSessionOutcomeAsync), so
-                        // the loop may not await a store write and a new Start stays blocked only
-                        // until this task completes (R-F).
-                        return SessionEnd.BudgetExhausted;
-                    }
-
                     var automatic = !counters.InitialLaunchPending;
                     var (launch, attemptTimestamp) = await AttemptLaunchAsync(target, knobs, counters,
                         automatic, ct).ConfigureAwait(false);
@@ -1168,24 +1216,46 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                         case LaunchOutcome.StartFailed:
                             // Genuine creation failure (v2.8 §3.2): charged exactly once at the
                             // boundary (inside AttemptLaunchAsync); the free initial attempt stays
-                            // free. The spacing deadline is armed from THIS actual attempt (its
-                            // pre-start timestamp, v2.8 §3.2); the next attempt is re-decided on
-                            // a normal tick.
+                            // free. The spacing reference is this COMPLETED attempt (its
+                            // post-TryStart timestamp, §3.1); the next attempt is re-decided on a
+                            // normal tick.
                             counters.InitialLaunchPending = false;
                             restartPending = true;
-                            nextLaunchAllowedAt = attemptTimestamp + DeadlineTicks(restartDelay);
+                            lastCreationAttemptAt = attemptTimestamp;
+
+                            // Terminal determination (§4.2): the creation failure of the last
+                            // budgeted attempt has just exhausted the budget on this same cycle
+                            // while the target is reliably absent — the outcome is terminal and
+                            // the Error is published immediately (no further confirmation cycle
+                            // and no restart delay can change it).
+                            if (knobs.MaxRestartAttempts > 0 && counters.RestartAttempts >= knobs.MaxRestartAttempts)
+                            {
+                                _logger.LogError("Automatic restart budget ({Max}) exhausted for {Target}; no stable run was established",
+                                    knobs.MaxRestartAttempts, target.NameWithoutExtension);
+                                try
+                                {
+                                    if (knobs.EnableToasts)
+                                        await _notifications.ShowAsync("Recovery Failed", string.Empty, ct).ConfigureAwait(false);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to show exhaustion toast");
+                                }
+
+                                return SessionEnd.BudgetExhausted;
+                            }
+
                             break;
 
                         case LaunchOutcome.Launched:
                             // Started: charged once at the creation boundary (automatic). The
-                            // appearance/probation window begins at this actual attempt; the
-                            // first positive Running starts the stability qualification and, for
-                            // an automatic restart, shows the recovery toast (v2.8.1 §D). The
-                            // free attempt also forms the spacing reference (v2.8 §3.2).
+                            // appearance/probation window begins at this actual attempt; the FULL
+                            // stability window sends the recovery toast (§6.2). The free attempt
+                            // also forms the spacing reference (§3.2).
                             counters.InitialLaunchPending = false;
                             attemptLaunchedAt = attemptTimestamp;
                             restartPending = false;
-                            nextLaunchAllowedAt = attemptTimestamp + DeadlineTicks(restartDelay);
+                            lastCreationAttemptAt = attemptTimestamp;
                             toastPending = automatic;
                             break;
                     }
@@ -1279,10 +1349,10 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     /// process-creation boundary or is indeterminate — always uncharged.
     /// <see cref="LaunchOutcome.Mismatch"/> is the separate fatal integrity path;
     /// <see cref="LaunchOutcome.Cancelled"/> is routine session cancellation (never Error, never charged).
-    /// The result carries the creation-attempt timestamp captured immediately before the
-    /// synchronous <c>TryStart</c>; the session loop commits it as the restart-spacing
+    /// The result carries the completion timestamp captured immediately after the synchronous
+    /// <c>TryStart</c> returned (§3.1); the session loop commits it as the restart-spacing
     /// reference only for a <c>Started</c> result or a genuine <c>Failed</c> — every other
-    /// outcome leaves the previous reference untouched (v2.8 §3.2).</summary>
+    /// outcome leaves the previous reference untouched.</summary>
     private enum LaunchOutcome { Launched, StartFailed, BlockedDegraded, Mismatch, Cancelled }
 
     // The launch boundary of one supervision tick (v2.8.1 §B.2): hash gate → launch gate →
@@ -1290,8 +1360,8 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     // process-creation boundary (Started or a genuine Failed). No timed phase is awaited
     // here: appearance/stability observation is serviced by the session event loop itself,
     // so a launch can never hold a check, a retry decision or a notification. Returns the
-    // outcome plus the creation-attempt timestamp captured immediately before the synchronous
-    // TryStart (v2.8 §3.2).
+    // outcome plus the completion timestamp captured immediately after the synchronous
+    // TryStart returned (§3.1) — the spacing reference for the next attempt.
     private async Task<(LaunchOutcome Outcome, long AttemptTimestamp)> AttemptLaunchAsync(
         ProcessTarget target, CommittedSettingsSnapshot knobs, SessionCounters counters,
         bool automatic, CancellationToken ct)
@@ -1340,11 +1410,15 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
             InsideLaunchGateHook?.Invoke();
 
-            // The creation-attempt timestamp is captured immediately before the synchronous
-            // TryStart (v2.8 §3.2); the session loop commits it as the restart-spacing
-            // reference only after the result confirms Started or a genuine Failed.
-            attemptTimestamp = _time.GetTimestamp();
+            // The spacing reference is the COMPLETION timestamp of the actual creation attempt
+            // (§3.1): it is captured immediately AFTER the synchronous TryStart returns, so a
+            // TryStart that takes non-zero time extends the measured interval instead of eating
+            // into it — the next attempt is never earlier than a full RestartDelaySeconds after
+            // the previous attempt returned. The session loop commits it as the spacing
+            // reference only after the result confirms Started or a genuine Failed; every other
+            // outcome leaves the previous reference untouched.
             start = _monitor.TryStart(target, ct);
+            attemptTimestamp = _time.GetTimestamp();
         }
         catch (OperationCanceledException)
         {
