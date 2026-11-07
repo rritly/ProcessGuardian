@@ -40,9 +40,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     private static readonly TimeSpan DegradedRequiredDuration = TimeSpan.FromSeconds(120);
     private const int DegradedRequiredConsecutive = 2;
 
-    // Bounded cadence of the startup-appearance and stability phases (v2.8 §4.2): polls run no
-    // slower than this, independent of CheckIntervalSeconds (which may far exceed the one-second
-    // stability window). Exit notification is not used; the finite detection tolerance is
+    // Bounded observation cadence of the startup-appearance and stability phases (v2.8.1):
+    // while a phase is active the session loop observes at this cadence — it never blocks or
+    // postpones a normal CheckIntervalSeconds tick (a poll landing at/after the next tick's
+    // deadline IS that normal tick). Independent of CheckIntervalSeconds, which may far exceed
+    // the one-second windows. Exit notification is not used; the finite detection tolerance is
     // ~PhasePollMs plus the check duration and is documented instead of claimed exact.
     private const int PhasePollMs = 100;
 
@@ -894,6 +896,25 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         }
     }
 
+    // v2.8.1 (R-AS-RESTART-CADENCE): the session is a single non-blocking event loop, owned by
+    // the session task, that services independently of each other:
+    //   - the next normal supervision tick (CheckIntervalSeconds): recovery decisions and
+    //     automatic launches happen on these ticks — never on a phase deadline, never on a
+    //     bare deadline wake — and the tick schedule is deadline-anchored (one interval per
+    //     serviced tick, drift-free, no extra interval added after the work completes);
+    //   - startup-appearance/stability observation: while a phase is active the loop observes
+    //     at the bounded PhasePollMs cadence; a poll landing at/after the next tick's deadline
+    //     IS that normal tick, so observation never postpones a normal tick and no separate
+    //     observer task exists that could block, postpone or race the supervision loop;
+    //   - monotonic deadlines: RestartDelaySeconds launch spacing, the appearance deadline and
+    //     the stability boundary are computed from TimeProvider timestamps and are only ever
+    //     re-evaluated on observations — never awaited inline, never busy-looped;
+    //   - cancellation: the only waits are token-linked Task.Delay waits plus the launch-gate
+    //     critical section, so Stop/Suspend settle promptly and no late launch can occur.
+    // The budget (RestartAttempts) is charged exactly once at the actual automatic
+    // process-creation boundary and replenished only by a full continuous stability window
+    // (v2.8); the stability qualification never blocks a check, a retry decision, an eligible
+    // launch or the recovery notification.
     private async Task<SessionEnd> RunSessionAsync(SessionSnapshot session, CancellationToken ct)
     {
         var counters = new SessionCounters();
@@ -902,79 +923,67 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         var target = new ProcessTarget(session.TargetProcessPath, session.TargetNameWithoutExtension, session.WorkingDirectory);
         try
         {
-            if (_committed.InitialDelaySeconds > 0)
-            {
+            var knobs = _committed; // numeric knobs re-read each cycle; path+pin stay fixed
+
+            // Deadline-anchored normal cadence (v2.8.1 §B.1): the next tick is an absolute
+            // monotonic deadline, advanced by exactly one interval per serviced tick.
+            var initialDelay = TimeSpan.FromSeconds(knobs.InitialDelaySeconds);
+            var nextCheckDue = _time.GetTimestamp() + DeadlineTicks(initialDelay);
+            if (initialDelay > TimeSpan.Zero)
                 Publish(new MonitorState(GuardianStatus.Waiting, false, null, false));
-                if (!await WaitForDelayAsync(TimeSpan.FromSeconds(_committed.InitialDelaySeconds), ct).ConfigureAwait(false))
-                    return SessionEnd.Cancelled;
-            }
+
+            // Attempt/qualification state, all session-owned by this loop (no separate observer
+            // task exists; nothing here ever launches from a detached callback).
+            long? attemptLaunchedAt = null;    // outstanding launch awaiting its first positive appearance
+            long? runningSince = null;         // stability-qualification start; null = not qualifying
+            bool restartPending = false;       // the target is down and a launch decision is pending
+            long nextLaunchAllowedAt = 0;      // monotonic RestartDelaySeconds deadline (0 = not yet armed)
+            bool toastPending = false;         // the current automatic attempt has not shown its recovery toast
 
             while (!ct.IsCancellationRequested)
             {
-                var knobs = _committed; // numeric knobs re-read each cycle; path+pin stay fixed
+                knobs = _committed;
 
+                // ---- wait for the earliest event (normal tick, phase poll) ----
+                var phaseActive = attemptLaunchedAt is not null || runningSince is not null;
+                var now = _time.GetTimestamp();
+                var wake = nextCheckDue;
+                if (phaseActive)
+                {
+                    // The bounded non-blocking observation cadence for the appearance/stability
+                    // phases (v2.8 §4.2): independent of CheckIntervalSeconds (which may far
+                    // exceed the one-second windows) and never a substitute for the tick
+                    // schedule below. Detection precision is finite — ~PhasePollMs plus the
+                    // check duration — and is documented rather than claimed exact.
+                    var nextPoll = now + DeadlineTicks(TimeSpan.FromMilliseconds(PhasePollMs));
+                    if (nextPoll < wake)
+                        wake = nextPoll;
+                }
+
+                if (!await WaitUntilAsync(wake, ct).ConfigureAwait(false))
+                    return SessionEnd.Cancelled;
+
+                now = _time.GetTimestamp();
+                var stabilityDuration = TimeSpan.FromSeconds(knobs.StartupVerificationTimeoutSeconds);
+                var restartDelay = TimeSpan.FromSeconds(knobs.RestartDelaySeconds);
+
+                // ---- observation (one CheckAsync services every due purpose) ----
+                // A poll landing at/after the next tick's deadline services that normal tick:
+                // the next tick is one full interval later (anchored, drift-free). If a single
+                // check ever overruns its interval, the schedule re-anchors instead of bursting
+                // catch-up checks.
+                var isNormalTick = now >= nextCheckDue;
+                if (isNormalTick)
+                {
+                    nextCheckDue += DeadlineTicks(TimeSpan.FromSeconds(knobs.CheckIntervalSeconds));
+                    if (nextCheckDue <= now)
+                        nextCheckDue = now + DeadlineTicks(TimeSpan.FromSeconds(knobs.CheckIntervalSeconds));
+                }
+
+                ProcessOutcome outcome;
                 try
                 {
-                    var result = await _monitor.CheckAsync(target, ct).ConfigureAwait(false);
-                    switch (result.Outcome)
-                    {
-                        case ProcessOutcome.Running when counters.InitialLaunchPending:
-                            // Session entry with the target already positively running (v2.8 §3.1.2):
-                            // begin the stability window for the observed instance; no launch, no
-                            // charge. A full window replenishes the streak budget.
-                            var entry = await ObserveStartupAndStabilityAsync(target, knobs, counters, ct,
-                                startupStartedAt: null, alreadyRunning: true).ConfigureAwait(false);
-                            switch (entry)
-                            {
-                                case PhaseEnd.Stable:
-                                    counters.InitialLaunchPending = false;
-                                    counters.RestartAttempts = 0;
-                                    ResetDegraded(counters);
-                                    break;
-
-                                case PhaseEnd.AttemptFailed:
-                                    // The observed instance exited before the stability boundary:
-                                    // nothing was charged (no launch happened). Proceed directly to
-                                    // the restart request (v2.8 §3.1).
-                                    counters.InitialLaunchPending = false;
-                                    var endAfterEntry = await HandleTargetDownAsync(
-                                        session, target, counters, knobs, initialPending: false, ct).ConfigureAwait(false);
-                                    if (endAfterEntry != SessionEnd.Continue)
-                                        return endAfterEntry;
-                                    break;
-
-                                case PhaseEnd.Degraded:
-                                    MarkDegraded(counters);
-                                    break;
-
-                                default:
-                                    return SessionEnd.Cancelled;
-                            }
-                            break;
-
-                        case ProcessOutcome.Running:
-                            // Normal cadence (v2.8 §3.4): the streak budget can only be non-zero
-                            // inside a restart streak, which never returns to the cadence; a
-                            // Running observation here clears degraded tracking only.
-                            ResetDegraded(counters);
-                            Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
-                            break;
-
-                        case ProcessOutcome.Unknown:
-                            // Prolonged-Unknown discipline (E): each Unknown cycle skips silently and
-                            // feeds the degraded indicator (threshold-driven, never Error).
-                            _logger.LogWarning("Process state for {Target} could not be determined; skipping this cycle",
-                                target.NameWithoutExtension);
-                            MarkDegraded(counters);
-                            break;
-
-                        default:
-                            var end = await HandleTargetDownAsync(session, target, counters, knobs,
-                                counters.InitialLaunchPending, ct).ConfigureAwait(false);
-                            if (end != SessionEnd.Continue)
-                                return end;
-                            break;
-                    }
+                    outcome = (await _monitor.CheckAsync(target, ct).ConfigureAwait(false)).Outcome;
                 }
                 catch (OperationCanceledException)
                 {
@@ -983,14 +992,196 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 catch (Exception ex)
                 {
                     // F (SPEC §7.2.1/EH-02): a throwing check behaves like Unknown — the session
-                    // stays alive and only feeds the degraded indicator; it never escalates to
-                    // Error on its own. The loop simply keeps checking.
+                    // stays alive, degraded, and never escalates to Error on its own.
                     _logger.LogWarning(ex, "CheckAsync failed for {Target}; treating the cycle as unknown", target.NameWithoutExtension);
-                    MarkDegraded(counters);
+                    outcome = ProcessOutcome.Unknown;
                 }
 
-                if (!await WaitForNextCheckAsync(TimeSpan.FromSeconds(knobs.CheckIntervalSeconds), ct).ConfigureAwait(false))
-                    return SessionEnd.Cancelled;
+                switch (outcome)
+                {
+                    case ProcessOutcome.Running:
+                        attemptLaunchedAt = null; // positively observed: the appearance window is over
+                        restartPending = false;   // the target is up; no launch is needed
+                        if (runningSince is null)
+                        {
+                            runningSince = now;
+                            ResetDegraded(counters);
+                            Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
+                            if (toastPending)
+                            {
+                                // v2.8.1 §D: the recovery toast is sent on the first positive
+                                // Running observation after an automatic restart — never merely
+                                // because Process.Start returned Started, at most once per
+                                // attempt, never duplicated for an attempt that exits before
+                                // stability, and never blocking supervision.
+                                toastPending = false;
+                                StartRecoveryToastSafe(knobs, ct);
+                            }
+                        }
+                        else if (_time.GetElapsedTime(runningSince.GetValueOrDefault()) >= stabilityDuration)
+                        {
+                            // Fresh positive observation at/after the full duration: stable
+                            // (v2.8 §3.3). This is the only budget refund during a session.
+                            StabilityConfirmedHook?.Invoke();
+                            counters.RestartAttempts = 0;
+                            // The entry qualification resolved stably (v2.8 §3.1.2): the free
+                            // launch is spent — the first actual restart of this session is
+                            // budgeted, preserving the old PhaseEnd.Stable semantics.
+                            counters.InitialLaunchPending = false;
+                            runningSince = null;
+                            ResetDegraded(counters);
+                            Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
+                        }
+                        break;
+
+                    case ProcessOutcome.NotRunning:
+                        if (runningSince is not null)
+                        {
+                            // Reliable absence during stability qualification: an unstable run,
+                            // never a refund (v2.8 §3.3). The launch is decided on the normal
+                            // ticks below (v2.8.1 §B.2), never on this phase poll directly.
+                            runningSince = null;
+                            toastPending = false;
+                            restartPending = true;
+                            nextLaunchAllowedAt = now + DeadlineTicks(restartDelay);
+                            // A qualification that began with the target already running (the
+                            // free launch unused) resolves here: per v2.8 §3.1.2/§3.4 the first
+                            // actual restart of such a session is budgeted, so the free launch
+                            // is consumed by the resolved entry observation.
+                            counters.InitialLaunchPending = false;
+                            Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
+                        }
+                        else if (attemptLaunchedAt is not null)
+                        {
+                            // Appearance/probation window: a reliable absence before the deadline
+                            // is not yet a failure (the launched process may still be starting
+                            // up). At/after the deadline the attempt is marked not established
+                            // (v2.8.1 §B.3); no charge is added — the attempt was already charged
+                            // at its creation boundary. The next launch then happens on a normal
+                            // tick, constrained only by the remaining budget and the delay.
+                            if (now - attemptLaunchedAt.GetValueOrDefault() >= DeadlineTicks(stabilityDuration))
+                            {
+                                attemptLaunchedAt = null;
+                                toastPending = false;
+                                restartPending = true;
+                                nextLaunchAllowedAt = now + DeadlineTicks(restartDelay);
+                                _logger.LogInformation(
+                                    "Launched process {Target} did not appear within the startup timeout", target.NameWithoutExtension);
+                                counters.InitialLaunchPending = false;
+                                Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
+                            }
+                        }
+                        else
+                        {
+                            // A loss detected on a check enters the restart decision path on that
+                            // cycle (v2.8.1 §B.1). No inline delay is ever awaited: the launch is
+                            // gated by the monotonic deadline and reconsidered on every tick.
+                            if (!restartPending)
+                            {
+                                restartPending = true;
+                                // The free initial launch is not spaced by RestartDelaySeconds
+                                // (v2.8 §3.1 semantics preserved: the free attempt fires on the
+                                // detection tick). Only budgeted automatic restarts are spaced
+                                // between actual attempts, so the spacing clock is armed here
+                                // only once the free launch is spent.
+                                if (!counters.InitialLaunchPending)
+                                    nextLaunchAllowedAt = now + DeadlineTicks(restartDelay);
+                            }
+
+                            if (!counters.InitialLaunchPending)
+                                Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
+                        }
+                        break;
+
+                    case ProcessOutcome.Unknown:
+                        // Prolonged-Unknown discipline (E, v2.8 §3.2/§3.3): never absence, never
+                        // proof of stability, never a duplicate launch, never a refund. An open
+                        // stability interval is voided; a fresh full interval is required later.
+                        _logger.LogWarning("Process state for {Target} could not be determined; skipping this cycle",
+                            target.NameWithoutExtension);
+                        MarkDegraded(counters);
+                        runningSince = null;
+                        break;
+                }
+
+                // ---- launch evaluation (normal supervision tick only, v2.8.1 §B.2) ----
+                // A pending restart is attempted on a tick whose fresh observation found the
+                // target reliably NotRunning, only after the RestartDelaySeconds deadline
+                // elapsed, and only while the budget permits — never on a phase deadline and
+                // never from a bare wake, so there is no busy loop and no early launch.
+                if (restartPending
+                    && attemptLaunchedAt is null
+                    && runningSince is null
+                    && outcome == ProcessOutcome.NotRunning
+                    && isNormalTick
+                    && now >= nextLaunchAllowedAt)
+                {
+                    // Budget gate (v2.8 §2.1): before invoking another automatic attempt,
+                    // determine whether the next attempt would exceed the non-zero limit —
+                    // terminate immediately, without a delay and without another launch call.
+                    if (knobs.MaxRestartAttempts > 0 && counters.RestartAttempts >= knobs.MaxRestartAttempts)
+                    {
+                        _logger.LogError("Automatic restart budget ({Max}) exhausted for {Target}; no stable run was established",
+                            knobs.MaxRestartAttempts, target.NameWithoutExtension);
+                        try
+                        {
+                            if (knobs.EnableToasts)
+                                await _notifications.ShowAsync("Recovery Failed", string.Empty, ct).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Failed to show exhaustion toast");
+                        }
+
+                        // Fatal: the budget is spent. The enabled=false persistence and the Error
+                        // publish happen outside the session task (SettleSessionOutcomeAsync), so
+                        // the loop may not await a store write and a new Start stays blocked only
+                        // until this task completes (R-F).
+                        return SessionEnd.BudgetExhausted;
+                    }
+
+                    var automatic = !counters.InitialLaunchPending;
+                    var launch = await AttemptLaunchAsync(target, knobs, counters,
+                        automatic, ct).ConfigureAwait(false);
+                    switch (launch)
+                    {
+                        case LaunchOutcome.Cancelled:
+                            return SessionEnd.Cancelled;
+
+                        case LaunchOutcome.Mismatch:
+                            // Fail closed (K): the fatal integrity path is independent of the budget.
+                            return SessionEnd.HashMismatch;
+
+                        case LaunchOutcome.BlockedDegraded:
+                            // Blocked before the OS process-creation boundary (hash/launch Missing
+                            // or ReadError, indeterminate adapter exception): uncharged, the
+                            // restart stays pending and is reconsidered on the next tick (E).
+                            MarkDegraded(counters);
+                            break;
+
+                        case LaunchOutcome.StartFailed:
+                            // Genuine creation failure (v2.8 §3.2): charged exactly once at the
+                            // boundary (inside AttemptLaunchAsync); the free initial attempt stays
+                            // free. The next attempt is spaced by the restart delay and
+                            // re-decided on a normal tick.
+                            counters.InitialLaunchPending = false;
+                            restartPending = true;
+                            nextLaunchAllowedAt = _time.GetTimestamp() + DeadlineTicks(restartDelay);
+                            break;
+
+                        case LaunchOutcome.Launched:
+                            // Started: charged once at the creation boundary (automatic). The
+                            // appearance/probation window begins; the first positive Running
+                            // starts the stability qualification and, for an automatic restart,
+                            // shows the recovery toast (v2.8.1 §D).
+                            counters.InitialLaunchPending = false;
+                            attemptLaunchedAt = _time.GetTimestamp();
+                            restartPending = false;
+                            nextLaunchAllowedAt = attemptLaunchedAt.GetValueOrDefault() + DeadlineTicks(restartDelay);
+                            toastPending = automatic;
+                            break;
+                    }
+                }
             }
         }
         finally
@@ -1029,6 +1220,12 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         /// resets it to zero (the only refund during a session). Only a newly created monitoring
         /// session starts it at zero.</summary>
         public int RestartAttempts;
+        /// <summary>True while the session's free launch (v2.8 §3.1) is still unused: the first
+        /// actual <c>TryStart</c> of the session is uncharged, and it stops being pending at the
+        /// creation boundary (Started/Failed) or when an entry qualification resolves (a stable
+        /// or fallen entry-Running observation). A free launch blocked before the OS creation
+        /// boundary (hash/TryStart Missing or ReadError, adapter exception) keeps it pending,
+        /// so the free attempt is retried without spending budget.</summary>
         public bool InitialLaunchPending = true;
 
         // Degraded-indicator tracking (E): consecutive degraded checks and the monotonic
@@ -1066,199 +1263,38 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             Publish(new MonitorState(CurrentState.Status, true, "the target identity or reachability cannot be verified", CurrentState.SaveFailed));
     }
 
-    private async Task<SessionEnd> HandleTargetDownAsync(
-        SessionSnapshot session, ProcessTarget target,
-        SessionCounters counters,
-        CommittedSettingsSnapshot knobs, bool initialPending, CancellationToken ct)
-    {
-        if (initialPending)
-        {
-            _logger.LogInformation("Initial start for {Target}", target.NameWithoutExtension);
-            var initial = await LaunchObserveAsync(target, knobs, counters,
-                automatic: false, showRecoveryToast: false, ct).ConfigureAwait(false);
-            switch (initial)
-            {
-                case PhaseEnd.Stable:
-                    counters.InitialLaunchPending = false;
-                    counters.RestartAttempts = 0; // a full stable window replenishes the budget (v2.8)
-                    ResetDegraded(counters);
-                    return SessionEnd.Continue;
+    /// <summary>Typed outcome of a launch attempt within one supervision tick (v2.8.1).
+    /// <see cref="LaunchOutcome.Launched"/> means the process was created (charged at the
+    /// boundary when automatic) and its appearance window begins. <see cref="LaunchOutcome.StartFailed"/>
+    /// means a genuine creation failure (charged once at the boundary when automatic).
+    /// <see cref="LaunchOutcome.BlockedDegraded"/> means the flow was blocked before the OS
+    /// process-creation boundary or is indeterminate — always uncharged.
+    /// <see cref="LaunchOutcome.Mismatch"/> is the separate fatal integrity path;
+    /// <see cref="LaunchOutcome.Cancelled"/> is routine session cancellation (never Error, never charged).</summary>
+    private enum LaunchOutcome { Launched, StartFailed, BlockedDegraded, Mismatch, Cancelled }
 
-                case PhaseEnd.AttemptFailed:
-                    // The free initial attempt failed (genuine creation failure, no appearance
-                    // within the startup timeout, or an unstable run). It stays free (v2.8 §3.1);
-                    // its failure triggers the first budgeted automatic restart below.
-                    counters.InitialLaunchPending = false;
-                    break;
-
-                case PhaseEnd.Degraded:
-                    // A degraded (missing/unreadable) free launch spends no budget, does not
-                    // consume the free launch, and feeds the degraded indicator (E): keep
-                    // initial-pending, mark degraded.
-                    MarkDegraded(counters);
-                    return SessionEnd.Continue;
-
-                case PhaseEnd.Mismatch:
-                    // Fail closed (K): the fatal integrity path is independent of the budget.
-                    return SessionEnd.HashMismatch;
-
-                default:
-                    return SessionEnd.Cancelled;
-            }
-        }
-
-        // Restart-streak loop (v2.8 §2.1/§3.5): each iteration makes at most one automatic
-        // process-creation call, charged exactly once at that boundary. The loop ends on a
-        // confirmed stable run (counter reset), an exhausted non-zero budget (fatal Error,
-        // no further launch), a degraded block, or cancellation.
-        while (true)
-        {
-            // Budget gate (v2.8 §2.1): before invoking another automatic attempt, determine
-            // whether the next attempt would exceed the non-zero limit — terminate immediately,
-            // without a delay and without another process-creation call.
-            if (knobs.MaxRestartAttempts > 0 && counters.RestartAttempts >= knobs.MaxRestartAttempts)
-            {
-                _logger.LogError("Automatic restart budget ({Max}) exhausted for {Target}; no stable run was established",
-                    knobs.MaxRestartAttempts, target.NameWithoutExtension);
-                try
-                {
-                    if (knobs.EnableToasts)
-                        await _notifications.ShowAsync("Recovery Failed", string.Empty, ct).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to show exhaustion toast");
-                }
-
-                // Fatal: the budget is spent. The enabled=false persistence and the Error publish
-                // happen outside the session task (SettleSessionOutcomeAsync), so the loop may not
-                // await a store write and a new Start stays blocked only until this task completes (R-F).
-                return SessionEnd.BudgetExhausted;
-            }
-
-            Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
-            _logger.LogInformation("Restart attempt for {Target}", target.NameWithoutExtension);
-
-            // RestartDelaySeconds between actual automatic attempts (preserved).
-            if (!await WaitForDelayAsync(TimeSpan.FromSeconds(knobs.RestartDelaySeconds), ct).ConfigureAwait(false))
-                return SessionEnd.Cancelled;
-
-            // Pre-launch recheck (v2.8 §3.5): after the delay, before every automatic launch,
-            // a fresh target-state check suppresses duplicate starts when the target appears
-            // independently or becomes unlaunchable while a restart is pending.
-            ProcessCheckResult recheck;
-            try
-            {
-                recheck = await _monitor.CheckAsync(target, ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return SessionEnd.Cancelled;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Pre-launch recheck failed for {Target}; deferring the restart",
-                    target.NameWithoutExtension);
-                MarkDegraded(counters);
-                return SessionEnd.Continue;
-            }
-
-            switch (recheck.Outcome)
-            {
-                case ProcessOutcome.Running:
-                    // The target appeared on its own (or late): no duplicate launch; begin/continue
-                    // the stability tracking for the observed instance (v2.8 §3.5).
-                    var observed = await ObserveStartupAndStabilityAsync(target, knobs, counters, ct,
-                        startupStartedAt: null, alreadyRunning: true).ConfigureAwait(false);
-                    switch (observed)
-                    {
-                        case PhaseEnd.Stable:
-                            counters.RestartAttempts = 0; // full stable window replenishes (v2.8)
-                            ResetDegraded(counters);
-                            return SessionEnd.Continue;
-
-                        case PhaseEnd.AttemptFailed:
-                            // Down again before stability; nothing was charged (no launch happened):
-                            // back to the budget gate.
-                            continue;
-
-                        case PhaseEnd.Degraded:
-                            MarkDegraded(counters);
-                            return SessionEnd.Continue;
-
-                        default:
-                            return SessionEnd.Cancelled;
-                    }
-
-                case ProcessOutcome.Unknown:
-                    // Indeterminate: no launch, no charge — remain degraded and retry
-                    // observation on a later cycle (v2.8 §3.5).
-                    _logger.LogWarning("Pre-launch state for {Target} is indeterminate; deferring the restart",
-                        target.NameWithoutExtension);
-                    MarkDegraded(counters);
-                    return SessionEnd.Continue;
-
-                default: // NotRunning: proceed through the existing final launch gate
-                    break;
-            }
-
-            var phase = await LaunchObserveAsync(target, knobs, counters,
-                automatic: true, showRecoveryToast: true, ct).ConfigureAwait(false);
-            switch (phase)
-            {
-                case PhaseEnd.Stable:
-                    counters.RestartAttempts = 0; // full stable window replenishes (v2.8)
-                    ResetDegraded(counters);
-                    return SessionEnd.Continue;
-
-                case PhaseEnd.AttemptFailed:
-                    // The charged automatic attempt failed to establish a stable run. Back to
-                    // the budget gate: it terminates with Error immediately when the streak
-                    // budget is consumed (v2.8 §2.1), otherwise the next attempt follows.
-                    continue;
-
-                case PhaseEnd.Degraded:
-                    // Blocked before the OS process-creation boundary (hash/launch Missing or
-                    // ReadError, indeterminate adapter exception): uncharged, session survives (E).
-                    MarkDegraded(counters);
-                    return SessionEnd.Continue;
-
-                case PhaseEnd.Mismatch:
-                    return SessionEnd.HashMismatch;
-
-                default:
-                    return SessionEnd.Cancelled;
-            }
-        }
-    }
-
-    /// <summary>Typed outcome of a launch and its two timed observation phases (v2.8).
-    /// <see cref="PhaseEnd.Stable"/> means the full stability window completed on a fresh
-    /// positive Running observation and replenishes the streak budget. <see cref="PhaseEnd.AttemptFailed"/>
-    /// means the current attempt did not establish a stable run (already charged at its creation
-    /// boundary when automatic; uncharged when no launch happened). <see cref="PhaseEnd.Degraded"/>
-    /// means the flow was blocked before the OS process-creation boundary or is indeterminate —
-    /// always uncharged. <see cref="PhaseEnd.Mismatch"/> is the separate fatal integrity path;
-    /// <see cref="PhaseEnd.Cancelled"/> is routine session cancellation (never Error, never charged).</summary>
-    private enum PhaseEnd { Stable, AttemptFailed, Degraded, Mismatch, Cancelled }
-
-    private async Task<PhaseEnd> LaunchObserveAsync(
+    // The launch boundary of one supervision tick (v2.8.1 §B.2): hash gate → launch gate →
+    // synchronous TryStart, with the budget charged exactly once at the actual automatic
+    // process-creation boundary (Started or a genuine Failed). No timed phase is awaited
+    // here: appearance/stability observation is serviced by the session event loop itself,
+    // so a launch can never hold a check, a retry decision or a notification.
+    private async Task<LaunchOutcome> AttemptLaunchAsync(
         ProcessTarget target, CommittedSettingsSnapshot knobs, SessionCounters counters,
-        bool automatic, bool showRecoveryToast, CancellationToken ct)
+        bool automatic, CancellationToken ct)
     {
         var hash = await VerifyTargetHashAsync(target, knobs, ct).ConfigureAwait(false);
         switch (hash)
         {
             case HashVerifyResult.Cancelled:
-                return PhaseEnd.Cancelled;
+                return LaunchOutcome.Cancelled;
             case HashVerifyResult.Missing:
                 _logger.LogWarning("Target {Target} is missing before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                return PhaseEnd.Degraded;
+                return LaunchOutcome.BlockedDegraded;
             case HashVerifyResult.ReadError:
                 _logger.LogWarning("Target {Target} could not be read before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                return PhaseEnd.Degraded;
+                return LaunchOutcome.BlockedDegraded;
             case HashVerifyResult.Mismatch:
                 // Fail closed (K): hash mismatch is fatal. The enabled=false persistence and the
                 // Error publish are deferred to the outside-the-task continuation
@@ -1266,14 +1302,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 // outcome and never publishes Error from inside the session task.
                 _logger.LogError("Target {Target} no longer matches its recorded pin; terminating the session",
                     target.NameWithoutExtension);
-                return PhaseEnd.Mismatch;
+                return LaunchOutcome.Mismatch;
         }
 
         // Linearized launch (R-CD): only the final session/gate check and the synchronous
         // Process.Start run while _launchGate is held. The gate is released immediately after
-        // the process-creation result is captured — the timed phases, toasts and delays all
-        // run outside it and remain cancellable by the session token. Stop/Suspend close the
-        // gate and cancel the session in one brief critical section, then settle it outside the
+        // the process-creation result is captured — observation, toasts and delays all run
+        // outside it and remain cancellable by the session token. Stop/Suspend close the gate
+        // and cancel the session in one brief critical section, then settle it outside the
         // gate, so no launch begins after they act and none begins after a completed Stop
         // returns.
         if (BeforeLaunchGateHook is not null)
@@ -1285,7 +1321,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         {
             // Re-check session identity under the gate; no await may precede the sync launch.
             if (ct.IsCancellationRequested || _launchGateClosed)
-                return PhaseEnd.Cancelled;
+                return LaunchOutcome.Cancelled;
 
             InsideLaunchGateHook?.Invoke();
 
@@ -1293,7 +1329,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         }
         catch (OperationCanceledException)
         {
-            return PhaseEnd.Cancelled;
+            return LaunchOutcome.Cancelled;
         }
         catch (Exception ex)
         {
@@ -1303,27 +1339,27 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             // (fail-safe: never spends the budget on an unobserved attempt) and keeps the
             // session alive.
             _logger.LogError(ex, "TryStart threw for {Target}", target.NameWithoutExtension);
-            return PhaseEnd.Degraded;
+            return LaunchOutcome.BlockedDegraded;
         }
         finally
         {
             // Released immediately after the start result is captured (R-CD); never held across
-            // an await, so the observation phases below cannot block Stop.
+            // an await, so the observation below cannot block Stop.
             _launchGate.Release();
         }
 
         switch (start.Status)
         {
             case ProcessStartStatus.Cancelled:
-                return PhaseEnd.Cancelled;
+                return LaunchOutcome.Cancelled;
             case ProcessStartStatus.Missing:
                 _logger.LogWarning("Target {Target} disappeared before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                return PhaseEnd.Degraded;
+                return LaunchOutcome.BlockedDegraded;
             case ProcessStartStatus.ReadError:
                 _logger.LogWarning("Target {Target} became unreadable before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                return PhaseEnd.Degraded;
+                return LaunchOutcome.BlockedDegraded;
             case ProcessStartStatus.Failed:
                 // Immediate genuine creation failure (v2.8 §3.2): charged exactly once here for
                 // an automatic attempt; the free initial attempt stays free. No appearance timer
@@ -1335,11 +1371,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                     _logger.LogInformation("Automatic launch attempt {Attempts} charged for {Target}",
                         counters.RestartAttempts, target.NameWithoutExtension);
                 }
-                return PhaseEnd.AttemptFailed;
+                return LaunchOutcome.StartFailed;
         }
 
         // Started (v2.8 §2.1): the single charging point for an automatic attempt — charged
-        // once here at the actual process-creation boundary. The appearance deadline and the
+        // once here at the actual process-creation boundary. The appearance deadline, exit and
         // stability events never charge again, so one attempt cannot be counted twice.
         if (automatic)
         {
@@ -1348,122 +1384,34 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 counters.RestartAttempts, target.NameWithoutExtension);
         }
 
-        // Started: run the two timed phases below (outside the gate).
-        var phase = await ObserveStartupAndStabilityAsync(target, knobs, counters, ct,
-            startupStartedAt: _time.GetTimestamp(), alreadyRunning: false).ConfigureAwait(false);
+        return LaunchOutcome.Launched;
+    }
 
-        if (phase == PhaseEnd.Stable && showRecoveryToast)
+    // v2.8.1 §D: the recovery toast fires on the first positive Running observation after an
+    // automatic restart — never merely because Process.Start returned Started, at most once
+    // per attempt, and never duplicated for an attempt that exits before stability. Delivery
+    // never blocks the supervision loop, and the detached task is fully observed: every
+    // exception path is caught and logged, so nothing escapes as an unobserved task fault.
+    private void StartRecoveryToastSafe(CommittedSettingsSnapshot knobs, CancellationToken ct)
+    {
+        if (!knobs.EnableToasts)
+            return;
+
+        _ = Task.Run(async () =>
         {
-            // The recovery is accepted only after the full stability window (v2.8 §3.3).
             try
             {
-                if (knobs.EnableToasts)
-                    await _notifications.ShowAsync("Process Recovered", string.Empty, ct).ConfigureAwait(false);
+                await _notifications.ShowAsync("Process Recovered", string.Empty, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Routine cancellation (Stop/Suspend): never an error.
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to show recovery toast");
             }
-        }
-        return phase;
-    }
-
-    // The two timed phases of v2.8 (§3.2/§3.3), driven directly from typed CheckAsync results
-    // (the bool-only VerifyStartupAsync is superseded: it collapsed the indeterminate Unknown
-    // state into a timeout failure). Sequential and owned by the session loop: the deadlines are
-    // monotonic TimeProvider timestamps, and no timer callback ever launches a process.
-    //
-    //   appearance — after a launch reports Started, until a positive Running observation within
-    //   StartupVerificationTimeoutSeconds; a reliable NotRunning through the deadline fails the
-    //   attempt (already charged at its creation boundary when automatic); Unknown never becomes
-    //   a failure and keeps observing until the state is determinate, even past the deadline.
-    //
-    //   stability — from the first positive Running observation (or immediately for an
-    //   already-running observed instance), continuous Running for the full duration confirms
-    //   stability; a reliable NotRunning before the boundary is an unstable launch; an Unknown
-    //   gap voids the current interval (neither a fall nor proof of stability) and a fresh full
-    //   interval is required once Running is positively re-established.
-    //
-    // Both phases use the existing StartupVerificationTimeoutSeconds value and poll at the
-    // bounded PhasePollMs cadence, independent of CheckIntervalSeconds (v2.8 §4.2): the normal
-    // check interval may far exceed the one-second windows. Detection precision is finite —
-    // ~PhasePollMs plus the check duration — and is documented rather than claimed exact.
-    private async Task<PhaseEnd> ObserveStartupAndStabilityAsync(
-        ProcessTarget target, CommittedSettingsSnapshot knobs, SessionCounters counters,
-        CancellationToken ct, long? startupStartedAt, bool alreadyRunning)
-    {
-        var stabilityDuration = TimeSpan.FromSeconds(knobs.StartupVerificationTimeoutSeconds);
-        long? runningSince = null;
-        if (alreadyRunning)
-        {
-            // The observed instance is positively running right now: report Monitoring
-            // immediately (v2.8 §3.1.2); the stability window below decides when the
-            // recovery is actually accepted (v2.8 §3.3).
-            runningSince = _time.GetTimestamp();
-            ResetDegraded(counters);
-            Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
-        }
-
-        while (true)
-        {
-            ProcessCheckResult check;
-            try
-            {
-                check = await _monitor.CheckAsync(target, ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return PhaseEnd.Cancelled;
-            }
-            catch (Exception ex)
-            {
-                // A throwing check inside a timed phase behaves like Unknown (F): the session
-                // stays alive, degraded, and never escalates to Error on its own.
-                _logger.LogWarning(ex, "CheckAsync failed during startup/stability observation for {Target}",
-                    target.NameWithoutExtension);
-                check = new ProcessCheckResult(ProcessOutcome.Unknown);
-            }
-
-            switch (check.Outcome)
-            {
-                case ProcessOutcome.Running:
-                    if (runningSince is null)
-                    {
-                        runningSince = _time.GetTimestamp();
-                        // Positively observable: report Monitoring; the stability window decides
-                        // when the recovery is actually accepted (v2.8 §3.3).
-                        ResetDegraded(counters);
-                        Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
-                    }
-                    else if (_time.GetElapsedTime(runningSince.GetValueOrDefault()) >= stabilityDuration)
-                    {
-                        // Fresh positive observation at/after the full duration: stable (v2.8 §3.3).
-                        StabilityConfirmedHook?.Invoke();
-                        return PhaseEnd.Stable;
-                    }
-                    break;
-
-                case ProcessOutcome.NotRunning:
-                    if (runningSince is not null)
-                        return PhaseEnd.AttemptFailed; // exited before the stability boundary: unstable
-                    if (startupStartedAt is null ||
-                        _time.GetElapsedTime(startupStartedAt.GetValueOrDefault()) >= stabilityDuration)
-                        return PhaseEnd.AttemptFailed; // reliably absent (through the appearance deadline)
-                    break;
-
-                case ProcessOutcome.Unknown:
-                    // Never a fall and never proof of stability (v2.8 §3.3): void the current
-                    // running interval so a fresh full window is required. Past the appearance
-                    // deadline an indeterminate state must not become a failure (v2.8 §3.2) —
-                    // keep observing degraded until the state is determinate.
-                    MarkDegraded(counters);
-                    runningSince = null;
-                    break;
-            }
-
-            if (!await WaitForPhasePollAsync(ct).ConfigureAwait(false))
-                return PhaseEnd.Cancelled;
-        }
+        });
     }
 
     private SessionSnapshot CurrentSessionOr(ProcessTarget target) =>
@@ -1656,58 +1604,42 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     // Waits
     // ---------------------------------------------------------------------
 
-    private async Task<bool> WaitForDelayAsync(TimeSpan delay, CancellationToken ct)
+    // Frequency-agnostic deadline helper (v2.8.1 §B): converts a duration into a monotonic
+    // deadline offset in the TimeProvider's native timestamp scale. Raw ticks are never
+    // cast into a TimeSpan — arithmetic always happens through GetTimestamp/GetElapsedTime,
+    // so both the real clock and the virtual test clock ( TimeSpan-scaled ticks) behave
+    // identically.
+    private long DeadlineTicks(TimeSpan duration)
     {
-        try
-        {
-            // Time-provider aware (v2.8 §4.1): all session waits resolve through the injected
-            // TimeProvider so tests drive virtual time deterministically.
-            await Task.Delay(delay, _time, ct).ConfigureAwait(false);
-            return !ct.IsCancellationRequested;
-        }
-        catch (OperationCanceledException)
-        {
-            return false;
-        }
+        var ticks = (long)Math.Round(duration.TotalSeconds * _time.TimestampFrequency);
+        return ticks > 0 ? ticks : 0;
     }
 
-    // Sliced 250 ms waits (Stop stays responsive); returns false when the host/session is
-    // cancelled or the persistence state says the session should end.
-    private async Task<bool> WaitForNextCheckAsync(TimeSpan interval, CancellationToken ct)
+    // The only wait primitive of the session loop (v2.8.1): a token-linked, deadline-based
+    // wait resolved through the injected TimeProvider, so tests drive virtual time
+    // deterministically. Waits until the absolute monotonic deadline `dueTimestamp`;
+    // very large deadlines are sliced so the wait stays cancellable. Returns false when
+    // cancelled (Stop/Suspend), true when the deadline elapsed.
+    private const int MaxWaitSlice = int.MaxValue;
+
+    private async Task<bool> WaitUntilAsync(long dueTimestamp, CancellationToken ct)
     {
-        const int sliceMs = 250;
-        var remaining = interval.TotalMilliseconds >= int.MaxValue
-            ? int.MaxValue
-            : (int)interval.TotalMilliseconds;
-        while (remaining > 0)
+        while (true)
         {
-            var slice = Math.Min(sliceMs, remaining);
+            var now = _time.GetTimestamp();
+            if (now >= dueTimestamp)
+                return !ct.IsCancellationRequested;
+
+            var remainingMs = _time.GetElapsedTime(now, dueTimestamp).TotalMilliseconds;
+            var sliceMs = remainingMs > MaxWaitSlice ? MaxWaitSlice : (int)remainingMs;
             try
             {
-                await Task.Delay(TimeSpan.FromMilliseconds(slice), _time, ct).ConfigureAwait(false);
+                await Task.Delay(TimeSpan.FromMilliseconds(sliceMs), _time, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
                 return false;
             }
-            remaining -= slice;
-        }
-        return !ct.IsCancellationRequested;
-    }
-
-    // Cancellable wait between startup/stability polls (v2.8 §4.2): bounded PhasePollMs cadence,
-    // resolved through the injected TimeProvider (virtual in tests) and independent of
-    // CheckIntervalSeconds.
-    private async Task<bool> WaitForPhasePollAsync(CancellationToken ct)
-    {
-        try
-        {
-            await Task.Delay(TimeSpan.FromMilliseconds(PhasePollMs), _time, ct).ConfigureAwait(false);
-            return !ct.IsCancellationRequested;
-        }
-        catch (OperationCanceledException)
-        {
-            return false;
         }
     }
 
