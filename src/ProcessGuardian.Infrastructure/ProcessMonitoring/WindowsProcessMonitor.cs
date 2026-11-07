@@ -27,7 +27,20 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
                 {
                     try
                     {
-                        candidates.Add(new ProcessCandidate(p.Id, p.MainModule?.FileName, Unreadable: false));
+                        string? path = p.MainModule?.FileName;
+                        if (path is not null)
+                        {
+                            candidates.Add(new ProcessCandidate(p.Id, path, Unreadable: false));
+                        }
+                        else if (!p.HasExited)
+                        {
+                            // A readable process object with no module path is not proof of
+                            // absence (v2.8 §4.3): while the process may still be alive the
+                            // state is indeterminate, so it must not count as a readable
+                            // non-match (which would look like reliable NotRunning).
+                            candidates.Add(new ProcessCandidate(p.Id, null, Unreadable: true));
+                        }
+                        // A positively-exited process contributes nothing: it is reliably absent.
                     }
                     catch (Win32Exception ex)
                     {
@@ -55,7 +68,10 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
     // Unknown discipline (E), deterministic unit-test seam: Running only on a readable module
     // match; Unknown only when no readable match exists and at least one candidate is unreadable;
     // NotRunning only when every candidate was readable and none matched. A single unreadable
-    // module never downgrades a readable match.
+    // module never downgrades a readable match. Production CheckAsync never submits a readable
+    // candidate with a null path (it is classified unreadable unless exit is positively
+    // established, v2.8 §4.3); the seam keeps accepting such candidates as plain non-matches
+    // because a test that deliberately supplies them asserts the pre-classification semantics.
     internal static ProcessCheckResult EvaluateCandidates(string targetFullPath, IReadOnlyList<ProcessCandidate> candidates)
     {
         bool anyUnreadable = false;
@@ -148,28 +164,4 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
         nativeErrorCode is 2 or 3 ? ProcessStartStatus.Missing
         : nativeErrorCode is 5 or 32 ? ProcessStartStatus.ReadError
         : ProcessStartStatus.Failed;
-
-    public async Task<bool> VerifyStartupAsync(ProcessTarget target, TimeSpan timeout, CancellationToken ct)
-    {
-        try
-        {
-            var sw = Stopwatch.StartNew();
-            while (sw.Elapsed < timeout)
-            {
-                var result = await CheckAsync(target, ct);
-                if (result.Outcome == ProcessOutcome.Running) return true;
-                await Task.Delay(250, ct);
-            }
-            return false;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "VerifyStartupAsync failed unexpectedly");
-            return false;
-        }
-    }
 }

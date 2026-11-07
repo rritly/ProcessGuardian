@@ -48,6 +48,12 @@ public class GuardianOrchestratorTests
         // Set when the first launch critical section is entered (used by launch-gate tests).
         public bool MonitorInitialLaunchCalled { get; set; }
 
+        // Incremented through the orchestrator's StabilityConfirmedHook seam every time a
+        // stability window completes; budget-reset tests wait on this counter instead of
+        // racy CheckCount thresholds (poll cadence is decoupled from CheckIntervalSeconds).
+        private int _stableCount;
+        public int StableCount => Volatile.Read(ref _stableCount);
+
         public Harness()
         {
             var dir = Path.Combine(Path.GetTempPath(), "ProcessGuardian.Tests", Guid.NewGuid().ToString("N"));
@@ -81,10 +87,14 @@ public class GuardianOrchestratorTests
                 .Returns(Task.FromResult(TargetHashResult.Computed("PIN")));
         }
 
-        public IMonitoringController CreateController() =>
-            new GuardianOrchestrator(
+        public IMonitoringController CreateController()
+        {
+            var controller = new GuardianOrchestrator(
                 Monitor, Config, Notifications, NullLogger<GuardianOrchestrator>.Instance,
                 Status, Integrity, Autostart, Time);
+            controller.StabilityConfirmedHook = () => Interlocked.Increment(ref _stableCount);
+            return controller;
+        }
 
         public StartRequest Request(
             int maxRestarts = 5,
@@ -279,8 +289,6 @@ public class GuardianOrchestratorTests
             });
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => { running = true; return ProcessStartResult.Started(); });
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request());
@@ -295,7 +303,6 @@ public class GuardianOrchestratorTests
         await controller.StopAsync();
 
         h.Monitor.Received(1).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
-        await h.Monitor.Received(1).VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
         h.Statuses.Should().Contain(GuardianStatus.Monitoring);
         h.Statuses.Should().Contain(GuardianStatus.Restarting,
             "a budgeted restart is user-visible while it is in flight");
@@ -361,12 +368,18 @@ public class GuardianOrchestratorTests
     public async Task FirstStart_ConsumesNoAttempts_StatusMonitoring_NoExhaustion()
     {
         using var h = new Harness();
+        // The free initial launch appears within the startup timeout and survives the full
+        // stability window (v2.8): it consumes no attempt and never trips exhaustion.
+        bool running = false;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(ProcessStartResult.Started());
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
+            .Returns(_ => { running = true; return ProcessStartResult.Started(); });
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request(maxRestarts: 1));
@@ -464,8 +477,6 @@ public class GuardianOrchestratorTests
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(ProcessStartResult.Started());
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request());
@@ -550,15 +561,16 @@ public class GuardianOrchestratorTests
     {
         using var h = new Harness();
         // The controller computes a fresh pin at Start and re-verifies at launch; both
-        // read the same value, so the re-check matches (case-insensitively).
+        // read the same value, so the re-check matches (case-insensitively). The launched
+        // process appears afterwards and is observed Running.
+        bool running = false;
         h.Integrity.ComputeHashAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(TargetHashResult.Computed("AA")));
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+            .Returns(_ => Task.FromResult(new ProcessCheckResult(
+                running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42)));
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(ProcessStartResult.Started());
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
+            .Returns(_ => { running = true; return ProcessStartResult.Started(); });
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request());
@@ -567,6 +579,8 @@ public class GuardianOrchestratorTests
         await WaitUntilAsync(() => h.Monitor.ReceivedCalls().Any(c =>
                 c.GetMethodInfo().Name == nameof(IProcessMonitor.TryStart)),
             "StartAsync to be called when the hash matches");
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "the launched process to be observed Running");
         await controller.StopAsync();
 
         h.Monitor.Received(1).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
@@ -604,6 +618,8 @@ public class GuardianOrchestratorTests
         using var h = new Harness();
         // Upper bound is intentionally unclamped at the entity level. Before the wait cap,
         // the int cast overflowed and CheckAsync was invoked thousands of times per second.
+        // The stability window for the already-running target polls at its own bounded
+        // cadence (v2.8 §4.2), then normal monitoring settles into the huge check interval.
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
             {
@@ -618,7 +634,8 @@ public class GuardianOrchestratorTests
         await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
             "Monitoring status after the first check");
         await Task.Delay(700);
-        h.CheckCount.Should().Be(1);
+        h.CheckCount.Should().BeLessThan(100,
+            "the stability window polls at its bounded cadence, never a busy loop");
 
         await controller.StopAsync();
     }
@@ -684,8 +701,6 @@ public class GuardianOrchestratorTests
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => { h.MonitorInitialLaunchCalled = true; return ProcessStartResult.Started(); });
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
 
         var controller = (GuardianOrchestrator)h.CreateController();
         var start = await controller.StartAsync(h.Request(initialDelay: 1));
@@ -731,35 +746,39 @@ public class GuardianOrchestratorTests
     public async Task Stop_VerificationBarrier_NotWaitingForVerificationTimeout_CancelsPromptly()
     {
         using var h = new Harness();
-        // The free initial launch succeeds, then startup verification is held behind a
-        // controllable barrier. The configured verification timeout is huge (999 s) on
-        // purpose: Stop must cancel the session token and settle promptly, not wait out the
-        // timeout (R-CD). Because verification runs OUTSIDE the launch gate, Stop can reach
-        // the gate immediately and turn the cancellation key.
-        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+        // The free initial launch succeeds, then the startup-observation phase (v2.8) is held
+        // behind a controllable CheckAsync barrier. The configured verification timeout is huge
+        // (999 s) on purpose: Stop must cancel the session token and settle promptly, not wait
+        // out the timeout (R-CD). Because observation runs OUTSIDE the launch gate, Stop can
+        // reach the gate immediately and turn the cancellation key.
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(ProcessStartResult.Started());
 
-        var verifyEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var verifyBarrier = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+        int checkIndex = 0;
+        var observationEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var observationBarrier = new TaskCompletionSource<ProcessCheckResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns((CallInfo ci) =>
             {
-                verifyEntered.TrySetResult(true);
                 var ct = ci.Arg<CancellationToken>();
+                // The first check reliably reports the target down (the free launch follows);
+                // the next one is the startup-appearance observation, parked on the barrier.
+                if (Interlocked.Increment(ref checkIndex) == 1)
+                    return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+                observationEntered.TrySetResult(true);
                 // Kept registered: the cancellation key turns when the session token is
-                // cancelled (the barrier only ever completes false for us, never by the test).
-                ct.Register(() => verifyBarrier.TrySetResult(false));
-                return verifyBarrier.Task;
+                // cancelled (the barrier only ever completes for us via cancellation, never
+                // by the test).
+                ct.Register(() => observationBarrier.TrySetResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+                return observationBarrier.Task;
             });
 
         var controller = (GuardianOrchestrator)h.CreateController();
         var start = await controller.StartAsync(h.Request(startupTimeout: 999, checkInterval: 60));
         start.Started.Should().BeTrue();
 
-        await WaitUntilAsync(() => verifyEntered.Task.IsCompleted,
-            "the session to enter startup verification");
+        await WaitUntilAsync(() => observationEntered.Task.IsCompleted,
+            "the session to enter startup observation");
 
         var sw = Stopwatch.StartNew();
         var stop = await controller.StopAsync();
@@ -769,8 +788,8 @@ public class GuardianOrchestratorTests
         sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(10),
             "Stop must cancel promptly instead of waiting out the verification timeout (R-CD)");
 
-        (await verifyBarrier.Task).Should().BeFalse(
-            "verification was unblocked by the cancellation, not by the test");
+        (await observationBarrier.Task).Outcome.Should().Be(ProcessOutcome.NotRunning,
+            "observation was unblocked by the cancellation, not by the test");
         await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Stopped),
             "Status Stopped once the session settles");
     }
@@ -828,23 +847,26 @@ public class GuardianOrchestratorTests
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(ProcessStartResult.Started());
 
-        var verifyEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var verifyBarrier = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+        int checkIndex = 0;
+        var observationEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var observationBarrier = new TaskCompletionSource<ProcessCheckResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns((CallInfo ci) =>
             {
-                verifyEntered.TrySetResult(true);
                 var ct = ci.Arg<CancellationToken>();
-                ct.Register(() => verifyBarrier.TrySetResult(false));
-                return verifyBarrier.Task;
+                if (Interlocked.Increment(ref checkIndex) == 1)
+                    return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+                observationEntered.TrySetResult(true);
+                ct.Register(() => observationBarrier.TrySetResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
+                return observationBarrier.Task;
             });
 
         var controller = (GuardianOrchestrator)h.CreateController();
         var start = await controller.StartAsync(h.Request(startupTimeout: 999, checkInterval: 60));
         start.Started.Should().BeTrue();
 
-        await WaitUntilAsync(() => verifyEntered.Task.IsCompleted,
-            "the session to enter startup verification");
+        await WaitUntilAsync(() => observationEntered.Task.IsCompleted,
+            "the session to enter startup observation");
 
         var sw = Stopwatch.StartNew();
         await controller.SuspendAsync();
@@ -852,8 +874,8 @@ public class GuardianOrchestratorTests
         sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(10),
             "Suspend must cancel promptly instead of waiting out the verification timeout (R-CD)");
 
-        (await verifyBarrier.Task).Should().BeFalse(
-            "verification was unblocked by the cancellation, not by the test");
+        (await observationBarrier.Task).Outcome.Should().Be(ProcessOutcome.NotRunning,
+            "observation was unblocked by the cancellation, not by the test");
         await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Stopped),
             "Status Stopped once the suspended session settles");
         h.Statuses.Should().NotContain(GuardianStatus.Error, "a suspend is never an Error");
@@ -1335,6 +1357,497 @@ public class GuardianOrchestratorTests
         public override long TimestampFrequency => TimeSpan.TicksPerSecond;
     }
 
+    // Deterministic virtual clock for the v2.8 timing-phase tests (§5): the timestamp is manual
+    // (like ManualTimeProvider), but CreateTimer queues virtual timers that fire only inside
+    // Advance — so every session wait (Task.Delay(..., TimeProvider, ...)) resolves
+    // deterministically with no real sleep participating in the timing semantics.
+    private sealed class VirtualTimeProvider : TimeProvider
+    {
+        private long _nowTicks;
+        private readonly object _gate = new();
+        private readonly List<VirtualTimer> _timers = new();
+
+        // Fires every virtual timer due within t, in due order, advancing the clock to each
+        // timer's due time so timers queued by fired continuations chain correctly.
+        public void Advance(TimeSpan t)
+        {
+            var targetTicks = _nowTicks + t.Ticks;
+            while (true)
+            {
+                VirtualTimer? due = null;
+                lock (_gate)
+                {
+                    foreach (var timer in _timers)
+                    {
+                        if (timer.DueTime.Ticks <= targetTicks && (due is null || timer.DueTime < due.DueTime))
+                            due = timer;
+                    }
+
+                    if (due is null)
+                    {
+                        _nowTicks = targetTicks;
+                        return;
+                    }
+
+                    _nowTicks = Math.Max(_nowTicks, due.DueTime.Ticks);
+                    _timers.Remove(due);
+                }
+
+                due.Fire();
+            }
+        }
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>
+            new VirtualTimer(this, callback, state, dueTime);
+
+        public override DateTimeOffset GetUtcNow() => DateTimeOffset.UnixEpoch + new TimeSpan(Volatile.Read(ref _nowTicks));
+
+        public override long GetTimestamp() => Volatile.Read(ref _nowTicks);
+
+        // TimeSpan tick scale: the base (non-virtual) GetElapsedTime(long) arithmetic is exact.
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        private void RemoveTimer(VirtualTimer timer)
+        {
+            lock (_gate) _timers.Remove(timer);
+        }
+
+        private sealed class VirtualTimer : ITimer
+        {
+            private readonly VirtualTimeProvider _owner;
+            private readonly TimerCallback _callback;
+            private readonly object? _state;
+            private TimeSpan _dueTime;
+
+            public VirtualTimer(VirtualTimeProvider owner, TimerCallback callback, object? state, TimeSpan dueTime)
+            {
+                _owner = owner;
+                _callback = callback;
+                _state = state;
+                // CreateTimer's due time is relative to the current virtual clock; store it as an
+                // absolute value on the _nowTicks (TimeSpan tick) scale so Advance's due
+                // comparisons stay consistent for timers created at any virtual moment.
+                // Negative due times clamp to zero: the callback is due immediately.
+                lock (owner._gate)
+                {
+                    _dueTime = new TimeSpan(owner._nowTicks + Math.Max(0, dueTime.Ticks));
+                    owner._timers.Add(this);
+                }
+            }
+
+            public TimeSpan DueTime => _dueTime;
+
+            public void Fire() => _callback(_state);
+
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                lock (_owner._gate)
+                {
+                    _dueTime = new TimeSpan(_owner._nowTicks + Math.Max(0, dueTime.Ticks));
+                    if (!_owner._timers.Contains(this))
+                        _owner._timers.Add(this);
+                }
+
+                return true;
+            }
+
+            public void Dispose() => _owner.RemoveTimer(this);
+
+            public ValueTask DisposeAsync()
+            {
+                _owner.RemoveTimer(this);
+                return ValueTask.CompletedTask;
+            }
+        }
+    }
+
+    // Advances the virtual clock in PhasePoll-sized steps, yielding real time between steps so
+    // the session loop's posted continuations run and queue the next virtual timers. Real time
+    // only pumps thread-pool scheduling: no timing semantic depends on it, because the
+    // orchestrator's checks and waits only progress inside Advance.
+    private static async Task AdvanceUntilAsync(VirtualTimeProvider time, Func<bool> condition, string failureMessage, int maxSteps = 400)
+    {
+        for (var step = 0; step < maxSteps; step++)
+        {
+            if (condition())
+                return;
+            time.Advance(TimeSpan.FromMilliseconds(100));
+            await Task.Delay(1);
+        }
+
+        throw new Xunit.Sdk.XunitException($"Timed out waiting for: {failureMessage}");
+    }
+
+    [Fact]
+    public async Task AlreadyRunning_StabilityBoundary_JustBelowIsUnstable_AtDurationConfirmsStable()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        // The target is already Running when the session begins: the stability window runs for
+        // the observed instance with no launch (v2.8 §3.1.2).
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42));
+            });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.CheckCount >= 1, "the first check to run before virtual time advances");
+
+        // Just below the configured duration (900 ms of 1000 ms): the window is incomplete,
+        // no stability confirmation and no state change.
+        await AdvanceUntilAsync(time, () => h.CheckCount >= 9, "the stability window to poll most of the duration");
+        h.StableCount.Should().Be(0, "just below the configured duration the stability window is not complete");
+        h.Statuses.Should().NotContain(GuardianStatus.Restarting);
+        h.Statuses.Should().NotContain(GuardianStatus.Error);
+        h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        // A fresh positive Running observation at the full duration confirms stability.
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the full continuous Running window to confirm stability");
+        h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task Initial_NeverAppears_FreeThenFirstAutomaticAllowed_ExhaustsAtLimit()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        // The launch returns Started, but the process never becomes observable: CheckAsync
+        // reliably reports NotRunning through the appearance deadline both times.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+
+        // Free initial attempt (uncharged): the appearance deadline expires, and the FIRST
+        // automatic restart is allowed — the initial failure triggers it (v2.8 §3.1).
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the first automatic restart to launch after the free initial attempt");
+        h.Statuses.Should().NotContain(GuardianStatus.Error, "the first automatic attempt is still within the budget");
+
+        // The budgeted automatic attempt also fails to appear: the non-zero budget is
+        // exhausted — Error immediately, no further launch (v2.8 §2.1).
+        await AdvanceUntilAsync(time, () => controller.CurrentState.Status == GuardianStatus.Error,
+            "the exhausted Max=1 budget to terminate the session with Error");
+
+        h.Statuses.Should().Contain(GuardianStatus.Error);
+        // Free initial launch + exactly one budgeted automatic attempt; no third TryStart.
+        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        // R-F settlement: the desired enabled=false was persisted best-effort on the fatal path.
+        h.Config.ReceivedCalls().Should().Contain(c =>
+            c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync),
+            "budget exhaustion must persist the desired disabled state");
+    }
+
+    [Fact]
+    public async Task Initial_ExitsJustBeforeStabilityBoundary_FirstAutomaticAllowed()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        bool running = false;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+
+        // The initial attempt appears and runs for part of the stability window, then exits
+        // before the full duration: an unstable launch, still free (v2.8 §3.1) — nothing charged.
+        await AdvanceUntilAsync(time, () => h.CheckCount >= 5, "several Running observations inside the stability window");
+        running = false;
+
+        // The first automatic restart is allowed by the untouched budget.
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the first automatic restart to launch after the unstable initial attempt");
+        h.Statuses.Should().NotContain(GuardianStatus.Error, "the free initial attempt consumes nothing");
+        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task Max1_Automatic_ExitsBeforeStability_Error_NoSecondTryStart()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        bool running = false;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        // CheckInterval far exceeds the one-second windows: the phases must run on their own
+        // bounded cadence, independent of CheckIntervalSeconds (v2.8 §4.2).
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 30, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+
+        // The initial attempt appears and completes the full stability window: budget reset.
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial attempt's stability window to complete");
+
+        // Crash: normal monitoring (the 60 s check interval resolves through virtual time) sees
+        // NotRunning — exactly one budgeted automatic restart is allowed.
+        running = false;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the single budgeted automatic restart to launch");
+
+        // The restarted process is positively observed once, then exits before the full
+        // stability window: the budget is spent — Error, no second automatic TryStart.
+        var checksAtRestart = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= checksAtRestart + 1, "the restarted process to be observed Running once");
+        running = false;
+        await AdvanceUntilAsync(time, () => controller.CurrentState.Status == GuardianStatus.Error,
+            "the exhausted budget to terminate the session with Error");
+
+        h.Statuses.Should().Contain(GuardianStatus.Error);
+        // Free initial launch + exactly one budgeted automatic attempt; no third TryStart.
+        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Config.ReceivedCalls().Should().Contain(c =>
+            c.GetMethodInfo().Name == nameof(IConfigurationStore.SaveAsync),
+            "budget exhaustion must persist the desired disabled state");
+    }
+
+    [Fact]
+    public async Task TargetAppearsDuringRestartDelay_NoDuplicateStart()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        // The free initial launch returns Started but the process never appears; the target
+        // then appears on its own while the first restart delay is pending.
+        bool running = false;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+        await AdvanceUntilAsync(time, () => h.Statuses.Contains(GuardianStatus.Restarting),
+            "the restart streak to begin after the initial appearance timeout");
+
+        // The target appears on its own during the restart delay (v2.8 §3.5): after the delay,
+        // the pre-launch recheck sees Running — no duplicate launch; the observed instance is
+        // tracked for stability and replenishes the budget.
+        running = true;
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the observed instance's stability window to complete");
+
+        h.Statuses.Should().Contain(GuardianStatus.Monitoring);
+        h.Monitor.Received(1).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().NotContain(GuardianStatus.Error);
+
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task Unknown_DuringStartup_DoesNotTriggerRetryOrError()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        // The launch returns Started but every observation afterwards stays indeterminate past
+        // the appearance deadline: no retry, no Error, no duplicate launch (v2.8 §3.2). The
+        // first cycle must reliably report NotRunning so the free initial launch is made.
+        bool launched = false;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(launched
+                    ? new ProcessCheckResult(ProcessOutcome.Unknown)
+                    : new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; launched = true; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+
+        // Let the appearance deadline elapse while the state stays Unknown: observation
+        // continues degraded instead of failing the attempt.
+        await AdvanceUntilAsync(time, () => h.CheckCount >= 12, "the appearance deadline to elapse while the state stays Unknown");
+
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "an indeterminate state never becomes a timeout failure (v2.8 §3.2)");
+        h.Statuses.Should().NotContain(GuardianStatus.Restarting);
+        h.Monitor.Received(1).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        await controller.StopAsync();
+    }
+
+    [Fact]
+    public async Task UnknownDuringStability_GapVoidsWindow_BudgetNotReplenished_ExhaustsAtLimit()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        // Max=1: the free initial attempt stabilizes; the target crashes; the budgeted restart
+        // is observed Running once, then an Unknown gap voids the interval (no failure, no
+        // confirmation), Running resumes, and the process exits before the fresh full window
+        // completes: the budget is not replenished — Error, no second automatic launch.
+        bool running = false;
+        int unknownGapRemaining = 0;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                if (unknownGapRemaining > 0)
+                {
+                    unknownGapRemaining--;
+                    return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
+                }
+
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial attempt's stability window to complete");
+
+        // Crash: the one budgeted automatic restart launches.
+        running = false;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the single budgeted automatic restart to launch");
+        var firstRunningCheck = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= firstRunningCheck + 1,
+            "the restarted process to be observed Running once");
+
+        // One Unknown check inside the stability window: it voids the current interval —
+        // neither a fall nor proof of stability (v2.8 §3.3).
+        unknownGapRemaining = 1;
+        var unknownCheck = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= unknownCheck + 1, "the Unknown gap check to run");
+        h.Statuses.Should().NotContain(GuardianStatus.Error, "an Unknown gap never becomes a failure");
+
+        // Running resumes; the fresh full window has not completed when the process exits.
+        var freshWindowCheck = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= freshWindowCheck + 1, "Running to resume after the gap");
+        running = false;
+
+        await AdvanceUntilAsync(time, () => controller.CurrentState.Status == GuardianStatus.Error,
+            "the unreplenished budget to terminate the session with Error");
+
+        h.Statuses.Should().Contain(GuardianStatus.Error);
+        // Free initial launch + exactly one budgeted automatic attempt; no second automatic launch.
+        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UnknownDuringStability_FreshFullWindowAfterGap_ReplenishesBudget_LaterCrashAllowsOneMoreRestart()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        // Max=1: the budgeted restart's stability window is voided by one Unknown gap, then a
+        // FRESH full continuous Running window completes — the budget is replenished, and a
+        // later crash allows one more automatic restart in the same session.
+        bool running = false;
+        int unknownGapRemaining = 0;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                if (unknownGapRemaining > 0)
+                {
+                    unknownGapRemaining--;
+                    return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Unknown));
+                }
+
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
+
+        var controller = h.CreateController();
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, restartDelay: 1, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial attempt's stability window to complete");
+
+        // Crash: the one budgeted automatic restart launches.
+        running = false;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the single budgeted automatic restart to launch");
+        var firstRunningCheck = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= firstRunningCheck + 1,
+            "the restarted process to be observed Running once");
+
+        // One Unknown gap voids the interval; the fresh full window then completes.
+        unknownGapRemaining = 1;
+        var unknownCheck = h.CheckCount;
+        await AdvanceUntilAsync(time, () => h.CheckCount >= unknownCheck + 1, "the Unknown gap check to run");
+        await AdvanceUntilAsync(time, () => h.StableCount >= 2,
+            "the fresh full stability window after the gap to replenish the budget");
+
+        // Second crash: the replenished budget allows one more automatic restart.
+        running = false;
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 3, "the later crash to allow one more automatic restart");
+
+        h.Statuses.Should().NotContain(GuardianStatus.Error, "the fresh full window after the gap replenished the budget");
+        h.Monitor.Received(3).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        await controller.StopAsync();
+    }
+
     [Fact]
     public async Task InvalidForm_StartRejected_NoSession_NoBudget()
     {
@@ -1800,14 +2313,14 @@ public class GuardianOrchestratorTests
     }
 
     [Fact]
-    public async Task SuccessfulRestart_ConsumesBudget_RunningDoesNotRefund_SecondExitExhausts()
+    public async Task AutomaticRestart_FullStabilityWindow_ResetsBudget_LaterCrash_AllowsOneMoreRestart()
     {
         using var h = new Harness();
-        // v2.7 cumulative budget semantics: a successful automatic restart DOES consume one
-        // per-session unit (the superseded consecutive-failure rule is gone), and repeated
-        // Running observations never refund a spent unit. Max=1: free initial launch, one
-        // budgeted successful restart, then the next down-state terminates with Error and
-        // no second automatic TryStart.
+        // v2.8 stability semantics: an automatic restart is accepted as stable only after the
+        // FULL positive-running stability window, and completing it resets the streak budget.
+        // Max=1: free initial launch, one budgeted restart, a full stable window (reset), a
+        // later crash, one more budgeted restart — repeated crashes separated by full stable
+        // windows never consume the same old budget.
         bool running = false;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
@@ -1818,46 +2331,45 @@ public class GuardianOrchestratorTests
             });
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request(maxRestarts: 1));
         start.Started.Should().BeTrue();
 
-        // The free initial launch is Verified; observe it Running for several check cycles.
-        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-            "Monitoring status after the free initial launch");
-        await WaitUntilAsync(() => h.CheckCount >= 3, "several Running observations after the initial launch");
+        // The free initial launch appears and completes the full stability window.
+        await WaitUntilAsync(() => h.StableCount >= 1,
+            "the initial launch's full stability window to complete");
 
-        // First exit: the only budgeted automatic restart (charged once, Verified).
+        // First exit: the one budgeted restart (charged once) is allowed by the reset budget.
         running = false;
-        await WaitUntilAsync(() => h.StartCallCount == 2, "the single budgeted restart to launch");
-        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-            "Monitoring status after the successful restart");
+        await WaitUntilAsync(() => h.StartCallCount == 2, "the first budgeted restart to launch");
 
-        // Several Running observations must not refund the spent unit.
-        await WaitUntilAsync(() => h.CheckCount >= 6, "more Running observations after the restart");
+        // Let the restarted process complete the full stability window: the counter resets.
+        await WaitUntilAsync(() => h.StableCount >= 2,
+            "the restart's full stability window to complete and replenish the budget");
 
-        // Second exit: the budget is already exhausted (Running never refunds it), so the
-        // session terminates with Error and no second automatic TryStart may occur.
+        // Second exit: the budget was replenished by the stable window, so one more automatic
+        // restart is allowed in the same session (a first Running observation alone never
+        // refunds, only the completed stability window does).
         running = false;
-        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
-            "the exhausted per-session budget to terminate the session with Error");
+        await WaitUntilAsync(() => h.StartCallCount == 3,
+            "the second exit to allow one more restart after the full stable window");
 
-        h.Statuses.Should().Contain(GuardianStatus.Error,
-            "a second exit after Max=1 must exhaust the cumulative budget (v2.7)");
-        // Free initial launch + exactly one budgeted restart; no third launch after exhaustion.
-        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "full stable windows replenish the streak budget (v2.8)");
+        // Free initial launch + exactly one budgeted restart per crash after each stable window.
+        h.Monitor.Received(3).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        await controller.StopAsync();
     }
 
     [Fact]
-    public async Task InitialRunningTarget_DoesNotConsumeBudget_FirstExitAllowsOneRestart()
+    public async Task InitialRunningTarget_DoesNotConsumeBudget_FullStableWindow_Replenishes()
     {
         using var h = new Harness();
-        // The target is already Running when the session begins: neither the free initial
-        // launch nor the automatic-restart budget is consumed; its first later exit still
-        // allows one automatic restart for Max=1, and the second exit exhausts (v2.7).
+        // The target is already Running when the session begins: the stability window runs for
+        // the observed instance with no TryStart (v2.8 §3.1.2) and nothing is consumed. Its
+        // first later exit allows one automatic restart for Max=1; that restart completes
+        // another full stability window, so a second exit is allowed one more restart (v2.8).
         bool running = true;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
@@ -1868,33 +2380,34 @@ public class GuardianOrchestratorTests
             });
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => { h.StartCallCount++; running = true; return ProcessStartResult.Started(); });
-        h.Monitor.VerifyStartupAsync(Arg.Any<ProcessTarget>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true));
 
         var controller = h.CreateController();
         var start = await controller.StartAsync(h.Request(maxRestarts: 1));
         start.Started.Should().BeTrue();
 
-        // The target is observed Running without any launch: nothing is consumed.
-        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-            "Monitoring status for the already-running target");
+        // The target is observed Running without any launch; the entry stability window
+        // (v2.8 §3.1.2) completes on the observed instance.
+        await WaitUntilAsync(() => h.StableCount >= 1,
+            "the entry stability window for the already-running target to complete");
         await WaitUntilAsync(() => h.CheckCount >= 2, "several Running observations with no launch");
         h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
 
-        // First exit: the one allowed automatic restart for Max=1 (charged).
+        // First exit: the one allowed automatic restart for Max=1 (charged once).
         running = false;
         await WaitUntilAsync(() => h.StartCallCount == 1, "the first exit to allow one automatic restart");
-        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
-            "Monitoring status after the restart");
-        await WaitUntilAsync(() => h.CheckCount >= 5, "several Running observations after the restart");
+        await WaitUntilAsync(() => h.StableCount >= 2,
+            "the restart's full stability window to complete and replenish the budget");
 
-        // Second exit: budget already spent, no refund from Running — Error, no second launch.
+        // Second exit: the restart completed the full stability window, so the counter was
+        // reset and one more automatic restart is allowed in the same session.
         running = false;
-        await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
-            "the exhausted budget to terminate the session with Error");
+        await WaitUntilAsync(() => h.StartCallCount == 2,
+            "the second exit to allow one more restart after the full stable window");
 
-        h.Statuses.Should().Contain(GuardianStatus.Error);
-        h.Monitor.Received(1).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().NotContain(GuardianStatus.Error,
+            "a completed stability window replenishes the streak budget (v2.8)");
+        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        await controller.StopAsync();
     }
 
     [Fact]
@@ -1902,8 +2415,8 @@ public class GuardianOrchestratorTests
     {
         using var h = new Harness();
         // Every automatic attempt fails (genuine process-creation failure): Max=2 allows the
-        // free initial launch plus exactly two budgeted attempts, then the next down-state
-        // exhausts the cumulative budget and terminates with Error.
+        // free initial launch plus exactly two budgeted attempts in the unstable streak, then
+        // the budget gate terminates with Error before a third automatic launch (v2.8).
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
@@ -1929,9 +2442,9 @@ public class GuardianOrchestratorTests
     public async Task Max0_BudgetNeverExhausts()
     {
         using var h = new Harness();
-        // MaxRestartAttempts=0 disables the per-session budget: always-failing automatic
+        // MaxRestartAttempts=0 disables the instability-streak budget: always-failing automatic
         // attempts never exhaust it and never publish Error, while other protections
-        // (restart delay, typed outcomes) stay in force.
+        // (restart delay, typed outcomes) stay in force (v2.8).
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
@@ -1980,7 +2493,7 @@ public class GuardianOrchestratorTests
     {
         using var h = new Harness();
         // Every launch fails (NotStarted): the free initial + MaxRestartAttempts=1 budgeted attempt
-        // exhaust the cumulative per-session budget, and the final Save(false) fails on the fatal path.
+        // exhaust the instability-streak budget, and the final Save(false) fails on the fatal path.
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning)));
         h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())

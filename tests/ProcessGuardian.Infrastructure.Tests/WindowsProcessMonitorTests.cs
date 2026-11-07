@@ -195,6 +195,23 @@ public class WindowsProcessMonitorTests : IDisposable
         result.ProcessId.Should().Be(202);
     }
 
+    [Fact]
+    public void EvaluateCandidates_TwoReadableMatches_IsRunning_ExitOfOneIsNotAbsence()
+    {
+        // Multiple matching instances (v2.8 §4.3): any readable full-path match means Running;
+        // the exit of one instance must never be read as target absence while another remains.
+        var candidates = new[]
+        {
+            new WindowsProcessMonitor.ProcessCandidate(101, @"C:\App\target.exe", Unreadable: false),
+            new WindowsProcessMonitor.ProcessCandidate(202, @"C:\APP\TARGET.EXE", Unreadable: false),
+        };
+
+        var result = WindowsProcessMonitor.EvaluateCandidates(@"C:\app\target.exe", candidates);
+
+        result.Outcome.Should().Be(ProcessOutcome.Running);
+        result.ProcessId.Should().BeOneOf(101, 202);
+    }
+
     // R-KE: document and verify the native Win32 error-code mapping at the launch boundary.
     [Theory]
     [InlineData(2, ProcessStartStatus.Missing)]  // ERROR_FILE_NOT_FOUND
