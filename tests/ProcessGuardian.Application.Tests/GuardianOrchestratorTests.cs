@@ -1710,8 +1710,10 @@ public class GuardianOrchestratorTests
         h.Time = new VirtualTimeProvider();
         var time = (VirtualTimeProvider)h.Time;
 
+        long startTicks = time.GetTimestamp();
+
         // The free initial launch returns Started but the process never appears; the target
-        // then appears on its own while the first restart delay is pending.
+        // then appears on its own while the first restart delay is still pending.
         bool running = false;
         h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
             .Returns(_ =>
@@ -1724,19 +1726,27 @@ public class GuardianOrchestratorTests
             .Returns(_ => { h.StartCallCount++; return ProcessStartResult.Started(); });
 
         var controller = h.CreateController();
-        var start = await controller.StartAsync(h.Request(maxRestarts: 1, restartDelay: 1, startupTimeout: 1));
+        // RestartDelaySeconds (3 s, measured from the actual launch at t=0) exceeds the
+        // appearance timeout (1 s): after the timeout the delay is still pending — the timeout
+        // expiry never re-arms it (v2.8 §3.2).
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 1, restartDelay: 3, startupTimeout: 1));
         start.Started.Should().BeTrue();
 
         await WaitUntilAsync(() => h.StartCallCount >= 1, "the free initial launch to be made");
         await AdvanceUntilAsync(time, () => h.Statuses.Contains(GuardianStatus.Restarting),
             "the restart streak to begin after the initial appearance timeout");
 
-        // The target appears on its own during the restart delay (v2.8 §3.5): after the delay,
-        // the pre-launch recheck sees Running — no duplicate launch; the observed instance is
+        // The target appears on its own while the restart delay is pending (v2.8 §3.5): the
+        // fresh observation sees Running — no duplicate launch; the observed instance is
         // tracked for stability and replenishes the budget.
         running = true;
         await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the observed instance's stability window to complete");
 
+        // The delay deadline elapses afterwards: the tick's fresh observation is Running —
+        // still no duplicate start (v2.8 §5.12).
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - startTicks >= TimeSpan.FromSeconds(4).Ticks,
+            "normal ticks past the deadline to run");
         h.Statuses.Should().Contain(GuardianStatus.Monitoring);
         h.Monitor.Received(1).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         h.Statuses.Should().NotContain(GuardianStatus.Error);
@@ -2620,15 +2630,16 @@ public class GuardianOrchestratorTests
         await AdvanceUntilAsync(time, () => h.CheckCount >= 4 && h.StartCallCount == 1,
             "normal checks to continue while the appearance window is pending");
 
-        // The budgeted restart fires on the first eligible normal tick after the arming
-        // deadline: appearance deadline (5 s) + RestartDelaySeconds (1 s) → ~6 s, on the
-        // normal cadence and never delayed by the verification timeout twice over.
+        // The budgeted restart fires on the first eligible normal tick after the appearance
+        // deadline (5 s): the RestartDelaySeconds deadline was armed at the free launch itself
+        // (t=0 + 1 s) and elapsed long before — the timeout expiry never re-arms the delay
+        // clock (v2.8 §3.2), so no extra second is added after the timeout.
         await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the restart to launch on a normal tick");
         var launchElapsedMs = (secondLaunchTicks - startTicks) / TimeSpan.TicksPerMillisecond;
         launchElapsedMs.Should().BeGreaterThanOrEqualTo(5000,
-            "no launch before the appearance deadline plus the restart delay");
-        launchElapsedMs.Should().BeLessThanOrEqualTo(6100,
-            "the launch fires on the first eligible normal tick, not after extra delay");
+            "no launch before the appearance deadline");
+        launchElapsedMs.Should().BeLessThanOrEqualTo(5100,
+            "the launch fires on the first normal tick at the appearance deadline, with no extra RestartDelaySeconds re-armed by the timeout");
         h.CheckCount.Should().BeGreaterThanOrEqualTo(5, "checks kept flowing through the appearance window");
 
         // The restarted attempt also never appears: the budget exhausts with Error.
@@ -2833,5 +2844,268 @@ public class GuardianOrchestratorTests
             gapMs.Should().BeGreaterThanOrEqualTo(900,
                 $"tick {i + 1} must not fire early (anchored to the tick deadline)");
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // R-AS-RESTART-SPACING required deterministic tests: RestartDelaySeconds is
+    // measured from the previous actual creation attempt (TryStart), never re-armed
+    // by an observation event (a fall, an appearance timeout or a loss detection).
+    // ---------------------------------------------------------------------
+
+    // Test B: a fall detected after a full stable run must not re-arm the delay clock. The
+    // spacing deadline was armed at the actual launch (t=0 + 10 s) and elapsed long before
+    // the exit at ~t=20 s, so the restart happens on the detection tick itself — no new
+    // ten-second delay counted from the detection event.
+    [Fact]
+    public async Task RestartDelay_NotReArmedByFallDetectedAfterStableRun_LaunchOnDetectionTick()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        long startTicks = time.GetTimestamp();
+        long secondLaunchTicks = 0;
+        bool running = false;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.StartCallCount++;
+                if (h.StartCallCount == 2)
+                    secondLaunchTicks = time.GetTimestamp();
+                running = true;
+                return ProcessStartResult.Started();
+            });
+
+        var controller = h.CreateController();
+        // Restart delay 10 s far exceeds the check interval (1 s); unlimited budget.
+        var start = await controller.StartAsync(h.Request(maxRestarts: 0, checkInterval: 1, restartDelay: 10, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        // The free launch happens at t=0 and completes the full stability window; the spacing
+        // deadline is armed at that actual attempt (t=0 + 10 s).
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free launch to be made");
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial stability window to complete");
+
+        // The target runs until t=20 s, then exits: RestartDelaySeconds (10 s) measured from
+        // the actual launch has long elapsed by the detection tick.
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - startTicks >= TimeSpan.FromSeconds(20).Ticks,
+            "the target to run until t=20 s");
+        running = false;
+        var exitTicks = time.GetTimestamp();
+
+        // The restart must happen on the detection tick (or the next normal tick) — the fall
+        // never re-arms RestartDelaySeconds, so no ten-second delay is counted from it.
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2,
+            "the restart on the detection tick, without a new restart delay");
+        var detectionElapsedMs = (secondLaunchTicks - exitTicks) / TimeSpan.TicksPerMillisecond;
+        detectionElapsedMs.Should().BeLessThanOrEqualTo(1100,
+            "the launch fires on the detection/next normal tick — the fall never re-arms RestartDelaySeconds");
+        h.Monitor.Received(2).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        h.Statuses.Should().NotContain(GuardianStatus.Error, "the unlimited budget never exhausts");
+
+        await controller.StopAsync();
+    }
+
+    // Test C: a fall detected while the delay (measured from the actual launch) has not elapsed
+    // yet holds the restart until the first eligible normal tick at/after the deadline —
+    // checks keep flowing meanwhile and no extra delay is added beyond the deadline.
+    [Fact]
+    public async Task RestartDelay_ElapsedSinceActualLaunch_LimitsNextLaunch_NoExtraDelay()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        long startTicks = time.GetTimestamp();
+        long secondLaunchTicks = 0;
+        bool running = false;
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(
+                    running ? ProcessOutcome.Running : ProcessOutcome.NotRunning, 42));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.StartCallCount++;
+                if (h.StartCallCount == 2)
+                    secondLaunchTicks = time.GetTimestamp();
+                running = true;
+                return ProcessStartResult.Started();
+            });
+
+        var controller = h.CreateController();
+        // The free launch at t=0 arms the spacing deadline at t=10 s; the process exits at
+        // ~t=3 s, well before the deadline.
+        var start = await controller.StartAsync(h.Request(maxRestarts: 0, checkInterval: 1, restartDelay: 10, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.StartCallCount >= 1, "the free launch to be made");
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1, "the initial stability window to complete");
+
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - startTicks >= TimeSpan.FromSeconds(3).Ticks,
+            "the target to run until t=3 s");
+        running = false;
+
+        // Checks keep flowing while the delay is pending; no restart before the deadline.
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - startTicks >= TimeSpan.FromSeconds(9).Ticks,
+            "checks to continue while the restart delay is pending");
+        h.CheckCount.Should().BeGreaterThanOrEqualTo(9, "checks keep flowing while the delay is pending");
+        h.StartCallCount.Should().Be(1,
+            "no restart before the RestartDelaySeconds deadline (measured from the actual launch) elapsed");
+
+        // The launch fires at the first eligible normal tick at/after the deadline measured
+        // from the actual launch — no extra delay beyond the deadline plus at most one tick
+        // (the racy first-tick anchor can shift the recorded attempt by up to one virtual step).
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2,
+            "the restart at the first eligible normal tick at/after the deadline");
+        var launchElapsedMs = (secondLaunchTicks - startTicks) / TimeSpan.TicksPerMillisecond;
+        launchElapsedMs.Should().BeGreaterThanOrEqualTo(10000,
+            "no launch before the RestartDelaySeconds deadline measured from the actual launch");
+        launchElapsedMs.Should().BeLessThanOrEqualTo(11100,
+            "the launch fires on the first eligible normal tick — no extra delay beyond the deadline");
+        await controller.StopAsync();
+    }
+
+    // Test D: a genuine ProcessStartStatus.Failed charges the automatic budget exactly once,
+    // updates the actual-attempt timestamp at the Failed boundary, and spaces the next attempt
+    // by RestartDelaySeconds from that attempt — with no double charge on later processing.
+    [Fact]
+    public async Task FailedLaunch_ChargesOnce_UpdatesAttemptTimestamp_SpacesNextAttempt()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        var launchTicks = new long[3];
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.StartCallCount++;
+                launchTicks[h.StartCallCount - 1] = time.GetTimestamp();
+                return ProcessStartResult.Failed("launch failed");
+            });
+
+        var controller = h.CreateController();
+        // Max=2: the free launch (uncharged) plus two budgeted attempts; delay 2 s between
+        // actual attempts, check interval 1 s.
+        var start = await controller.StartAsync(h.Request(maxRestarts: 2, checkInterval: 1, restartDelay: 2, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        // The free launch fails at t=0 (uncharged); the first budgeted attempt fires at the
+        // 2 s deadline; the second at the next 2 s deadline — each spaced from the previous
+        // actual attempt.
+        await AdvanceUntilAsync(time, () => h.StartCallCount >= 1, "the free launch to fail at the first tick");
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 2, "the first budgeted attempt at the 2 s deadline");
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 3, "the second budgeted attempt at the next 2 s deadline");
+
+        var firstGapMs = (launchTicks[1] - launchTicks[0]) / TimeSpan.TicksPerMillisecond;
+        var secondGapMs = (launchTicks[2] - launchTicks[1]) / TimeSpan.TicksPerMillisecond;
+        // The recorded TryStart timestamp may trail its anchoring tick by up to one virtual
+        // step, which can push the deadline past the next tick boundary: the gap is at least
+        // the full RestartDelaySeconds measured from the previous actual attempt, and at most
+        // the deadline plus one normal tick — never an early launch and never a delay re-armed
+        // by an observation event.
+        firstGapMs.Should().BeGreaterThanOrEqualTo(2000,
+            "the next attempt is never earlier than RestartDelaySeconds after the previous actual attempt");
+        firstGapMs.Should().BeLessThanOrEqualTo(3100,
+            "the launch fires on the first eligible normal tick — at most one tick past the deadline");
+        secondGapMs.Should().BeGreaterThanOrEqualTo(2000,
+            "the spacing deadline is re-armed only at the actual Failed boundary");
+        secondGapMs.Should().BeLessThanOrEqualTo(3100,
+            "no extra delay beyond the first eligible normal tick");
+
+        // Exactly two budgeted attempts were charged (one each): the budget exhausts — Error,
+        // no third budgeted TryStart (no double charge on later state processing).
+        await AdvanceUntilAsync(time, () => controller.CurrentState.Status == GuardianStatus.Error,
+            "the exhausted budget to terminate the session with Error");
+        h.Monitor.Received(3).TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+    }
+
+    // Test E: attempts blocked before the OS process-creation boundary (TryStart Missing or
+    // ReadError, indeterminate adapter exception) never charge the budget, never update the
+    // actual-attempt timestamp and never create an artificial RestartDelaySeconds delay — the
+    // session keeps retrying on the normal cadence and recovers when an attempt succeeds.
+    [Fact]
+    public async Task BlockedLaunches_NoCharge_NoAttemptTimestamp_NoArtificialDelay()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        long startTicks = time.GetTimestamp();
+        var launchTicks = new long[4];
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.NotRunning));
+            });
+        h.Monitor.TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.StartCallCount++;
+                launchTicks[h.StartCallCount - 1] = time.GetTimestamp();
+                return h.StartCallCount switch
+                {
+                    1 => ProcessStartResult.Missing(),
+                    2 => ProcessStartResult.ReadError(),
+                    3 => throw new InvalidOperationException("indeterminate launch failure"),
+                    _ => ProcessStartResult.Started(),
+                };
+            });
+
+        var controller = h.CreateController();
+        // A huge RestartDelaySeconds (10 s) would block any attempt that wrongly armed the
+        // spacing clock on a blocked/indeterminate outcome; blocked attempts must instead
+        // retry on every normal tick (1 s). Max=1: had any blocked attempt charged, the
+        // budget gate would have terminated the session before the fourth (free) attempt.
+        var start = await controller.StartAsync(h.Request(maxRestarts: 1, checkInterval: 1, restartDelay: 10, startupTimeout: 1));
+        start.Started.Should().BeTrue();
+
+        await AdvanceUntilAsync(time, () => h.StartCallCount == 4,
+            "the blocked attempts to retry on the normal cadence and the fourth (free) attempt to succeed");
+
+        // Every blocked attempt retried on the very next normal tick — no RestartDelaySeconds
+        // (10 s) gap was created by any blocked/indeterminate outcome. The recorded TryStart
+        // timestamp may trail its anchoring tick by up to one virtual step (the racy first-tick
+        // anchor, same as the drift test), so the gap band is one check interval ± one step —
+        // never the 10 s artificial delay and never a zero-gap burst.
+        for (var i = 1; i < 4; i++)
+        {
+            var gapMs = (launchTicks[i] - launchTicks[i - 1]) / TimeSpan.TicksPerMillisecond;
+            gapMs.Should().BeGreaterThanOrEqualTo(900,
+                $"blocked attempt {i + 1} must not fire early (tick-cadence retries)");
+            gapMs.Should().BeLessThanOrEqualTo(1100,
+                $"blocked attempt {i + 1} must retry on the next normal tick, without an artificial restart delay");
+        }
+
+        // The fourth attempt's appearance window begins (the process never appears): no
+        // duplicate launch while it is pending, and no Error — blocked attempts never charged.
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - startTicks >= TimeSpan.FromSeconds(5).Ticks,
+            "the appearance window to observe the never-appearing attempt");
+        h.StartCallCount.Should().Be(4, "no duplicate launch while the appearance window is pending");
+        h.Statuses.Should().NotContain(GuardianStatus.Error, "blocked attempts never charge the budget");
+
+        await controller.StopAsync();
     }
 }

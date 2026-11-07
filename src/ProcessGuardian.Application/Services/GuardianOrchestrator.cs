@@ -906,9 +906,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     //     at the bounded PhasePollMs cadence; a poll landing at/after the next tick's deadline
     //     IS that normal tick, so observation never postpones a normal tick and no separate
     //     observer task exists that could block, postpone or race the supervision loop;
-    //   - monotonic deadlines: RestartDelaySeconds launch spacing, the appearance deadline and
-    //     the stability boundary are computed from TimeProvider timestamps and are only ever
-    //     re-evaluated on observations — never awaited inline, never busy-looped;
+    //   - monotonic deadlines: the RestartDelaySeconds spacing deadline is armed ONLY at the
+    //     actual creation attempt (Started or a genuine Failed — the free initial attempt
+    //     included) and is never re-armed by an observation event: a fall, an appearance
+    //     timeout or a loss detection never restart the delay clock (v2.8 §3.2). The
+    //     appearance deadline and the stability boundary are computed from TimeProvider
+    //     timestamps and are only ever re-evaluated on observations — never awaited inline,
+    //     never busy-looped;
     //   - cancellation: the only waits are token-linked Task.Delay waits plus the launch-gate
     //     critical section, so Stop/Suspend settle promptly and no late launch can occur.
     // The budget (RestartAttempts) is charged exactly once at the actual automatic
@@ -934,10 +938,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
             // Attempt/qualification state, all session-owned by this loop (no separate observer
             // task exists; nothing here ever launches from a detached callback).
-            long? attemptLaunchedAt = null;    // outstanding launch awaiting its first positive appearance
+            long? attemptLaunchedAt = null;    // actual creation-attempt timestamp of the outstanding
+                                               // launch awaiting its first positive appearance
             long? runningSince = null;         // stability-qualification start; null = not qualifying
             bool restartPending = false;       // the target is down and a launch decision is pending
-            long nextLaunchAllowedAt = 0;      // monotonic RestartDelaySeconds deadline (0 = not yet armed)
+            long nextLaunchAllowedAt = 0;      // RestartDelaySeconds spacing deadline (0 = no
+                                               // spacing pending = allowed); armed ONLY at the
+                                               // actual creation attempt, never by an observation
+                                               // event (v2.8 §3.2)
             bool toastPending = false;         // the current automatic attempt has not shown its recovery toast
 
             while (!ct.IsCancellationRequested)
@@ -1039,11 +1047,12 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                         {
                             // Reliable absence during stability qualification: an unstable run,
                             // never a refund (v2.8 §3.3). The launch is decided on the normal
-                            // ticks below (v2.8.1 §B.2), never on this phase poll directly.
+                            // ticks below (v2.8.1 §B.2), never on this phase poll directly, and
+                            // the RestartDelaySeconds clock is NOT re-armed here: it stays
+                            // anchored to the previous actual creation attempt (v2.8 §3.2).
                             runningSince = null;
                             toastPending = false;
                             restartPending = true;
-                            nextLaunchAllowedAt = now + DeadlineTicks(restartDelay);
                             // A qualification that began with the target already running (the
                             // free launch unused) resolves here: per v2.8 §3.1.2/§3.4 the first
                             // actual restart of such a session is budgeted, so the free launch
@@ -1058,13 +1067,14 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                             // up). At/after the deadline the attempt is marked not established
                             // (v2.8.1 §B.3); no charge is added — the attempt was already charged
                             // at its creation boundary. The next launch then happens on a normal
-                            // tick, constrained only by the remaining budget and the delay.
+                            // tick, constrained only by the remaining budget and the spacing
+                            // deadline armed at that actual attempt — the timeout expiry never
+                            // re-arms the delay clock (v2.8 §3.2).
                             if (now - attemptLaunchedAt.GetValueOrDefault() >= DeadlineTicks(stabilityDuration))
                             {
                                 attemptLaunchedAt = null;
                                 toastPending = false;
                                 restartPending = true;
-                                nextLaunchAllowedAt = now + DeadlineTicks(restartDelay);
                                 _logger.LogInformation(
                                     "Launched process {Target} did not appear within the startup timeout", target.NameWithoutExtension);
                                 counters.InitialLaunchPending = false;
@@ -1074,19 +1084,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                         else
                         {
                             // A loss detected on a check enters the restart decision path on that
-                            // cycle (v2.8.1 §B.1). No inline delay is ever awaited: the launch is
-                            // gated by the monotonic deadline and reconsidered on every tick.
-                            if (!restartPending)
-                            {
-                                restartPending = true;
-                                // The free initial launch is not spaced by RestartDelaySeconds
-                                // (v2.8 §3.1 semantics preserved: the free attempt fires on the
-                                // detection tick). Only budgeted automatic restarts are spaced
-                                // between actual attempts, so the spacing clock is armed here
-                                // only once the free launch is spent.
-                                if (!counters.InitialLaunchPending)
-                                    nextLaunchAllowedAt = now + DeadlineTicks(restartDelay);
-                            }
+                            // cycle (v2.8.1 §B.1). No inline delay is ever awaited and no new
+                            // RestartDelaySeconds deadline is armed here: the spacing deadline
+                            // was armed at the previous actual creation attempt (the free initial
+                            // attempt included — freeness means no budget charge, not a missing
+                            // attempt, v2.8 §3.2), so the launch evaluation below is gated only
+                            // by that deadline, the budget and this fresh NotRunning observation.
+                            restartPending = true;
 
                             if (!counters.InitialLaunchPending)
                                 Publish(new MonitorState(GuardianStatus.Restarting, false, null, false));
@@ -1106,9 +1110,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
                 // ---- launch evaluation (normal supervision tick only, v2.8.1 §B.2) ----
                 // A pending restart is attempted on a tick whose fresh observation found the
-                // target reliably NotRunning, only after the RestartDelaySeconds deadline
-                // elapsed, and only while the budget permits — never on a phase deadline and
-                // never from a bare wake, so there is no busy loop and no early launch.
+                // target reliably NotRunning, only after the RestartDelaySeconds deadline —
+                // measured from the previous actual creation attempt, not from the observation
+                // that detected the loss (v2.8 §3.2) — elapsed, and only while the budget
+                // permits — never on a phase deadline and never from a bare wake, so there is
+                // no busy loop and no early launch.
                 if (restartPending
                     && attemptLaunchedAt is null
                     && runningSince is null
@@ -1141,7 +1147,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                     }
 
                     var automatic = !counters.InitialLaunchPending;
-                    var launch = await AttemptLaunchAsync(target, knobs, counters,
+                    var (launch, attemptTimestamp) = await AttemptLaunchAsync(target, knobs, counters,
                         automatic, ct).ConfigureAwait(false);
                     switch (launch)
                     {
@@ -1162,22 +1168,24 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                         case LaunchOutcome.StartFailed:
                             // Genuine creation failure (v2.8 §3.2): charged exactly once at the
                             // boundary (inside AttemptLaunchAsync); the free initial attempt stays
-                            // free. The next attempt is spaced by the restart delay and
-                            // re-decided on a normal tick.
+                            // free. The spacing deadline is armed from THIS actual attempt (its
+                            // pre-start timestamp, v2.8 §3.2); the next attempt is re-decided on
+                            // a normal tick.
                             counters.InitialLaunchPending = false;
                             restartPending = true;
-                            nextLaunchAllowedAt = _time.GetTimestamp() + DeadlineTicks(restartDelay);
+                            nextLaunchAllowedAt = attemptTimestamp + DeadlineTicks(restartDelay);
                             break;
 
                         case LaunchOutcome.Launched:
                             // Started: charged once at the creation boundary (automatic). The
-                            // appearance/probation window begins; the first positive Running
-                            // starts the stability qualification and, for an automatic restart,
-                            // shows the recovery toast (v2.8.1 §D).
+                            // appearance/probation window begins at this actual attempt; the
+                            // first positive Running starts the stability qualification and, for
+                            // an automatic restart, shows the recovery toast (v2.8.1 §D). The
+                            // free attempt also forms the spacing reference (v2.8 §3.2).
                             counters.InitialLaunchPending = false;
-                            attemptLaunchedAt = _time.GetTimestamp();
+                            attemptLaunchedAt = attemptTimestamp;
                             restartPending = false;
-                            nextLaunchAllowedAt = attemptLaunchedAt.GetValueOrDefault() + DeadlineTicks(restartDelay);
+                            nextLaunchAllowedAt = attemptTimestamp + DeadlineTicks(restartDelay);
                             toastPending = automatic;
                             break;
                     }
@@ -1270,15 +1278,21 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     /// <see cref="LaunchOutcome.BlockedDegraded"/> means the flow was blocked before the OS
     /// process-creation boundary or is indeterminate — always uncharged.
     /// <see cref="LaunchOutcome.Mismatch"/> is the separate fatal integrity path;
-    /// <see cref="LaunchOutcome.Cancelled"/> is routine session cancellation (never Error, never charged).</summary>
+    /// <see cref="LaunchOutcome.Cancelled"/> is routine session cancellation (never Error, never charged).
+    /// The result carries the creation-attempt timestamp captured immediately before the
+    /// synchronous <c>TryStart</c>; the session loop commits it as the restart-spacing
+    /// reference only for a <c>Started</c> result or a genuine <c>Failed</c> — every other
+    /// outcome leaves the previous reference untouched (v2.8 §3.2).</summary>
     private enum LaunchOutcome { Launched, StartFailed, BlockedDegraded, Mismatch, Cancelled }
 
     // The launch boundary of one supervision tick (v2.8.1 §B.2): hash gate → launch gate →
     // synchronous TryStart, with the budget charged exactly once at the actual automatic
     // process-creation boundary (Started or a genuine Failed). No timed phase is awaited
     // here: appearance/stability observation is serviced by the session event loop itself,
-    // so a launch can never hold a check, a retry decision or a notification.
-    private async Task<LaunchOutcome> AttemptLaunchAsync(
+    // so a launch can never hold a check, a retry decision or a notification. Returns the
+    // outcome plus the creation-attempt timestamp captured immediately before the synchronous
+    // TryStart (v2.8 §3.2).
+    private async Task<(LaunchOutcome Outcome, long AttemptTimestamp)> AttemptLaunchAsync(
         ProcessTarget target, CommittedSettingsSnapshot knobs, SessionCounters counters,
         bool automatic, CancellationToken ct)
     {
@@ -1286,15 +1300,15 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         switch (hash)
         {
             case HashVerifyResult.Cancelled:
-                return LaunchOutcome.Cancelled;
+                return (LaunchOutcome.Cancelled, 0);
             case HashVerifyResult.Missing:
                 _logger.LogWarning("Target {Target} is missing before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                return LaunchOutcome.BlockedDegraded;
+                return (LaunchOutcome.BlockedDegraded, 0);
             case HashVerifyResult.ReadError:
                 _logger.LogWarning("Target {Target} could not be read before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                return LaunchOutcome.BlockedDegraded;
+                return (LaunchOutcome.BlockedDegraded, 0);
             case HashVerifyResult.Mismatch:
                 // Fail closed (K): hash mismatch is fatal. The enabled=false persistence and the
                 // Error publish are deferred to the outside-the-task continuation
@@ -1302,7 +1316,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 // outcome and never publishes Error from inside the session task.
                 _logger.LogError("Target {Target} no longer matches its recorded pin; terminating the session",
                     target.NameWithoutExtension);
-                return LaunchOutcome.Mismatch;
+                return (LaunchOutcome.Mismatch, 0);
         }
 
         // Linearized launch (R-CD): only the final session/gate check and the synchronous
@@ -1317,19 +1331,24 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
 
         await _launchGate.WaitAsync(ct).ConfigureAwait(false);
         ProcessStartResult start;
+        long attemptTimestamp;
         try
         {
             // Re-check session identity under the gate; no await may precede the sync launch.
             if (ct.IsCancellationRequested || _launchGateClosed)
-                return LaunchOutcome.Cancelled;
+                return (LaunchOutcome.Cancelled, 0);
 
             InsideLaunchGateHook?.Invoke();
 
+            // The creation-attempt timestamp is captured immediately before the synchronous
+            // TryStart (v2.8 §3.2); the session loop commits it as the restart-spacing
+            // reference only after the result confirms Started or a genuine Failed.
+            attemptTimestamp = _time.GetTimestamp();
             start = _monitor.TryStart(target, ct);
         }
         catch (OperationCanceledException)
         {
-            return LaunchOutcome.Cancelled;
+            return (LaunchOutcome.Cancelled, 0);
         }
         catch (Exception ex)
         {
@@ -1339,7 +1358,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             // (fail-safe: never spends the budget on an unobserved attempt) and keeps the
             // session alive.
             _logger.LogError(ex, "TryStart threw for {Target}", target.NameWithoutExtension);
-            return LaunchOutcome.BlockedDegraded;
+            return (LaunchOutcome.BlockedDegraded, 0);
         }
         finally
         {
@@ -1351,15 +1370,15 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
         switch (start.Status)
         {
             case ProcessStartStatus.Cancelled:
-                return LaunchOutcome.Cancelled;
+                return (LaunchOutcome.Cancelled, 0);
             case ProcessStartStatus.Missing:
                 _logger.LogWarning("Target {Target} disappeared before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                return LaunchOutcome.BlockedDegraded;
+                return (LaunchOutcome.BlockedDegraded, 0);
             case ProcessStartStatus.ReadError:
                 _logger.LogWarning("Target {Target} became unreadable before launch; skipping (degraded), no budget spent",
                     target.NameWithoutExtension);
-                return LaunchOutcome.BlockedDegraded;
+                return (LaunchOutcome.BlockedDegraded, 0);
             case ProcessStartStatus.Failed:
                 // Immediate genuine creation failure (v2.8 §3.2): charged exactly once here for
                 // an automatic attempt; the free initial attempt stays free. No appearance timer
@@ -1371,7 +1390,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                     _logger.LogInformation("Automatic launch attempt {Attempts} charged for {Target}",
                         counters.RestartAttempts, target.NameWithoutExtension);
                 }
-                return LaunchOutcome.StartFailed;
+                return (LaunchOutcome.StartFailed, attemptTimestamp);
         }
 
         // Started (v2.8 §2.1): the single charging point for an automatic attempt — charged
@@ -1384,7 +1403,7 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 counters.RestartAttempts, target.NameWithoutExtension);
         }
 
-        return LaunchOutcome.Launched;
+        return (LaunchOutcome.Launched, attemptTimestamp);
     }
 
     // v2.8.1 §D: the recovery toast fires on the first positive Running observation after an
