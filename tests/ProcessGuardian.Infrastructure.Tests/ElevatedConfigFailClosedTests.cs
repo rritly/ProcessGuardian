@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text.Json;
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using ProcessGuardian.Domain.Entities;
 using ProcessGuardian.Domain.Exceptions;
@@ -45,8 +46,8 @@ public class ElevatedConfigFailClosedTests : IDisposable
         }
     }
 
-    private JsonConfigurationStore NewStore() =>
-        new(NullLogger<JsonConfigurationStore>.Instance, _configDir, _journal, _fs, elevated: true);
+    private JsonConfigurationStore NewStore(ILogger<JsonConfigurationStore>? logger = null) =>
+        new(logger ?? NullLogger<JsonConfigurationStore>.Instance, _configDir, _journal, _fs, elevated: true);
 
     private string[] QuarantineSiblings() =>
         Directory.GetDirectories(_root, "quarantine-*")
@@ -60,12 +61,15 @@ public class ElevatedConfigFailClosedTests : IDisposable
     }
 
     [Fact]
-    public async Task CleanFirstRun_CreatesProtectedDefaults_ResetNoticePending_MonitoringOffEmptyPin()
+    public async Task MissingDirectory_CreatesProtectedDefaults_DefaultsInitializedPendingRecovery_MonitoringOffEmptyPin()
     {
         var status = await NewStore().InitializeAsync();
 
-        status.Should().Be(ConfigurationInitializationStatus.ResetNoticePending);
-        _journal.State.Should().Be(RecoveryState.ResetNoticePending);
+        // The neutral missing-directory status (R-AS-FIRST-RUN-DIAGNOSTICS): no content was
+        // quarantined, so no reset notice is claimed — but the same reconciliation is pending.
+        status.Should().Be(ConfigurationInitializationStatus.DefaultsInitializedPendingRecovery);
+        _journal.State.Should().Be(RecoveryState.ResetNoticePending,
+            "the journaled sequence is identical for every recovery cause");
         Directory.Exists(_configDir).Should().BeTrue();
         File.Exists(_settingsPath).Should().BeTrue();
 
@@ -74,6 +78,61 @@ public class ElevatedConfigFailClosedTests : IDisposable
         defaults.TargetProcessPath.Should().BeEmpty();
         defaults.TargetHashSha256.Should().BeEmpty();
         defaults.AutostartEnabled.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task MissingDirectory_Initialization_LogsNeutralInformation_NeverClaimsQuarantine()
+    {
+        var logger = new CapturingLogger();
+
+        await NewStore(logger).InitializeAsync();
+
+        logger.Messages.Where(m => m.Level == LogLevel.Warning).Should().BeEmpty(
+            "a normal missing-directory initialization must not produce a Warning");
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Information
+            && m.Message.Contains("configuration directory is absent", StringComparison.Ordinal)
+            && m.Message.Contains("protected defaults were initialized", StringComparison.Ordinal)
+            && m.Message.Contains("autostart reconciliation is required", StringComparison.Ordinal));
+        logger.Messages.Should().NotContain(m =>
+            m.Message.Contains("quarantined", StringComparison.OrdinalIgnoreCase),
+            "nothing existed, so nothing was quarantined");
+        logger.Messages.Should().NotContain(m =>
+            m.Message.Contains("reset", StringComparison.OrdinalIgnoreCase),
+            "the missing-directory path is never reported as a reset");
+    }
+
+    [Fact]
+    public async Task UntrustedConfig_Quarantine_KeepsWarningWithQuarantineWording()
+    {
+        // Pre-existing config that fails the protection check: the actual quarantine must keep
+        // its Warning with the accurate quarantine wording.
+        Directory.CreateDirectory(_configDir);
+        File.WriteAllText(_settingsPath, "{}");
+        var logger = new CapturingLogger();
+
+        await NewStore(logger).InitializeAsync();
+
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Warning
+            && m.Message.Contains("quarantined", StringComparison.OrdinalIgnoreCase)
+            && m.Message.Contains("recreated with fresh defaults", StringComparison.Ordinal));
+    }
+
+    // Capturing logger asserting levels and rendered messages (EventId is not used by the
+    // store; the template text is asserted, never localized OS text).
+    private sealed class CapturingLogger : ILogger<JsonConfigurationStore>
+    {
+        public List<(LogLevel Level, string Message)> Messages { get; } = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Messages.Add((logLevel, formatter(state, exception)));
     }
 
     [Fact]
@@ -231,7 +290,7 @@ public class ElevatedConfigFailClosedTests : IDisposable
     }
 
     [Fact]
-    public async Task LegacyParentSettingsFile_Quarantined_OnCleanFirstRun_NeverReadOrMigrated()
+    public async Task LegacyParentSettingsFile_Quarantined_OnMissingDirectoryInitialization_NeverReadOrMigrated()
     {
         var legacy = Path.Combine(_root, "settings.json");
         File.WriteAllText(legacy, JsonSerializer.Serialize(new AppSettings
@@ -243,7 +302,7 @@ public class ElevatedConfigFailClosedTests : IDisposable
 
         var status = await NewStore().InitializeAsync();
 
-        status.Should().Be(ConfigurationInitializationStatus.ResetNoticePending);
+        status.Should().Be(ConfigurationInitializationStatus.DefaultsInitializedPendingRecovery);
         File.Exists(legacy).Should().BeFalse("the legacy parent-level file must be moved out of the way");
         Directory.Exists(_configDir).Should().BeTrue();
         ReadRealSettings(_settingsPath).TargetProcessPath.Should().BeEmpty("legacy content must never be migrated");

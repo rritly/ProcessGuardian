@@ -1,5 +1,6 @@
 using System.IO;
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using ProcessGuardian.Application.Services;
@@ -121,8 +122,12 @@ public class GuardianAutomaticRecoveryTests
             Config.InitializeAsync(Arg.Any<CancellationToken>())
                 .Returns(Task.FromResult(ConfigurationInitializationStatus.ResetNoticePending));
 
-        public GuardianOrchestrator Create() => new(
-            Monitor, Config, Notifications, NullLogger<GuardianOrchestrator>.Instance,
+        public void DefaultsInitializedPendingRecoveryInit() =>
+            Config.InitializeAsync(Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult(ConfigurationInitializationStatus.DefaultsInitializedPendingRecovery));
+
+        public GuardianOrchestrator Create(ILogger<GuardianOrchestrator>? logger = null) => new(
+            Monitor, Config, Notifications, logger ?? NullLogger<GuardianOrchestrator>.Instance,
             Status, Integrity, Autostart, Time, ResetNoticeAck);
     }
 
@@ -180,6 +185,56 @@ public class GuardianAutomaticRecoveryTests
         h.Autostart.SetCalls.Should().Be(0, "recovery removes; it never enables a registration");
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
         controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+    }
+
+    // Capturing logger asserting controller-level levels and rendered messages.
+    private sealed class CapturingLogger : ILogger<GuardianOrchestrator>
+    {
+        public List<(LogLevel Level, string Message)> Messages { get; } = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Messages.Add((logLevel, formatter(state, exception)));
+    }
+
+    [Fact]
+    public async Task Reconcile_MissingDirectoryDefaultsInit_RunsTheSameRecoveryFlow_WithNeutralLog()
+    {
+        using var h = new Harness();
+        h.DefaultsInitializedPendingRecoveryInit();
+        h.Autostart.State = AutostartState.Enabled; // a pre-existing task that the delete removes
+        var logger = new CapturingLogger();
+
+        var controller = h.Create(logger);
+        await controller.ReconcileAsync();
+
+        // The neutral missing-directory init runs the EXACT same reconciliation: verified task
+        // removal, persisted disabled state, journal clear, no enable/create, no session start.
+        controller.AutostartActualState.Should().Be(AutostartState.Absent);
+        controller.RecoveryPending.Should().BeFalse("a fully-verified recovery clears the pending gate");
+        h.LastSaved.Should().NotBeNull();
+        h.LastSaved!.AutostartEnabled.Should().BeFalse();
+        h.LastSaved.IsMonitoringEnabled.Should().BeFalse();
+        h.ResetNoticeAck.ClearCalls.Should().Be(1);
+        h.Autostart.SetCalls.Should().Be(0, "recovery removes; it never enables a registration");
+        _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+        controller.CurrentState.Status.Should().Be(GuardianStatus.Stopped);
+
+        // The controller reports the missing-directory path at Information with neutral wording,
+        // never as a reset/quarantine Warning (R-AS-FIRST-RUN-DIAGNOSTICS).
+        logger.Messages.Should().NotContain(m =>
+            m.Level == LogLevel.Warning
+            && m.Message.Contains("Reset notice pending", StringComparison.Ordinal));
+        logger.Messages.Should().NotContain(m =>
+            m.Message.Contains("quarantin", StringComparison.OrdinalIgnoreCase));
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Information
+            && m.Message.Contains("Configuration directory was absent", StringComparison.Ordinal));
     }
 
     [Fact]

@@ -305,32 +305,51 @@ public partial class MainViewModel : ObservableObject
                 IsDegraded = false;
                 break;
             case ConfigurationInitializationStatus.ResetNoticePending:
-                ResetNotice =
-                    "Settings were reset to safe defaults: the previous configuration was untrusted and has been " +
-                    "quarantined. Automatic recovery (removing the scheduled task and disabling autostart) " +
-                    "completes at startup; monitoring stays off until you re-select the target and start it.";
-                // Until the automatic recovery completes and the journal is cleared, autostart edits
-                // and Start stay locked and the checkbox shows no verified state (2.1/2.5 / R-AS-AUTO).
-                _recoveryPending = true;
-                // [v2.6 Amendment B / R-AS-GATE] Cancel an already scheduled debounce and raise the
-                // derived-gate notifications so every settings binding and command CanExecute
-                // updates immediately (the pending flag is not itself an observable property).
-                _saveCts?.Cancel();
-                OnPropertyChanged(nameof(IsSettingsEditable));
-                OnPropertyChanged(nameof(IsTargetPathEditable));
-                IsAutostartEditable = false;
-                _updatingAutostartEffective = true;
-                try
+            case ConfigurationInitializationStatus.DefaultsInitializedPendingRecovery:
+                // [R-AS-FIRST-RUN-DIAGNOSTICS] Both pending-recovery statuses share the exact
+                // same gating; only the reset notice differs. ResetNoticePending keeps the
+                // accurate quarantine wording. DefaultsInitializedPendingRecovery reports a
+                // missing configuration directory — nothing was quarantined, so no reset/
+                // quarantine banner is shown; the neutral controller-side Information log is
+                // the only diagnostic for that path.
+                if (status == ConfigurationInitializationStatus.ResetNoticePending)
                 {
-                    AutostartEffective = false;
+                    ResetNotice =
+                        "Settings were reset to safe defaults: the previous configuration was untrusted and has been " +
+                        "quarantined. Automatic recovery (removing the scheduled task and disabling autostart) " +
+                        "completes at startup; monitoring stays off until you re-select the target and start it.";
                 }
-                finally
-                {
-                    _updatingAutostartEffective = false;
-                }
-                NotifyStartStopCanExecuteChanged();
+                EnterRecoveryPendingState();
                 break;
         }
+    }
+
+    // Applies the pending-recovery gating shared by both pending-recovery initialization
+    // statuses (R-AS-FIRST-RUN-DIAGNOSTICS): until the automatic recovery completes and the
+    // journal is cleared, autostart edits and Start stay locked and the checkbox shows no
+    // verified state (2.1/2.5 / R-AS-AUTO).
+    private void EnterRecoveryPendingState()
+    {
+        // Until the automatic recovery completes and the journal is cleared, autostart edits
+        // and Start stay locked and the checkbox shows no verified state (2.1/2.5 / R-AS-AUTO).
+        _recoveryPending = true;
+        // [v2.6 Amendment B / R-AS-GATE] Cancel an already scheduled debounce and raise the
+        // derived-gate notifications so every settings binding and command CanExecute
+        // updates immediately (the pending flag is not itself an observable property).
+        _saveCts?.Cancel();
+        OnPropertyChanged(nameof(IsSettingsEditable));
+        OnPropertyChanged(nameof(IsTargetPathEditable));
+        IsAutostartEditable = false;
+        _updatingAutostartEffective = true;
+        try
+        {
+            AutostartEffective = false;
+        }
+        finally
+        {
+            _updatingAutostartEffective = false;
+        }
+        NotifyStartStopCanExecuteChanged();
     }
 
     // True when any persistent status-guidance message is present (refused configuration,

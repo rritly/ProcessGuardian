@@ -148,7 +148,7 @@ public sealed class JsonConfigurationStore : IConfigurationStore
         {
             // Never load/parse/hash/migrate current settings while a recovery is in
             // progress; resume quarantine-and-recreate instead.
-            return await RunRecoveryAsync(ct, quarantineConfig: true);
+            return await RunRecoveryAsync(ct, RecoveryCause.JournalResumption);
         }
 
         return await CompleteOrRecoverAsync(ct, journalState, parent);
@@ -186,15 +186,33 @@ public sealed class JsonConfigurationStore : IConfigurationStore
                 : ConfigurationInitializationStatus.Success;
         }
 
-        return await RunRecoveryAsync(ct, quarantineConfig: verdict == Verdict.Recreate);
+        return await RunRecoveryAsync(
+            ct,
+            verdict == Verdict.Recreate ? RecoveryCause.UntrustedConfig : RecoveryCause.MissingDirectory);
     }
 
     private enum Verdict
     {
         UseExisting,
         Recreate,
-        CleanFirstRun,
+        MissingDirectory,
         Refuse,
+    }
+
+    // Why RunRecoveryAsync runs. The cause only selects accurate diagnostics and the returned
+    // initialization status; the journaled recovery sequence itself is identical for every
+    // cause and is never skipped or shortened (R-AS-FIRST-RUN-DIAGNOSTICS).
+    private enum RecoveryCause
+    {
+        // The intended config directory does not exist: a first run or an external wipe (the
+        // two cannot be told apart without a durable install marker). Nothing is quarantined.
+        MissingDirectory,
+
+        // An existing config object was classified untrusted and is moved to quarantine.
+        UntrustedConfig,
+
+        // A journaled RecoveryInProgress was found: an interrupted recovery resumes.
+        JournalResumption,
     }
 
     private Verdict EvaluateConfig()
@@ -229,15 +247,18 @@ public sealed class JsonConfigurationStore : IConfigurationStore
         // Missing config directory: first run (or external wipe). Legacy parent files are
         // quarantined during recovery; a reparse/object at the intended path is handled by
         // create-exclusive collision + classification during recovery.
-        return Verdict.CleanFirstRun;
+        return Verdict.MissingDirectory;
     }
 
     // ---------------------------------------------------------------------
     // Quarantine and recreate
     // ---------------------------------------------------------------------
 
-    private async Task<ConfigurationInitializationStatus> RunRecoveryAsync(CancellationToken ct, bool quarantineConfig)
+    private async Task<ConfigurationInitializationStatus> RunRecoveryAsync(CancellationToken ct, RecoveryCause cause)
     {
+        // The journaled sequence below is identical for every cause: only the diagnostics and
+        // the returned status depend on whether anything untrusted was actually quarantined.
+        var quarantineConfig = cause != RecoveryCause.MissingDirectory;
         var parent = ParentDirectory();
 
         // Crash-safe ordering: persist the recovery marker BEFORE touching any config object.
@@ -278,10 +299,26 @@ public sealed class JsonConfigurationStore : IConfigurationStore
             return ConfigurationInitializationStatus.Refused;
         }
 
-        // Values come from fresh defaults only; the quarantined content is never read.
+        // Values come from fresh defaults only; the quarantined content (if any) is never read.
         _current = new AppSettings();
-        _logger.LogWarning("Elevated config quarantined and recreated with fresh defaults");
-        return ConfigurationInitializationStatus.ResetNoticePending;
+        if (cause == RecoveryCause.MissingDirectory)
+        {
+            // Neutral factual wording (R-AS-FIRST-RUN-DIAGNOSTICS): nothing existed, so nothing
+            // was quarantined or reset. Without a durable install marker a first run and an
+            // external wipe are indistinguishable — only the observed fact is reported, at
+            // Information, because a normal missing-directory initialization is not a Warning.
+            _logger.LogInformation(
+                "Elevated configuration directory is absent; protected defaults were initialized and autostart reconciliation is required.");
+        }
+        else
+        {
+            // An untrusted config object was actually quarantined (or an interrupted recovery
+            // resumed), so the quarantine wording is accurate here.
+            _logger.LogWarning("Elevated config quarantined and recreated with fresh defaults");
+        }
+        return cause == RecoveryCause.MissingDirectory
+            ? ConfigurationInitializationStatus.DefaultsInitializedPendingRecovery
+            : ConfigurationInitializationStatus.ResetNoticePending;
     }
 
     private async Task<bool> TryGuardJournalAsync(CancellationToken ct, RecoveryState state)

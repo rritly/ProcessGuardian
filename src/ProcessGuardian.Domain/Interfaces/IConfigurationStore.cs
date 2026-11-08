@@ -17,6 +17,14 @@ public enum ConfigurationInitializationStatus
     ResetNoticePending,
 
     /// <summary>
+    /// The configuration directory itself was absent (first run or an external wipe — the
+    /// two cannot be distinguished without a durable install marker). Fresh protected
+    /// defaults were initialized and no content was quarantined; the same automatic
+    /// reconciliation (task removal, disabled state, journal clear) is still required.
+    /// </summary>
+    DefaultsInitializedPendingRecovery,
+
+    /// <summary>
     /// The store refused to read/write (unsafe location, unverifiable parent, or a
     /// quarantine that never converged). No settings object can be obtained; the
     /// boot path must enter the ordinary Error mode and must not start monitoring.

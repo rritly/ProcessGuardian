@@ -134,6 +134,27 @@ public class MainViewModelInitIndicatorTests
             "after the controller raises RecoveryPendingChanged for a fully-verified recovery");
     }
 
+    // [R-AS-FIRST-RUN-DIAGNOSTICS] The neutral missing-directory initialization shares the exact
+    // same recovery gating, but must NOT show the user a banner claiming that an existing
+    // untrusted configuration was quarantined (nothing was quarantined — the directory itself
+    // was absent).
+    [Fact]
+    public void DefaultsInitializedPendingRecovery_LocksGates_StartDisabled_NoResetNoticeBanner()
+    {
+        var vm = new Harness().CreateVm();
+
+        vm.ApplyInitializationStatus(ConfigurationInitializationStatus.DefaultsInitializedPendingRecovery);
+
+        vm.ResetNotice.Should().BeEmpty("no false quarantine/reset banner for a missing-directory initialization");
+        vm.ConfigurationError.Should().BeEmpty();
+        vm.StartCommand.CanExecute(null).Should().BeFalse(
+            "the same reconciliation is pending; Start stays gated off until it is fully verified");
+        vm.IsSettingsEditable.Should().BeFalse();
+        vm.IsTargetPathEditable.Should().BeFalse();
+        vm.IsAutostartEditable.Should().BeFalse();
+        vm.AutostartEffective.Should().BeFalse();
+    }
+
     // Monitoring Card layout: the guidance row must be fully collapsed (HasStatusGuidance ==
     // false) when no message and no recovery indication exists, and visible whenever any of the
     // three source messages is present.

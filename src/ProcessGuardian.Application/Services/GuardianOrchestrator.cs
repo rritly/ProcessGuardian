@@ -197,21 +197,33 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 return;
             }
 
-            if (init == ConfigurationInitializationStatus.ResetNoticePending)
+            var resetNotice = init == ConfigurationInitializationStatus.ResetNoticePending;
+            if (resetNotice || init == ConfigurationInitializationStatus.DefaultsInitializedPendingRecovery)
             {
                 // [recovery policy, product v2.5 R-AS-AUTO] A pending reset notice means the
                 // previous configuration was untrusted and quarantined and fresh safe defaults
-                // were written. The controller now runs the automatic recovery BEFORE any
-                // ordinary autostart sync and before any possibility of Start: remove the
-                // (possibly pre-existing) elevated autostart task, persist AutostartEnabled=false
-                // + IsMonitoringEnabled=false, and only then clear the journal. Until it settles,
-                // _recoveryPending blocks Start at the controller level, no SyncAutostartAsync and
-                // no session may run, and a failed recovery leaves the journal pending for the
-                // next startup (idempotent). No A/B choice exists anymore — target path and pin
-                // stay at their safe defaults and the user re-selects the target later.
+                // were written. DefaultsInitializedPendingRecovery reports the neutral factual
+                // case (R-AS-FIRST-RUN-DIAGNOSTICS): the configuration directory was absent, so
+                // nothing was quarantined — but the same reconciliation is still mandatory. The
+                // controller runs the automatic recovery BEFORE any ordinary autostart sync and
+                // before any possibility of Start: remove the (possibly pre-existing) elevated
+                // autostart task, persist AutostartEnabled=false + IsMonitoringEnabled=false,
+                // and only then clear the journal. Until it settles, _recoveryPending blocks
+                // Start at the controller level, no SyncAutostartAsync and no session may run,
+                // and a failed recovery leaves the journal pending for the next startup
+                // (idempotent). No A/B choice exists anymore — target path and pin stay at
+                // their safe defaults and the user re-selects the target later.
                 _configRefused = false;
                 _recoveryPending = true;
-                _logger.LogWarning("Reset notice pending; running automatic recovery (remove autostart, save disabled, clear journal)");
+                if (resetNotice)
+                {
+                    _logger.LogWarning("Reset notice pending; running automatic recovery (remove autostart, save disabled, clear journal)");
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "Configuration directory was absent and protected defaults were initialized; running automatic reconciliation (remove autostart, save disabled, clear journal)");
+                }
                 var recovery = await RunAutomaticRecoveryAsync(ct).ConfigureAwait(false);
                 if (recovery.Completed)
                 {
