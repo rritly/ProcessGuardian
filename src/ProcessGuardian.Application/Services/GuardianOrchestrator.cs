@@ -385,11 +385,44 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             // 1) Initial settings save. A failed initial save must NOT be followed by an autostart
             //    side effect based on an uncommitted desired value (R-AS-TXN): the external
             //    scheduled task is only touched after a confirmed settings write.
-            var saved = await PersistEnabledAsync(enabled: sessionActive, ct).ConfigureAwait(false);
+            bool saved;
+            try
+            {
+                saved = await PersistEnabledAsync(enabled: sessionActive, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // PersistEnabledAsync rethrows a cancellation only when the settings write was
+                // NOT committed: both IConfigurationStore implementations perform their only
+                // cancellable awaits (the lock acquisition and, in the regular edition, the
+                // temp-file write) strictly BEFORE the atomic File.Move, and the elevated path
+                // has no cancellable await after the actual commit. The previous persisted
+                // document is therefore still on disk, so the in-memory committed snapshot must
+                // not keep the unconfirmed AutostartEnabled (R-AS-AUTOSTART-CHANGE-GATE-RETRY):
+                // restore only the autostart baseline — the other snapshot fields and the
+                // controller-owned target path / pin keep their values — and rethrow without any
+                // scheduler operation. No retry loop: the next ordinary settings commit
+                // re-detects the change against the restored baseline.
+                _committed = _committed with { AutostartEnabled = previousAutostart };
+                throw;
+            }
             if (!sessionActive && saved)
                 Publish(new MonitorState(GuardianStatus.Stopped, false, null, false));
             if (!saved)
+            {
+                // A failed initial save must not leave the unconfirmed AutostartEnabled in the
+                // committed snapshot (R-AS-AUTOSTART-CHANGE-GATE-RETRY): PersistEnabledAsync
+                // applies _committed to every document it saves, so a stale unconfirmed value
+                // would otherwise leak onto the disk through ANY later successful save, and the
+                // change gate would treat the unconfirmed value as the committed baseline and
+                // skip a still-required synchronization. Restore only the autostart baseline to
+                // the last confirmed value — the disk still holds it — and keep the other
+                // snapshot fields and the controller-owned target path / pin untouched. No
+                // scheduler operation runs here; the next ordinary settings commit re-detects
+                // the change and syncs exactly once, after a successful save (R-AS-TXN).
+                _committed = _committed with { AutostartEnabled = previousAutostart };
                 return CommitSettingsResult.SaveFailed();
+            }
 
             // 2) Autostart sync only after a successful initial save AND only when the autostart
             //    preference actually changed (R-AS-AUTOSTART-CHANGE-GATE): a target-path, pin,

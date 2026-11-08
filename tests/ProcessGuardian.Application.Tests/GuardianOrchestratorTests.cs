@@ -1438,6 +1438,148 @@ public class GuardianOrchestratorTests
         _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
     }
 
+    // ---------------------------------------------------------------------
+    // R-AS-AUTOSTART-CHANGE-GATE-RETRY: a failed initial save must not leave
+    // the unconfirmed preference in the committed snapshot as the baseline
+    // ---------------------------------------------------------------------
+
+    // Both directions: the first commit requests the opposite preference but the initial save
+    // fails; the next ordinary commit with the SAME still-unconfirmed preference (plus an
+    // unrelated setting change) must re-detect the change against the restored baseline and
+    // sync exactly once, after the successful save (R-AS-TXN ordering). The persisted snapshot
+    // from the retried save is inspected to prove the other fields were not rolled back.
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task CommitSettings_SaveFailedBaselineRestored_NextCommitSameValueRetriesSync(
+        bool persisted, bool requested)
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings { AutostartEnabled = persisted }));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+        h.Autostart.ClearReceivedCalls();
+
+        var savedDocs = new List<AppSettings>();
+        var order = new List<string>();
+        var firstSaveFailed = false;
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                order.Add("save");
+                if (!firstSaveFailed)
+                {
+                    firstSaveFailed = true;
+                    throw new InvalidOperationException("disk full");
+                }
+                savedDocs.Add(callInfo.ArgAt<AppSettings>(0));
+                return Task.CompletedTask;
+            });
+        h.Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                order.Add("sync");
+                var desired = callInfo.ArgAt<bool>(0);
+                return Task.FromResult(AutostartResult.Success(
+                    desired ? AutostartState.Enabled : AutostartState.Absent));
+            });
+
+        // First commit: the preference change to `requested` fails to persist. The scheduler is
+        // never touched and no autostart outcome is carried.
+        var first = await controller.CommitSettingsAsync(
+            CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = requested }), @"C:\app.exe");
+
+        first.Saved.Should().BeFalse("the initial settings save failed");
+        first.Autostart.Should().BeNull("no scheduler operation runs after a failed save");
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
+        h.Autostart.ClearReceivedCalls();
+        order.Clear();
+
+        // Second ordinary commit: the same unconfirmed preference plus an unrelated setting
+        // change. The restored baseline makes the gate re-detect the change.
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings
+        {
+            AutostartEnabled = requested,
+            CheckIntervalSeconds = 9,
+        });
+        var second = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        second.Saved.Should().BeTrue("the retried save succeeds");
+        second.Autostart.Should().NotBeNull("the change gate re-detects the unconfirmed preference");
+        second.Autostart!.Value.Succeeded.Should().BeTrue();
+        second.Autostart!.Value.ActualState.Should().Be(
+            requested ? AutostartState.Enabled : AutostartState.Absent);
+        _ = h.Autostart.Received(1).SetEnabledAsync(requested, Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+        order.Should().Equal("save", "sync");
+        savedDocs.Should().ContainSingle("only the retried save reached the store");
+        savedDocs[0].AutostartEnabled.Should().Be(requested);
+        savedDocs[0].CheckIntervalSeconds.Should().Be(9,
+            "the other fields of the new snapshot are preserved, not rolled back");
+    }
+
+    // Cancellation of the initial save. Controller-side contract: an OperationCanceledException
+    // from the save means the write was NOT committed, so the baseline is restored and the
+    // exception propagates with no scheduler operation. Limitation: the NSubstitute store seam
+    // does not model the real atomic tmp+move semantics; the guarantee "OCE => no commit" is
+    // verified against JsonConfigurationStore's structure (its only cancellable awaits run
+    // strictly before the atomic File.Move, and the elevated path has no cancellable await
+    // after the commit), so this test proves the controller-side handling of that contract,
+    // not the store's own atomicity.
+    [Fact]
+    public async Task CommitSettings_SaveCancelled_BaselineRestored_NoScheduler_NextCommitRetries()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings { AutostartEnabled = false }));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+        h.Autostart.ClearReceivedCalls();
+
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException(new OperationCanceledException()));
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = true });
+        Func<Task> act = () => controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
+
+        // The next ordinary commit with the same desired value re-detects the change against
+        // the restored baseline and syncs exactly once, after the successful save.
+        var order = new List<string>();
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                order.Add("save");
+                return Task.CompletedTask;
+            });
+        h.Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                order.Add("sync");
+                return Task.FromResult(AutostartResult.Success(AutostartState.Enabled));
+            });
+
+        var retry = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        retry.Saved.Should().BeTrue();
+        retry.Autostart.Should().NotBeNull();
+        _ = h.Autostart.Received(1).SetEnabledAsync(true, Arg.Any<CancellationToken>());
+        order.Should().Equal("save", "sync");
+    }
+
     // R-AS-TXN §4.2 #3: initial save succeeds, enable fails, but the compensating rollback save
     // ALSO fails — the commit must NOT report a fully persisted outcome. It stays Saved=false (not
     // silently converted to "saved"), the autostart failure is still distinguishable, the in-memory
