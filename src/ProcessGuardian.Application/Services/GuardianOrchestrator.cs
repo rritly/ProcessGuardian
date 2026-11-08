@@ -1705,27 +1705,12 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
     {
         try
         {
-            // The service reports a typed, verified state; the controller surfaces it instead of
-            // swallowing it so the UI can show the failure and the checkbox reflects reality.
-            var state = await _autostart.ReadStateAsync(ct).ConfigureAwait(false);
-            if (state == AutostartState.Unknown)
-            {
-                // A reliable read failure must never be treated as "off" (2.4/2.5): mutating on
-                // the back of an unknown state could destroy a mis-detected registration or claim
-                // a verified state we do not have. Surface the uncertainty and make no change —
-                // an Unknown state is never a trigger for a potentially destructive disable.
-                _logger.LogWarning("Autostart state could not be read reliably; no change was made");
-                return AutostartResult.Failure(
-                    "the autostart registration state could not be verified; no change was made",
-                    AutostartState.Unknown);
-            }
-
-            // Verified idempotent fast path.
-            if (desiredEnabled && state == AutostartState.Enabled)
-                return AutostartResult.Success(state);
-            if (!desiredEnabled && state == AutostartState.Absent)
-                return AutostartResult.Success(state);
-
+            // The desired-state synchronization is delegated to the service in full: it reads the
+            // typed state itself, refuses to mutate on Unknown, short-circuits an already-desired
+            // registration as a no-op and verifies the actual state after a real change. A separate
+            // controller pre-read here would only add one redundant query before the service's own
+            // read (R-AS-AUTOSTART-QUERY-DEDUP). The typed result is surfaced to the caller so the
+            // UI can show the failure and the checkbox reflects reality.
             return await _autostart.SetEnabledAsync(desiredEnabled, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)

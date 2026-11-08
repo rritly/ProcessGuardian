@@ -21,10 +21,15 @@ public interface IAutostartService
     Task<AutostartState> ReadStateAsync(CancellationToken ct = default);
 
     /// <summary>
-    /// Enables or disables autostart. The returned result verifies the actual registration
-    /// state against the requested state before reporting success; a nonzero
-    /// <c>schtasks.exe</c> exit code, a process-start failure, or a state that did not take
-    /// effect are all reported as failures with diagnostics.
+    /// Enables or disables autostart, fully owning the desired-state synchronization
+    /// (R-AS-AUTOSTART-QUERY-DEDUP): the current typed registration state is read first; a state
+    /// that could not be read reliably (<see cref="AutostartState.Unknown"/>) forbids any
+    /// mutation and yields a failure result; a registration already in the desired state is a
+    /// verified no-op (no create/delete/write); after a real create/delete/write the actual
+    /// registration state is re-read and success is reported only when the verified postcondition
+    /// matches the requested state — a nonzero <c>schtasks.exe</c> exit code, a process-start
+    /// failure, or a state that did not take effect are all reported as failures with
+    /// diagnostics.
     /// </summary>
     Task<AutostartResult> SetEnabledAsync(bool enabled, CancellationToken ct = default);
 

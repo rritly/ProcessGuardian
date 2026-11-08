@@ -84,11 +84,11 @@ public class ScheduledTaskAutostartDiagnosticsTests
     }
 
     // ------------------------------------------------------------------
-    // MissingTask: Absent with routine Debug diagnostics only
+    // MissingTask: Absent as a routine state — nothing logged at all
     // ------------------------------------------------------------------
 
     [Fact]
-    public async Task ReadState_PositiveMissingTask_Absent_LogsDebugOnly_NoRawLocalizedOutput()
+    public async Task ReadState_PositiveMissingTask_Absent_LogsNothing_NoRawLocalizedOutput()
     {
         var (service, logger) = NewService(arguments =>
             arguments.Contains("/Query", StringComparison.Ordinal)
@@ -99,33 +99,35 @@ public class ScheduledTaskAutostartDiagnosticsTests
 
         state.Should().Be(AutostartState.Absent,
             "a positively classified task-not-found response is the verified Absent state");
-        logger.Messages.Should().Contain(m =>
-            m.Level == LogLevel.Debug
-            && m.Message.Contains("Autostart task is absent", StringComparison.Ordinal));
-        logger.Messages.Should().NotContain(m => m.Level >= LogLevel.Information,
-            "a missing task is an ordinary state: no Information/Error, only concise Debug");
-        logger.Messages.Should().NotContain(m =>
-            m.Message.Contains("Не удается найти", StringComparison.Ordinal),
-            "raw localized schtasks output never enters routine logs");
-        logger.Messages.Should().NotContain(m =>
-            m.Message.Contains("ERROR", StringComparison.Ordinal));
+        logger.Messages.Should().BeEmpty(
+            "a missing task is an ordinary state (R-AS-AUTOSTART-QUERY-DEDUP): no exit code, " +
+            "no localized stdout/stderr and no Error/Information/Debug entry in the routine journal");
     }
 
     [Fact]
-    public async Task Disable_FromAbsent_FastPath_LogsNothingWithRawOutput()
+    public async Task Disable_FromAbsent_FastPath_OnePreRead_NoMutations_NoLog()
     {
+        var queries = 0;
+        var deletes = 0;
         var (service, logger) = NewService(arguments =>
-            arguments.Contains("/Query", StringComparison.Ordinal)
-                ? LocalizedNotFound()
-                : Result(0, string.Empty, string.Empty, null));
+        {
+            if (arguments.Contains("/Query", StringComparison.Ordinal))
+            {
+                queries++;
+                return LocalizedNotFound();
+            }
+            deletes++;
+            return Result(0, string.Empty, string.Empty, null);
+        });
 
         var result = await service.SetEnabledAsync(false);
 
         result.Succeeded.Should().BeTrue();
         result.ActualState.Should().Be(AutostartState.Absent);
-        logger.Messages.Should().OnlyContain(m => m.Level <= LogLevel.Debug);
-        logger.Messages.Should().NotContain(m =>
-            m.Message.Contains("Не удается найти", StringComparison.Ordinal));
+        queries.Should().Be(1, "the desired-state fast path performs exactly one pre-read");
+        deletes.Should().Be(0, "an already-absent registration is never deleted again");
+        logger.Messages.Should().BeEmpty(
+            "a no-op fast path is silent: no missing-task message and no success message");
     }
 
     // ------------------------------------------------------------------
@@ -149,9 +151,36 @@ public class ScheduledTaskAutostartDiagnosticsTests
         result.ActualState.Should().Be(AutostartState.Absent);
         logger.Messages.Should().NotContain(m => m.Level == LogLevel.Error,
             "the preceding Error for the nonzero delete is false once the absence is verified");
-        logger.Messages.Should().Contain(m =>
-            m.Level == LogLevel.Debug
-            && m.Message.Contains("delete reported nonzero", StringComparison.Ordinal));
+        logger.Messages.Should().NotContain(m =>
+            m.Message.Contains("delete reported nonzero", StringComparison.Ordinal),
+            "no provisional delete-command message is emitted before the post-verification");
+        logger.Messages.Should().ContainSingle(
+            "only the final verified-removal message is logged")
+            .Which.Level.Should().Be(LogLevel.Information);
+        logger.Messages[0].Message.Should().Contain(
+            "Autostart task removal verified; no registration remains");
+    }
+
+    [Fact]
+    public async Task RemoveRegistration_DeleteExitZero_VerifiedAbsent_SingleFinalMessage()
+    {
+        // Exit-0 delete + verified absence: exactly one pre-command-free final Information, no
+        // provisional "delete command reported success" message, no Error.
+        var (service, logger) = NewService(arguments =>
+            arguments.Contains("/Delete", StringComparison.Ordinal)
+                ? Result(0, "SUCCESS", string.Empty, null)
+                : LocalizedNotFound());
+
+        var result = await service.RemoveRegistrationAsync();
+
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().Be(AutostartState.Absent);
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().Be(AutostartState.Absent);
+        logger.Messages.Should().ContainSingle();
+        logger.Messages[0].Level.Should().Be(LogLevel.Information);
+        logger.Messages[0].Message.Should().Contain(
+            "Autostart task removal verified; no registration remains");
     }
 
     // ------------------------------------------------------------------
@@ -172,9 +201,114 @@ public class ScheduledTaskAutostartDiagnosticsTests
         result.Succeeded.Should().BeTrue("the desired absent state was already achieved");
         result.ActualState.Should().Be(AutostartState.Absent);
         logger.Messages.Should().NotContain(m => m.Level == LogLevel.Error);
+        logger.Messages.Should().NotContain(m =>
+            m.Message.Contains("delete reported nonzero", StringComparison.Ordinal),
+            "no provisional delete-command message is emitted before the post-verification");
         logger.Messages.Should().Contain(m =>
-            m.Level == LogLevel.Debug
-            && m.Message.Contains("delete reported nonzero", StringComparison.Ordinal));
+            m.Level == LogLevel.Information
+            && m.Message.Contains("Autostart task removal verified; no registration remains", StringComparison.Ordinal));
+    }
+
+    // ------------------------------------------------------------------
+    // Desired-state synchronization counts (R-AS-AUTOSTART-QUERY-DEDUP):
+    // one pre-read, one desired operation, one post-verification
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Enable_FromAbsent_ExactCommandSequence_SingleVerifiedInformation()
+    {
+        var queries = 0;
+        var creates = 0;
+        var (service, logger) = NewService(arguments =>
+        {
+            if (arguments.Contains("/Query", StringComparison.Ordinal))
+            {
+                queries++;
+                return queries == 1
+                    ? LocalizedNotFound() // pre-read: verified absent -> the create must run
+                    : Result(0, ScheduledTaskTestXml.TaskXml(command: ExpectedCommand()), string.Empty, null);
+            }
+            creates++;
+            return Result(0, "SUCCESS", string.Empty, null); // /Create exit 0
+        });
+
+        var result = await service.SetEnabledAsync(true);
+
+        result.Succeeded.Should().BeTrue("the post-query verified the Enabled registration");
+        result.ActualState.Should().Be(AutostartState.Enabled);
+        queries.Should().Be(2, "exactly one pre-read and exactly one post-verification query");
+        creates.Should().Be(1, "exactly one desired /Create command");
+        logger.Messages.Should().ContainSingle(
+            "exactly one Information entry is logged after the verified creation")
+            .Which.Message.Should().Contain(
+                "Autostart task registration verified as enabled");
+        logger.Messages.Should().NotContain(m =>
+            m.Message.Contains("Autostart task is absent", StringComparison.Ordinal),
+            "the routine missing-task pre-read state is never logged");
+        logger.Messages.Should().NotContain(m =>
+            m.Message.Contains("(exit 1)", StringComparison.Ordinal),
+            "no raw pre-read exit code enters the routine journal");
+    }
+
+    [Fact]
+    public async Task Enable_AlreadyEnabled_FastPath_OnePreRead_NoMutations_NoLog()
+    {
+        var queries = 0;
+        var creates = 0;
+        var deletes = 0;
+        var (service, logger) = NewService(arguments =>
+        {
+            if (arguments.Contains("/Query", StringComparison.Ordinal))
+            {
+                queries++;
+                return Result(0, ScheduledTaskTestXml.TaskXml(command: ExpectedCommand()), string.Empty, null);
+            }
+            if (arguments.Contains("/Create", StringComparison.Ordinal))
+                creates++;
+            else
+                deletes++;
+            return Result(0, string.Empty, string.Empty, null);
+        });
+
+        var result = await service.SetEnabledAsync(true);
+
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().Be(AutostartState.Enabled);
+        queries.Should().Be(1, "the desired-state fast path performs exactly one pre-read");
+        creates.Should().Be(0, "an already-enabled task is never re-created");
+        deletes.Should().Be(0);
+        logger.Messages.Should().BeEmpty("a no-op fast path has no success log");
+    }
+
+    [Fact]
+    public async Task Disable_FromEnabled_ExactCommandSequence_SingleVerifiedInformation()
+    {
+        // The ordinary disable: 1 pre-read, 1 /Delete, 1 post-verification query; the verified
+        // absence is the single logged outcome.
+        var queries = 0;
+        var deletes = 0;
+        var (service, logger) = NewService(arguments =>
+        {
+            if (arguments.Contains("/Query", StringComparison.Ordinal))
+            {
+                queries++;
+                return queries == 1
+                    ? Result(0, ScheduledTaskTestXml.TaskXml(command: ExpectedCommand()), string.Empty, null)
+                    : LocalizedNotFound();
+            }
+            deletes++;
+            return Result(0, "SUCCESS", string.Empty, null);
+        });
+
+        var result = await service.SetEnabledAsync(false);
+
+        result.Succeeded.Should().BeTrue();
+        result.ActualState.Should().Be(AutostartState.Absent);
+        queries.Should().Be(2, "exactly one pre-read and exactly one post-verification query");
+        deletes.Should().Be(1, "exactly one desired /Delete command");
+        logger.Messages.Should().ContainSingle()
+            .Which.Message.Should().Contain(
+                "Autostart task removal verified; no registration remains");
     }
 
     // ------------------------------------------------------------------

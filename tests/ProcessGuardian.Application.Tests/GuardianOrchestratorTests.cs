@@ -69,10 +69,15 @@ public class GuardianOrchestratorTests
                 });
             Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
                 .Returns(Task.CompletedTask);
+            // R-AS-AUTOSTART-QUERY-DEDUP: the controller delegates the desired-state
+            // synchronization to SetEnabledAsync in full (no separate controller read), so the
+            // default stub mirrors a healthy service: the returned verified state matches the
+            // requested one. ReadStateAsync stays stubbed only to catch an accidental call.
             Autostart.ReadStateAsync(Arg.Any<CancellationToken>())
                 .Returns(Task.FromResult(AutostartState.Absent));
             Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
-                .Returns(Task.FromResult(AutostartResult.Success(AutostartState.Enabled)));
+                .Returns(callInfo => Task.FromResult(AutostartResult.Success(
+                    callInfo.ArgAt<bool>(0) ? AutostartState.Enabled : AutostartState.Absent)));
             Status.Report(Arg.Do<GuardianStatus>(s => Statuses.Add(s)));
 
             Notifications.ShowAsync(
@@ -1137,8 +1142,8 @@ public class GuardianOrchestratorTests
         using var h = new Harness();
         h.Config.InitializeAsync(Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
-        h.Autostart.ReadStateAsync(Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(AutostartState.Enabled));
+        // R-AS-AUTOSTART-QUERY-DEDUP: the controller performs no pre-read; the failure comes from
+        // the SetEnabledAsync result alone.
         h.Autostart.SetEnabledAsync(false, Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(AutostartResult.Failure(
                 "task deletion failed (exit 1)", AutostartState.Enabled)));
@@ -1174,6 +1179,11 @@ public class GuardianOrchestratorTests
         var controller = h.CreateController();
         await controller.ReconcileAsync();
 
+        // R-AS-AUTOSTART-QUERY-DEDUP: the startup reconciliation itself now reaches the service
+        // (exactly one SetEnabledAsync(false)); the assertion below is about the COMMIT, so the
+        // recorded startup call is cleared first.
+        h.Autostart.ClearReceivedCalls();
+
         var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = true });
         var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
 
@@ -1181,6 +1191,104 @@ public class GuardianOrchestratorTests
         // The external scheduled task is never mutated on the back of a failed settings save.
         _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
         _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
+    }
+
+    // R-AS-AUTOSTART-QUERY-DEDUP: the controller delegates the whole desired-state
+    // synchronization to the service — exactly one SetEnabledAsync call and no separate
+    // controller pre-read (the service reads its own typed state internally).
+    [Fact]
+    public async Task Reconcile_SyncAutostart_DelegatesToSetEnabledAsync_NoControllerPreRead()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings { AutostartEnabled = true }));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        _ = h.Autostart.Received(1).SetEnabledAsync(true, Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+        controller.AutostartActualState.Should().Be(AutostartState.Enabled);
+        controller.AutostartSyncError.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task CommitSettings_SyncAutostart_DelegatesToSetEnabledAsync_NoControllerPreRead()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = true });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        result.Saved.Should().BeTrue();
+        result.Autostart.Should().NotBeNull();
+        result.Autostart!.Value.Succeeded.Should().BeTrue();
+        _ = h.Autostart.Received(1).SetEnabledAsync(true, Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+    }
+
+    // The typed Unknown outcome (produced by the service, never by the controller) is surfaced to
+    // the presentation layer as the verified actual state + error, with no mutation having been
+    // requested beyond the single SetEnabledAsync call.
+    [Fact]
+    public async Task SyncAutostart_UnknownOutcome_PublishedToPresentationLayer()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(AutostartResult.Failure(
+                "the current autostart state could not be read reliably; no change was made",
+                AutostartState.Unknown)));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        controller.AutostartActualState.Should().Be(AutostartState.Unknown,
+            "an unverifiable state is never reported as a verified off/on state");
+        controller.AutostartSyncError.Should().Contain("could not be read reliably");
+        _ = h.Autostart.Received(1).SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+    }
+
+    // A service-side exception is surfaced as a typed failure with diagnostics — never lost.
+    [Fact]
+    public async Task SyncAutostart_ServiceThrows_TypedFailureSurfaced()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<AutostartResult>(new InvalidOperationException("boom")));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        controller.AutostartActualState.Should().BeNull();
+        controller.AutostartSyncError.Should().Contain("InvalidOperationException")
+            .And.Contain("boom", "the exception diagnostics travel with the surfaced failure");
+    }
+
+    // Cancellation propagates out of the synchronization (never swallowed as a failure).
+    [Fact]
+    public async Task SyncAutostart_Cancellation_Propagates()
+    {
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<AutostartResult>(new OperationCanceledException()));
+
+        var controller = h.CreateController();
+        Func<Task> act = () => controller.ReconcileAsync();
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
     }
 
     // R-AS-TXN §4.2 #3: initial save succeeds, enable fails, but the compensating rollback save

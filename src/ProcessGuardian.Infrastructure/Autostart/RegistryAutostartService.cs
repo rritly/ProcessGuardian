@@ -34,10 +34,18 @@ public sealed class RegistryAutostartService : IAutostartService
         _registryPath = registryPath;
     }
 
+    // Test-only seam (R-AS-AUTOSTART-QUERY-DEDUP): when set, ReadStateAsync throws this exception
+    // instead of touching the registry, so tests can drive the fail-closed Unknown path
+    // deterministically (in production Unknown arises only from a real read/access failure).
+    // Never set by production code.
+    internal Func<Exception>? ReadFault { get; set; }
+
     public Task<AutostartState> ReadStateAsync(CancellationToken ct = default)
     {
         try
         {
+            if (ReadFault is not null)
+                throw ReadFault();
             using var key = Registry.CurrentUser.OpenSubKey(_registryPath, false);
             var value = key?.GetValue(KeyName) as string;
             if (string.IsNullOrWhiteSpace(value))

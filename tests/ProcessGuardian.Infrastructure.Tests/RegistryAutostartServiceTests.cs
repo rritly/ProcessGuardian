@@ -99,4 +99,26 @@ public class RegistryAutostartServiceTests : IDisposable
 
         (await _service.ReadStateAsync()).Should().Be(AutostartState.Misconfigured);
     }
+
+    // R-AS-AUTOSTART-QUERY-DEDUP: the fail-closed desired-state contract — an unreliable read
+    // (Unknown) forbids any mutation and yields a failure result for BOTH implementations. The
+    // Registry fault seam makes the read failure deterministic without touching machine state.
+    [Fact]
+    public async Task SetEnabled_UnknownRead_FailsClosed_NoMutation_FailureResult()
+    {
+        _service.ReadFault = () => new UnauthorizedAccessException("test read fault");
+
+        var enable = await _service.SetEnabledAsync(true);
+        var disable = await _service.SetEnabledAsync(false);
+
+        enable.Succeeded.Should().BeFalse("an Unknown state must never be mutated");
+        enable.ActualState.Should().Be(AutostartState.Unknown);
+        disable.Succeeded.Should().BeFalse("an Unknown state must never be mutated");
+        disable.ActualState.Should().Be(AutostartState.Unknown);
+        using (var key = Registry.CurrentUser.OpenSubKey(_scratchPath, false))
+        {
+            key?.GetValue(KeyName).Should().BeNull(
+                "no enable/disable write may happen on the back of an unreliable read");
+        }
+    }
 }

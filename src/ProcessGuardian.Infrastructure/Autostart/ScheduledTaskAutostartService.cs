@@ -193,12 +193,12 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         {
             case SchTasksQueryFailure.MissingTask:
                 // A positively classified missing task is the ordinary Absent state, especially
-                // on first install: routine Debug diagnostics, no raw localized stdout/stderr and
-                // no Error event (R-AS-TASK-SCHEDULER-DIAGNOSTICS). The fail-closed rule is
-                // unchanged — only the supported task-not-found response reaches this case, and
-                // the actual raw streams stay in the SchTasksCommandResult for any genuine
-                // failure diagnostic that later needs them.
-                _logger.LogDebug("Autostart task is absent (exit {Code})", query.ExitCode);
+                // on first install — a routine state, not an operation outcome and not a failure
+                // (R-AS-AUTOSTART-QUERY-DEDUP). Nothing is logged for it at all: neither an exit
+                // code nor localized stdout/stderr belongs in the journal merely because the task
+                // is not yet registered. The fail-closed rule is unchanged — only the supported
+                // task-not-found response reaches this case, and the raw streams stay in the
+                // SchTasksCommandResult for any genuine failure diagnostic that later needs them.
                 return (AutostartState.Absent, null);
             case SchTasksQueryFailure.AccessDenied:
                 LogCommandFailure("query-xml", query);
@@ -243,8 +243,8 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                 AutostartState.Unknown);
         }
 
-        // Carried out of the branch so the disable path's provisional delete result can reach the
-        // shared verification block below (R-AS-TASK-SCHEDULER-DIAGNOSTICS).
+        // Carried out of the branch so the disable path's delete result can reach the shared
+        // verification block below (only its genuine-failure re-log uses it).
         SchTasksCommandResult? delete = null;
         if (enabled)
         {
@@ -292,22 +292,17 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                 return AutostartResult.Success(AutostartState.Absent);
 
             var result = await RunSchTasksAsync(BuildDeleteArguments(), ct).ConfigureAwait(false);
+            // Carried out of the branch so the delete result can reach the shared verification
+            // block below; a nonzero exit is never proof of the final state (R-AS-AUTOSTART-
+            // QUERY-DEDUP): a concurrent removal between the pre-query and this delete is a benign
+            // race, no provisional message is emitted, and the post-operation verification below
+            // decides. When the required postcondition was NOT achieved, the bounded delete
+            // diagnostics are re-logged at Error exactly once, below.
             delete = result;
             if (result.InvocationFailed)
             {
                 LogCommandFailure("delete", result);
                 return AutostartResult.Failure("task deletion failed: schtasks.exe could not be started", state);
-            }
-            if (result.ExitCode != 0)
-            {
-                // Provisional (R-AS-TASK-SCHEDULER-DIAGNOSTICS): a concurrent removal between the
-                // pre-query and this delete is a benign race — the task may already be absent, so
-                // the post-operation verification below decides, and a verified absence is an
-                // idempotent success. Logged at Debug for now; a genuine failure re-logs the
-                // bounded diagnostics at Error. A failure to invoke schtasks.exe remains an
-                // invocation failure above.
-                _logger.LogDebug(
-                    "Autostart task delete reported nonzero (exit {Code}); verifying actual absence", result.ExitCode);
             }
         }
 
@@ -317,7 +312,16 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         var (actual, descriptor) = await ReadStateDetailedAsync(ct).ConfigureAwait(false);
         var expected = enabled ? AutostartState.Enabled : AutostartState.Absent;
         if (actual == expected)
+        {
+            // The verified outcome of a REAL change is logged exactly once, after the
+            // post-verification confirms it (R-AS-AUTOSTART-QUERY-DEDUP). The desired-state fast
+            // path (no change attempted) returned earlier and stays silent.
+            if (enabled)
+                _logger.LogInformation("Autostart task registration verified as enabled");
+            else
+                _logger.LogInformation("Autostart task removal verified; no registration remains");
             return AutostartResult.Success(actual);
+        }
         if (actual == AutostartState.Unknown)
         {
             if (delete is { ExitCode: not 0 })
@@ -368,13 +372,10 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
 
         // A nonzero /Delete exit code alone proves nothing and is NOT yet an error (not-found is
         // expected when the task was already removed by a previous, interrupted recovery or a
-        // concurrent actor). It is provisional until the positive verification below decides
-        // (R-AS-TASK-SCHEDULER-DIAGNOSTICS); a genuine failure re-logs the bounded diagnostics
-        // at Error exactly once.
-        if (delete.ExitCode != 0)
-            _logger.LogDebug("Autostart task delete reported nonzero (exit {Code}); verifying actual absence", delete.ExitCode);
-        else
-            _logger.LogInformation("Autostart task delete command reported success (exit 0); verifying actual absence");
+        // concurrent actor), and an exit-0 code is not proof of absence either. No provisional
+        // message is emitted for the delete command: the positive verification below decides, and
+        // only its verified outcome is logged (R-AS-AUTOSTART-QUERY-DEDUP). A genuine failure
+        // re-logs the bounded delete diagnostics at Error exactly once.
 
         // Positive verification: /Delete's exit code does not prove the task is gone. Query the
         // machine-readable XML state and require Absent; Unknown/access/service/other failures and
@@ -382,12 +383,12 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         var (actual, _) = await ReadStateDetailedAsync(ct).ConfigureAwait(false);
         if (actual == AutostartState.Absent)
         {
-            _logger.LogInformation("Autostart task removal verified; the task is absent");
+            _logger.LogInformation("Autostart task removal verified; no registration remains");
             return AutostartResult.Success(AutostartState.Absent);
         }
 
-        // A genuine failure re-logs the bounded delete diagnostics at Error (the provisional
-        // Debug above is upgraded only when the required postcondition was not achieved).
+        // A genuine failure re-logs the bounded delete diagnostics at Error (R-AS-TASK-SCHEDULER-
+        // DIAGNOSTICS): only when the required postcondition was not achieved.
         if (delete.ExitCode != 0)
             LogCommandFailure("delete", delete);
         _logger.LogWarning("Autostart task removal could not be verified (actual state: {Actual}); recovery stays pending", actual);

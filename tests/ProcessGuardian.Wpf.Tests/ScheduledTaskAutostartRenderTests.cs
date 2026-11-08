@@ -59,12 +59,20 @@ public class ScheduledTaskAutostartRenderTests : IDisposable
 
         var text = _sink.GetRecentLogs();
 
-        // The routine missing-task entry stays concise Debug with no raw localized stream text
-        // and no false Error.
-        text.Should().Contain("Autostart task is absent");
+        // The routine missing-task state is silent (R-AS-AUTOSTART-QUERY-DEDUP): no Debug/Info
+        // entry with an exit code and no raw localized stream text; the only entry is the single
+        // verified-removal Information, logged after the post-verification.
+        text.Should().NotContain("Autostart task is absent",
+            "a routine missing-task pre-read state is never logged");
+        text.Should().NotContain("(exit 1)",
+            "no provisional exit-code message precedes the verification");
+        text.Should().NotContain("delete reported nonzero");
+        text.Should().NotContain("delete command reported success");
+        text.Should().Contain("Autostart task removal verified; no registration remains",
+            "exactly one concise Information entry follows the verified absence");
         text.Should().NotContain("ERROR: The system cannot find the file specified.");
         text.Should().NotContain("Не удается найти указанный файл",
-            "raw localized stdout/stderr never enters the routine missing-task entry");
+            "raw localized stdout/stderr never enters routine logs");
         text.Should().NotContain("ERR");
 
         // Exercise the genuine-failure rendering (LogCommandFailure with :l scalars) and assert
