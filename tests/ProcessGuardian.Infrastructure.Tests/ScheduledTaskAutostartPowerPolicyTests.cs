@@ -359,7 +359,7 @@ public class ScheduledTaskAutostartPowerPolicyTests
                 new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
         var service = new ScheduledTaskAutostartService(
-            NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, new FakeStagingStore());
 
         var result = await service.SetEnabledAsync(true);
 
@@ -397,7 +397,7 @@ public class ScheduledTaskAutostartPowerPolicyTests
                 new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
         var service = new ScheduledTaskAutostartService(
-            NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, new FakeStagingStore());
 
         var result = await service.SetEnabledAsync(true);
 
@@ -430,7 +430,7 @@ public class ScheduledTaskAutostartPowerPolicyTests
                 new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
         var service = new ScheduledTaskAutostartService(
-            NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, new FakeStagingStore());
 
         var result = await service.SetEnabledAsync(true);
 
@@ -448,7 +448,8 @@ public class ScheduledTaskAutostartPowerPolicyTests
             NullLogger<ScheduledTaskAutostartService>.Instance, (_, _) =>
                 System.Threading.Tasks.Task.FromResult(
                     new ScheduledTaskAutostartService.SchTasksCommandResult(
-                        1, string.Empty, "ERROR: The system cannot find the file specified.", null)));
+                        1, string.Empty, "ERROR: The system cannot find the file specified.", null)),
+            new FakeStagingStore());
 
         var result = await service.SetEnabledAsync(true);
 
@@ -483,15 +484,18 @@ public class ScheduledTaskAutostartPowerPolicyTests
             return System.Threading.Tasks.Task.FromResult(
                 new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
+        var store = new FakeStagingStore();
         var service = new ScheduledTaskAutostartService(
-            NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, store);
 
         var result = await service.SetEnabledAsync(true);
 
         result.Succeeded.Should().BeTrue();
         definitionPath.Should().NotBeNullOrEmpty();
+        store.Deleted.Should().Contain(definitionPath,
+            "the staged definition file is cleaned up after a successful create");
         File.Exists(definitionPath).Should().BeFalse(
-            "the temporary definition file is cleaned up after a successful create");
+            "the staged definition file is cleaned up after a successful create");
     }
 
     [Fact]
@@ -511,19 +515,22 @@ public class ScheduledTaskAutostartPowerPolicyTests
                 new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty,
                     "ERROR: The parameter is incorrect.", null));
         };
+        var store = new FakeStagingStore();
         var service = new ScheduledTaskAutostartService(
-            NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, store);
 
         var result = await service.SetEnabledAsync(true);
 
         result.Succeeded.Should().BeFalse();
         definitionPath.Should().NotBeNullOrEmpty();
+        store.Deleted.Should().Contain(definitionPath,
+            "the staged definition file is cleaned up even when the create fails");
         File.Exists(definitionPath).Should().BeFalse(
-            "the temporary definition file is cleaned up even when the create fails");
+            "the staged definition file is cleaned up even when the create fails");
     }
 
     // A create/verify failure is handled by the existing error mechanism (scenario 14): the
-    // temporary definition file is also cleaned up when the invocation throws.
+    // staged definition file is also cleaned up when the invocation throws.
     [Fact]
     public async Task Enable_InvocationThrows_TempDefinitionFileIsDeleted()
     {
@@ -539,14 +546,17 @@ public class ScheduledTaskAutostartPowerPolicyTests
             definitionPath = match.Groups[1].Value;
             throw new InvalidOperationException("boom");
         };
+        var store = new FakeStagingStore();
         var service = new ScheduledTaskAutostartService(
-            NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, store);
 
         var result = await service.SetEnabledAsync(true);
 
         result.Succeeded.Should().BeFalse();
         result.ErrorMessage.Should().Contain("boom");
         definitionPath.Should().NotBeNullOrEmpty();
+        store.Deleted.Should().Contain(definitionPath,
+            "the finally-block cleanup runs even when the invocation throws");
         File.Exists(definitionPath).Should().BeFalse(
             "the finally-block cleanup runs even when the invocation throws");
     }

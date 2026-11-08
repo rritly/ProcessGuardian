@@ -74,10 +74,7 @@ public sealed class JsonConfigurationStore : IConfigurationStore
         if (AppEdition.IsElevated)
         {
             // Elevated layout: %ProgramData%\ProcessGuardianAdmin\config\settings.json
-            var root = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                AppEdition.DataDirName);
-            return Path.Combine(root, "config");
+            return Path.Combine(ElevatedDataPaths.ElevatedRoot, "config");
         }
 
         return Path.Combine(

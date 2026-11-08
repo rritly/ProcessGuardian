@@ -93,7 +93,10 @@ public class ScheduledTaskAutostartServiceErrorTests
     {
         ScheduledTaskAutostartService.SchTasksInvoker invoker = (arguments, _) =>
             System.Threading.Tasks.Task.FromResult(script.For(arguments));
-        return new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+        // The enable path stages the definition through the protected staging seam; the fake
+        // keeps CI free of a live elevated ACL (R-AS-XML-IMPORT-SECURITY).
+        return new ScheduledTaskAutostartService(
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, new FakeStagingStore());
     }
 
     // ---------------------------------------------------------------------
@@ -466,7 +469,8 @@ public class ScheduledTaskAutostartServiceErrorTests
             return System.Threading.Tasks.Task.FromResult(
                 new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
-        var svc = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+        var svc = new ScheduledTaskAutostartService(
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, new FakeStagingStore());
 
         var result = await svc.SetEnabledAsync(true);
 
@@ -816,7 +820,8 @@ public class ScheduledTaskAutostartServiceErrorTests
             return System.Threading.Tasks.Task.FromResult(
                 new ScheduledTaskAutostartService.SchTasksCommandResult(0, "SUCCESS", string.Empty, null));
         };
-        var service = new ScheduledTaskAutostartService(NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+        var service = new ScheduledTaskAutostartService(
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, new FakeStagingStore());
 
         var result = await service.SetEnabledAsync(true);
 

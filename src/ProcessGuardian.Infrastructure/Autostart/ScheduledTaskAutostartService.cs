@@ -1,11 +1,15 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security;
 using System.Text;
 using System.Xml.Linq;
 using Microsoft.Extensions.Logging;
 using ProcessGuardian.Domain;
 using ProcessGuardian.Domain.Enums;
 using ProcessGuardian.Domain.Interfaces;
+using ProcessGuardian.Infrastructure.Configuration;
+using ProcessGuardian.Infrastructure.Security;
 
 namespace ProcessGuardian.Infrastructure.Autostart;
 
@@ -21,6 +25,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
 
     private readonly ILogger<ScheduledTaskAutostartService> _logger;
     private readonly SchTasksInvoker? _invoker;
+    private readonly IProtectedTaskXmlStagingStore _staging;
 
     public ScheduledTaskAutostartService(ILogger<ScheduledTaskAutostartService> logger)
         : this(logger, null)
@@ -28,12 +33,17 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     }
 
     // Internal seam so CI can script schtasks.exe results (exit code, stdout, stderr, invocation
-    // exception) without touching the real scheduled-task store; production leaves it null and
-    // runs the real process.
-    internal ScheduledTaskAutostartService(ILogger<ScheduledTaskAutostartService> logger, SchTasksInvoker? invoker)
+    // exception) without touching the real scheduled-task store, and so the secure staging
+    // boundary (R-AS-XML-IMPORT-SECURITY) can be tested without a live elevated ACL. Production
+    // leaves both null and runs the real process against real protected storage.
+    internal ScheduledTaskAutostartService(
+        ILogger<ScheduledTaskAutostartService> logger,
+        SchTasksInvoker? invoker,
+        IProtectedTaskXmlStagingStore? stagingStore = null)
     {
         _logger = logger;
         _invoker = invoker;
+        _staging = stagingStore ?? new Win32TaskXmlStagingStore();
     }
 
     internal delegate Task<SchTasksCommandResult> SchTasksInvoker(string arguments, CancellationToken ct);
@@ -48,13 +58,25 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         int ExitCode,
         string StandardOutput,
         string StandardError,
-        Exception? InvocationException)
+        Exception? InvocationException,
+        string? StagingFailure = null)
     {
         // Per-stream cap for diagnostic captures so a hostile or huge output can never flood the
         // log. A full exported task XML is never logged, even when bounded.
         internal const int MaxStreamChars = 4096;
 
         public bool InvocationFailed => InvocationException is not null;
+
+        // Secure-staging refusal (R-AS-XML-IMPORT-SECURITY): the definition was never staged, so
+        // schtasks.exe was never invoked and nothing was registered. Carries the refusal reason
+        // verbatim for the failure report; distinct from InvocationFailed, which stays exclusively
+        // for a real schtasks.exe start/invocation error.
+        public bool StagingFailed => StagingFailure is not null;
+
+        // Factory for a secure-staging refusal outcome: schtasks.exe was never invoked, both
+        // streams are empty, and the reason travels with the result.
+        internal static SchTasksCommandResult SecureStagingRefused(string reason) =>
+            new(0, string.Empty, string.Empty, null, reason);
 
         // Combined text used ONLY for classification (the "not found"/"access denied"/"service
         // unavailable" markers can be written to either stdout or stderr). The raw streams are
@@ -228,6 +250,18 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             }
 
             var create = await CreateTaskAsync(exePath, ct).ConfigureAwait(false);
+            if (create.StagingFailed)
+            {
+                // Secure staging refused (R-AS-XML-IMPORT-SECURITY): schtasks.exe was never
+                // invoked and nothing was registered, so the post-create verification is skipped.
+                // The refusal reason travels with the result for the report.
+                _logger.LogError(
+                    "Autostart enable failed: the task definition could not be staged securely ({Reason})",
+                    create.StagingFailure);
+                return AutostartResult.Failure(
+                    $"task creation failed: the task definition could not be staged securely: {create.StagingFailure}",
+                    state);
+            }
             if (create.InvocationFailed)
             {
                 LogCommandFailure("create", create);
@@ -672,37 +706,106 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     // /TR command line exports both flags as true, which blocks the logon autostart on battery
     // power and stops the running app when the charger is unplugged. A /Create /XML import with
     // both flags explicitly false is the only schtasks.exe facility that can set them; no COM/WMI
-    // dependency is introduced. The definition file is written to a per-call temporary path and
-    // always deleted in a finally block — on success, on failure and on cancellation alike.
+    // dependency is introduced.
+    // [R-AS-XML-IMPORT-SECURITY] The definition is staged inside the protected elevated data
+    // root, never in the interactive user's %TEMP%: a medium-integrity process of the same user
+    // could otherwise tamper with the XML consumed by the elevated schtasks.exe. The root must
+    // exist, be a real directory (no reparse indirection) and carry the protected owner/DACL
+    // before anything is staged; the GUID-named file is created exclusively with its
+    // born-protected descriptor supplied at creation (CREATE_NEW, protected DACL, Administrators
+    // owner, Administrators + SYSTEM FullControl only), and its live classification is verified
+    // after the handle is closed and before the elevated consumer opens it. Every gate is fail
+    // closed: any refusal returns a StagingFailed result and never invokes schtasks.exe. The file
+    // is always deleted in a finally block — on success, on failure and on cancellation alike —
+    // but only when this invocation owns it: a CREATE_NEW collision never deletes, overwrites, or
+    // modifies the pre-existing object.
     private async Task<SchTasksCommandResult> CreateTaskAsync(string exePath, CancellationToken ct)
     {
-        var definitionPath = Path.Combine(
-            Path.GetTempPath(), $"ProcessGuardian-task-{Guid.NewGuid():N}.xml");
+        // Fail-closed root gate: elevated configuration initialization guarantees a protected root
+        // at startup, before autostart synchronization; any missing/reparse/untrusted root refuses
+        // staging here instead of writing security-sensitive XML to an unverified location.
+        var stagingRoot = ElevatedDataPaths.ElevatedRoot;
+        if (!_staging.ExistsAndIsNotReparse(stagingRoot))
+        {
+            _logger.LogError(
+                "Autostart staging refused: the protected data root {Root} is missing or is a reparse point",
+                stagingRoot);
+            return SchTasksCommandResult.SecureStagingRefused(
+                "the protected data root is missing or is a reparse point");
+        }
+        if (_staging.Classify(stagingRoot, isDirectory: true) != ProtectionClassification.Trusted)
+        {
+            _logger.LogError(
+                "Autostart staging refused: the protected data root {Root} is not classified as trusted",
+                stagingRoot);
+            return SchTasksCommandResult.SecureStagingRefused(
+                "the protected data root is not classified as trusted");
+        }
+
+        var definitionPath = Path.Combine(stagingRoot, $"ProcessGuardian-task-{Guid.NewGuid():N}.xml");
+
+        // Encoding.Unicode via WriteAllText also writes the UTF-16 LE BOM; the exclusive-create
+        // stream has no encoder, so the preamble is written explicitly to keep the bytes identical.
+        var content = Encoding.Unicode.GetPreamble()
+            .Concat(Encoding.Unicode.GetBytes(BuildTaskDefinitionXml(exePath)))
+            .ToArray();
+
+        bool owned = false;
         try
         {
-            await File.WriteAllTextAsync(
-                definitionPath, BuildTaskDefinitionXml(exePath), Encoding.Unicode, ct)
-                .ConfigureAwait(false);
+            try
+            {
+                _staging.CreateExclusiveProtected(
+                    definitionPath, ElevatedSecurity.CreateProtectedFileSecurity(), content, out owned);
+            }
+            catch (Win32Exception ex)
+            {
+                // Exclusive-create refusal (a CREATE_NEW collision among others): the pre-existing
+                // object is never overwritten, deleted, or modified (owned stays false); staging
+                // fails closed without invoking schtasks.exe.
+                _logger.LogError(ex,
+                    "Autostart staging refused: the exclusive definition file could not be created");
+                return SchTasksCommandResult.SecureStagingRefused(
+                    "the exclusive definition file could not be created");
+            }
+
+            // Mandatory post-create verification of the actual staged file (R-AS-XML-IMPORT-SECURITY):
+            // the handle is already closed here, and a file whose live owner/DACL does not classify
+            // as trusted is never handed to the elevated consumer. A zero /Create exit code is not a
+            // substitute either — the /Query /XML verification below it stays mandatory.
+            if (_staging.Classify(definitionPath, isDirectory: false) != ProtectionClassification.Trusted)
+            {
+                _logger.LogError(
+                    "Autostart staging refused: the staged definition file is not classified as trusted");
+                return SchTasksCommandResult.SecureStagingRefused(
+                    "the staged definition file is not classified as trusted");
+            }
+
             return await RunSchTasksAsync(BuildCreateArguments(definitionPath), ct).ConfigureAwait(false);
         }
         finally
         {
-            TryDeleteDefinitionFile(definitionPath);
+            if (owned)
+                TryDeleteDefinitionFile(definitionPath);
         }
     }
 
-    // Best-effort cleanup of the temporary task-definition file. A leftover file in the user's
-    // temp directory is non-consequential; a failed delete is logged and never thrown, so the
-    // create/verify outcome above is never masked by a cleanup error.
+    // Best-effort cleanup of the staged task-definition file. Called only for a file created by
+    // the current invocation (R-AS-XML-IMPORT-SECURITY ownership tracking) — a CREATE_NEW
+    // collision never reaches this method, so a pre-existing object is never touched. The file
+    // sits in the protected elevated root, where a medium-integrity caller can still hit
+    // UnauthorizedAccessException/SecurityException on a misconfigured root; a failed delete is
+    // logged and never thrown, so the create/verify outcome above is never masked by a cleanup
+    // error.
     private void TryDeleteDefinitionFile(string path)
     {
         try
         {
-            File.Delete(path);
+            _staging.Delete(path);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
         {
-            _logger.LogWarning(ex, "The temporary task-definition file could not be deleted: {Path}", path);
+            _logger.LogWarning(ex, "The staged task-definition file could not be deleted: {Path}", path);
         }
     }
 

@@ -264,7 +264,7 @@ public class ScheduledTaskAutostartXmlVerifyTests
                 0, "SUCCESS: The scheduled task \"ProcessGuardianAdmin\" has been successfully created.", string.Empty, null));
         };
         var service = new ScheduledTaskAutostartService(
-            NullLogger<ScheduledTaskAutostartService>.Instance, invoker);
+            NullLogger<ScheduledTaskAutostartService>.Instance, invoker, new FakeStagingStore());
 
         var result = await service.SetEnabledAsync(true);
 
