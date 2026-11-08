@@ -431,4 +431,117 @@ public class WindowsProcessMonitorTests : IDisposable
 
         logger.Entries.Should().BeEmpty("a recovery entry is only logged for a previously failing PID");
     }
+
+    // ---------------------------------------------------------------------
+    // R-AS-INSPECTION-CLEANUP (§4): the InvalidOperationException exit
+    // classification and the stale diagnostic-state cleanup on a positively
+    // confirmed exit of the inspected process.
+    // ---------------------------------------------------------------------
+
+    // §4.4 #1: an InvalidOperationException followed by a positively confirmed exit of the
+    // inspected process — the candidate is excluded (reliably absent).
+    [Fact]
+    public void ClassifyInvalidInspection_ConfirmedExit_IsExcluded()
+    {
+        var candidate = WindowsProcessMonitor.ClassifyInvalidInspection(505, hasExited: true);
+
+        candidate.Should().BeNull("the positively exited inspected process is excluded");
+    }
+
+    // §4.4 #2: an InvalidOperationException with HasExited == false — the process is alive
+    // but its module path is unavailable: an unreadable candidate, never exclusion.
+    [Fact]
+    public void ClassifyInvalidInspection_StillAlive_IsUnreadable()
+    {
+        var candidate = WindowsProcessMonitor.ClassifyInvalidInspection(505, hasExited: false);
+
+        candidate.Should().NotBeNull("a live process with an unavailable module path stays a candidate");
+        candidate!.Value.ProcessId.Should().Be(505);
+        candidate.Value.ModulePath.Should().BeNull();
+        candidate.Value.Unreadable.Should().BeTrue();
+    }
+
+    // §4.4 #3: an InvalidOperationException with an unverifiable exit state — conservatively
+    // unreadable, never proof of absence.
+    [Fact]
+    public void ClassifyInvalidInspection_ExitUnverifiable_IsUnreadable()
+    {
+        var candidate = WindowsProcessMonitor.ClassifyInvalidInspection(505, hasExited: null);
+
+        candidate.Should().NotBeNull("an unverifiable exit state is never converted into absence");
+        candidate!.Value.Unreadable.Should().BeTrue();
+    }
+
+    // §4.4 #4/#5: ERROR_PARTIAL_COPY (299) followed by a positively confirmed exit — the
+    // candidate is excluded AND the stale (PID, code) diagnostic counters are cleared: no
+    // misleading "recovered" entry is emitted, and a later failure for the same PID starts
+    // with a full first-failure diagnostic again.
+    [Fact]
+    public void InspectionDiagnostics_PartialCopyConfirmedExit_Excluded_CountersCleared_NoRecoveredEntry()
+    {
+        var logger = new CapturingLogger();
+        var monitor = new WindowsProcessMonitor(logger);
+        var ex299 = new Win32Exception(299, "partial copy");
+
+        // The Win32 failure is recorded (full first-failure diagnostic) before the exit check.
+        monitor.LogInspectionFailure(4242, 299, "target", ex299);
+        logger.Entries.Should().HaveCount(1);
+        logger.Entries[0].Exception.Should().BeSameAs(ex299);
+
+        // The classification excludes the positively exited process; the production flow then
+        // clears the stale counters. No "recovered" entry may be emitted — the process exited;
+        // inspection did not recover (§4.2).
+        var candidate = WindowsProcessMonitor.ClassifyInspection(4242, null, 299, hasExited: true);
+        candidate.Should().BeNull("the positively exited process is excluded from the candidate list");
+        monitor.ClearInspectionDiagnosticsOnConfirmedExit(4242);
+        logger.Entries.Should().HaveCount(1, "no misleading 'inspection recovered' entry for a confirmed exit");
+
+        // A later failure for the same PID starts with a full first-failure diagnostic again
+        // (the stale counters were cleared).
+        monitor.LogInspectionFailure(4242, 299, "target", ex299);
+        logger.Entries.Should().HaveCount(2);
+        logger.Entries[1].Level.Should().Be(LogLevel.Warning);
+        logger.Entries[1].Exception.Should().BeSameAs(ex299,
+            "the counters were cleared on the confirmed exit, so this is a fresh first-failure diagnostic");
+        logger.Entries[1].Message.Should().Contain("4242").And.Contain("299");
+    }
+
+    // §4.4 #6/#10: bounded, PID-safe diagnostic state — pruning removes only the entries of
+    // processes absent from the completed snapshot; a present (possibly reused) PID keeps its
+    // own counters (a newer live process instance's diagnostics are never erased), and a
+    // pruned PID starts with a fresh first-failure diagnostic.
+    [Fact]
+    public void InspectionDiagnostics_Prune_RemovesAbsentPids_RetainsPresentOnes()
+    {
+        var logger = new CapturingLogger();
+        var monitor = new WindowsProcessMonitor(logger);
+        var ex299 = new Win32Exception(299, "partial copy");
+
+        monitor.LogInspectionFailure(111, 299, "gone", ex299);
+        monitor.LogInspectionFailure(222, 299, "alive", ex299);
+        logger.Entries.Should().HaveCount(2);
+
+        // The completed snapshot contains only PID 222: PID 111's stale entry is pruned,
+        // PID 222's live counters are retained.
+        monitor.PruneInspectionDiagnostics(new HashSet<int> { 222 });
+
+        // A repeat of the still-present PID 222 is rate-limited (its counters were retained);
+        // the pruned PID 111 is diagnosed in full again (fresh first-failure).
+        monitor.LogInspectionFailure(222, 299, "alive", ex299);
+        logger.Entries.Should().HaveCount(2, "the present PID's counters were not erased by the prune");
+
+        monitor.LogInspectionFailure(111, 299, "gone", ex299);
+        logger.Entries.Should().HaveCount(3);
+        logger.Entries[2].Exception.Should().BeSameAs(ex299,
+            "the pruned PID starts with a fresh full first-failure diagnostic");
+    }
+
+    [Fact]
+    public void InspectionDiagnostics_Prune_EmptyState_NoThrow()
+    {
+        var monitor = new WindowsProcessMonitor(NullLogger<WindowsProcessMonitor>.Instance);
+
+        var act = () => monitor.PruneInspectionDiagnostics(new HashSet<int> { 1, 2, 3 });
+        act.Should().NotThrow("pruning an empty diagnostic state is a safe no-op");
+    }
 }

@@ -40,10 +40,12 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
         {
             var processes = Process.GetProcessesByName(target.NameWithoutExtension);
             var candidates = new List<ProcessCandidate>(processes.Length);
+            var presentPids = new HashSet<int>();
             foreach (var p in processes)
             {
                 using (p)
                 {
+                    presentPids.Add(p.Id);
                     // A positively-exited process contributes nothing (reliably absent); every
                     // other inspected process yields a candidate snapshot (readable or
                     // indeterminate).
@@ -51,6 +53,10 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
                         candidates.Add(candidate);
                 }
             }
+
+            // Bounded diagnostic state (§4.2): drop the stale diagnostic entries of processes
+            // that are no longer present in this completed snapshot.
+            PruneInspectionDiagnostics(presentPids);
 
             return Task.FromResult(EvaluateCandidates(target.FullPath, candidates));
         }
@@ -69,7 +75,12 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
     // never proves absence by itself: the exit of exactly the inspected process is verified
     // through its own Process object (bound to the original handle, so a reused PID cannot
     // confound the check) before the process may be excluded (§5.2). PID reuse therefore can
-    // never turn a live (or unverifiable) process into a NotRunning outcome.
+    // never turn a live (or unverifiable) process into a NotRunning outcome. An
+    // InvalidOperationException from the module probe may mean the process exited DURING the
+    // inspection: the exit is verified through the same original Process object (never a
+    // reopened PID) — a positively confirmed exit excludes the process (and drops its stale
+    // diagnostic state), an alive or unverifiable one stays conservatively indeterminate
+    // (R-AS-INSPECTION-CLEANUP §4.1).
     private ProcessCandidate? InspectCandidate(Process p)
     {
         string? path = null;
@@ -85,9 +96,15 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
         }
         catch (InvalidOperationException)
         {
-            // The process object became invalid (it exited during inspection): conservatively
-            // indeterminate (v2.8 §4.3) — never proof of absence.
-            return new ProcessCandidate(p.Id, null, Unreadable: true);
+            // The process object became invalid — it may have exited during the inspection.
+            // The exit is verified through the ORIGINAL process object/handle (never a PID
+            // reopened with GetProcessById, which could refer to a different process after
+            // PID reuse): a positively confirmed exit excludes the process; an alive or
+            // unverifiable one stays conservatively indeterminate — never proof of absence.
+            var candidate = ClassifyInvalidInspection(p.Id, TryGetHasExited(p));
+            if (candidate is null)
+                ClearInspectionDiagnosticsOnConfirmedExit(p.Id);
+            return candidate;
         }
 
         if (path is not null)
@@ -103,8 +120,26 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
         bool? exited = win32Error is null || win32Error == ErrorPartialCopy
             ? TryGetHasExited(p)
             : null;
-        return ClassifyInspection(p.Id, path, win32Error, exited);
+        var classified = ClassifyInspection(p.Id, path, win32Error, exited);
+        if (classified is null)
+        {
+            // Positively confirmed exit of the inspected process (299+exited or clean-read-
+            // exited): the (PID, code) diagnostic counters recorded above are now stale —
+            // drop them WITHOUT a "recovered" entry (the process exited; inspection did not
+            // recover, §4.2) so a later process reusing the PID starts with fresh
+            // first-failure diagnostics.
+            ClearInspectionDiagnosticsOnConfirmedExit(p.Id);
+        }
+
+        return classified;
     }
+
+    // Pure classification of an InvalidOperationException module-probe failure (testable
+    // seam, §4.1): a positively confirmed exit of the inspected process excludes it from the
+    // candidate list; an alive or unverifiable state stays conservatively indeterminate —
+    // never proof of absence.
+    internal static ProcessCandidate? ClassifyInvalidInspection(int pid, bool? hasExited) =>
+        hasExited == true ? null : new ProcessCandidate(pid, null, Unreadable: true);
 
     // Pure classification of one per-process inspection (testable seam): maps the probe's raw
     // results to a candidate snapshot without live OS access-control scenarios.
@@ -226,6 +261,45 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
             hadFailures = _inspectionFailureCounts.Remove(pid);
         if (hadFailures)
             _logger.LogInformation("Process {Pid} inspection recovered; the earlier Win32 failure no longer occurs", pid);
+    }
+
+    // Positively confirmed exit of the inspected process (§4.2): its (PID, code) diagnostic
+    // counters are stale — the process exited, inspection did not recover — so they are
+    // removed WITHOUT the "recovered" Information entry. A later process reusing the PID
+    // therefore starts with a fresh first-failure diagnostic. The removal is keyed by PID
+    // only, which is safe under the existing concurrency model: CheckAsync inspections of
+    // one monitor instance never overlap (a single serialized session loop), so a cleanup
+    // triggered by the ORIGINAL process's own confirmed exit can never erase the counters
+    // of a newer live instance that reused the PID during an in-progress inspection.
+    internal void ClearInspectionDiagnosticsOnConfirmedExit(int pid)
+    {
+        lock (_inspectionDiagnosticsGate)
+            _inspectionFailureCounts.Remove(pid);
+    }
+
+    // Bounded diagnostic state (§4.2): after a completed process snapshot, drop every
+    // diagnostic entry whose PID is no longer present in the snapshot, so the counters of
+    // processes that are gone cannot be retained indefinitely. Thread-safe (the shared
+    // diagnostics gate); a concurrent inspection of a just-pruned PID is benign — it would
+    // only be re-diagnosed in full.
+    internal void PruneInspectionDiagnostics(HashSet<int> presentPids)
+    {
+        lock (_inspectionDiagnosticsGate)
+        {
+            if (_inspectionFailureCounts.Count == 0)
+                return;
+            List<long>? stale = null;
+            foreach (var pid in _inspectionFailureCounts.Keys)
+            {
+                if (!presentPids.Contains((int)pid))
+                    (stale ??= new List<long>()).Add(pid);
+            }
+            if (stale is not null)
+            {
+                foreach (var pid in stale)
+                    _inspectionFailureCounts.Remove(pid);
+            }
+        }
     }
 
     // Unknown discipline (E), deterministic unit-test seam: Running only on a readable module
