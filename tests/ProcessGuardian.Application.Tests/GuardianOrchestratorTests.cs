@@ -1581,6 +1581,79 @@ public class GuardianOrchestratorTests
         await controller.StopAsync();
     }
 
+    // R-AS-STABILITY-OBSERVATION-ANCHOR required test: the stability window starts at the
+    // POST-OBSERVATION timestamp of the first reliable Running check (the post-observation
+    // `observedAt`), never at the pre-check tick timestamp — time consumed INSIDE CheckAsync
+    // before the result reaches the supervisor is not credited toward
+    // StartupVerificationTimeoutSeconds, and StabilityConfirmedHook (the budget reset) must
+    // not run until the full configured interval has elapsed from the post-observation
+    // timestamp.
+    [Fact]
+    public async Task StabilityWindow_StartsAfterPositiveObservation_CheckTimeNotCredited()
+    {
+        using var h = new Harness();
+        h.Time = new VirtualTimeProvider();
+        var time = (VirtualTimeProvider)h.Time;
+
+        long firstRunningObservedTicks = 0;
+
+        // The first check returns Running only after 6 s of virtual time have elapsed INSIDE
+        // the check (a slow enumeration, modeled with the clock-only advance: no scheduled
+        // wait can observe the intermediate moments and no queued callback fires during the
+        // blocking span). The configured stability window is 5 s: with the window anchored to
+        // the PRE-check tick timestamp the inside time would already complete the window at
+        // the second observation — the regression this test guards against.
+        h.Monitor.CheckAsync(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                h.CheckCount++;
+                if (h.CheckCount == 1)
+                {
+                    time.AdvanceClockOnly(TimeSpan.FromSeconds(6));
+                    Volatile.Write(ref firstRunningObservedTicks, time.GetTimestamp());
+                }
+
+                return Task.FromResult(new ProcessCheckResult(ProcessOutcome.Running, 42));
+            });
+
+        var controller = h.CreateController();
+        // A huge check interval keeps every observation below a stability-phase poll — no
+        // normal recovery tick can land inside the verification window.
+        var start = await controller.StartAsync(
+            h.Request(maxRestarts: 1, checkInterval: 60, restartDelay: 1, startupTimeout: 5));
+        start.Started.Should().BeTrue();
+
+        await WaitUntilAsync(() => h.CheckCount >= 1, "the first positive Running check to run");
+        await WaitUntilAsync(() => h.Statuses.Contains(GuardianStatus.Monitoring),
+            "Monitoring to be published on the first positive Running observation");
+
+        // The second observation happens well within the configured window measured from the
+        // POST-OBSERVATION timestamp: no stability confirmation and no premature budget reset —
+        // the 6 s spent inside the first check is not credited toward the interval.
+        await AdvanceUntilAsync(time, () => h.CheckCount >= 2, "the second stability observation to run");
+        h.StableCount.Should().Be(0, "time spent inside CheckAsync is not credited toward the stability window");
+        h.Statuses.Should().NotContain(GuardianStatus.Restarting);
+        h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        // Just below the full interval from the post-observation timestamp: still no
+        // confirmation — the window is measured from the observation, not the tick.
+        await AdvanceUntilAsync(time,
+            () => time.GetTimestamp() - Volatile.Read(ref firstRunningObservedTicks)
+                >= TimeSpan.FromMilliseconds(4900).Ticks,
+            "the loop to observe just below the full interval from the post-observation timestamp");
+        h.StableCount.Should().Be(0,
+            "StabilityConfirmedHook must not run before the full configured interval has elapsed from the post-observation timestamp");
+
+        // A fresh positive Running observation at/after the full interval confirms stability
+        // and resets the restart budget (the hook is the budget-reset synchronization seam);
+        // no launch ever happened in this session, so the budget was never charged either.
+        await AdvanceUntilAsync(time, () => h.StableCount >= 1,
+            "the full continuous Running window to confirm stability from the post-observation timestamp");
+        h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        await controller.StopAsync();
+    }
+
     [Fact]
     public async Task Initial_NeverAppears_FreeThenFirstAutomaticAllowed_ExhaustsAtLimit()
     {

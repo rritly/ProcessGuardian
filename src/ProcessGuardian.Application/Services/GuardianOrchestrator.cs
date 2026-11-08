@@ -956,7 +956,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             // task exists; nothing here ever launches from a detached callback).
             long? attemptLaunchedAt = null;    // actual creation-attempt timestamp of the outstanding
                                                // launch awaiting its first positive appearance
-            long? runningSince = null;         // stability-qualification start; null = not qualifying
+            long? runningSince = null;         // stability-qualification start, armed with the
+                                                // post-observation timestamp of the first reliable
+                                                // Running check (§2.2); null = not qualifying
             bool restartPending = false;       // the target is down and a launch decision is pending
             long? restartDelayStartedAt = null; // start of the currently pending RestartDelaySeconds
                                                 // wait (R-AS-EXIT-ANCHORED-DELAY §2.3): the timestamp
@@ -971,8 +973,8 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                                                 // is never the previous creation attempt's timestamp
                                                 // for a successfully started process (§2.3 E).
             bool toastPending = false;         // the current automatic attempt has not shown its
-                                               // recovery toast (sent only after the attempt's FULL
-                                               // stability window completes — §6.2)
+                                               // recovery toast yet (requested on the FIRST reliable Running
+                                               // observation of the attempt — §3.1, not after the stability window)
 
             while (!ct.IsCancellationRequested)
             {
@@ -1053,7 +1055,13 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                         restartDelayStartedAt = null;
                         if (runningSince is null)
                         {
-                            runningSince = now;
+                            // R-AS-STABILITY-OBSERVATION-ANCHOR: the stability window starts at
+                            // the POST-OBSERVATION timestamp of this first reliable Running check
+                            // (§2.2) — never at the pre-check tick timestamp: time spent executing
+                            // CheckAsync before the supervisor has received the positive result is
+                            // not credited toward the stability interval, and the full
+                            // StartupVerificationTimeoutSeconds elapses after this observation.
+                            runningSince = observedAt;
                             ResetDegraded(counters);
                             Publish(new MonitorState(GuardianStatus.Monitoring, false, null, false));
                             if (toastPending)
@@ -1199,9 +1207,9 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                         // Prolonged-Unknown discipline (E, v2.8 §3.2/§3.3): never absence, never
                         // proof of stability, never a duplicate launch, never a refund. An open
                         // stability interval is voided; a fresh full interval is required later.
-                        // A pending recovery toast stays pending: the attempt has not completed
-                        // its full stability window (§6.2), and the next fresh positive Running
-                        // starts a new one.
+                        // A pending recovery toast stays pending: the next fresh positive
+                        // Running observation requests it immediately (first-Running
+                        // notification, §3.1) and arms a fresh stability window then.
                         _logger.LogWarning("Process state for {Target} could not be determined; skipping this cycle",
                             target.NameWithoutExtension);
                         MarkDegraded(counters);
