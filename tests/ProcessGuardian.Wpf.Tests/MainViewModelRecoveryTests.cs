@@ -324,4 +324,41 @@ public class MainViewModelRecoveryTests
             "the checkbox to revert after a failed autostart enable");
         vm.Settings.AutostartEnabled.Should().BeFalse("persisted intent must match the verified actual state");
     }
+
+    // R-AS-AUTOSTART-CHANGE-GATE: when the autostart preference did not change, the commit carries
+    // no AutostartResult (null). A missing result is NOT a new confirmed state: the ViewModel must
+    // leave its current AutostartEffective and AutostartError exactly as they are.
+    [Fact]
+    public async Task Commit_NullAutostartResult_LeavesEffectiveAndErrorUnchanged()
+    {
+        var h = new Harness();
+        var commitCount = 0;
+        h.Controller.CommitSettingsAsync(
+                Arg.Any<CommittedSettingsSnapshot>(),
+                Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                commitCount++;
+                return Task.FromResult(CommitSettingsResult.Persisted(autostart: null));
+            });
+
+        var vm = h.CreateVm();
+        await Task.Delay(100); // let the initial LoadSettingsAsync settle
+
+        // A previously confirmed effective state and a stale error are on the VM.
+        vm.AutostartEffective = true;
+        vm.AutostartError = "stale confirmed error";
+
+        // An unrelated settings change schedules the debounced commit.
+        vm.Settings.CheckIntervalSeconds = 9;
+
+        await WaitUntilAsync(() => commitCount >= 1, "the unrelated settings commit to run");
+        await Task.Delay(100); // room for any spurious state/error update
+
+        vm.AutostartEffective.Should().BeTrue(
+            "a null autostart result is not a new confirmed state; the checkbox keeps its value");
+        vm.AutostartError.Should().Be("stale confirmed error",
+            "an absent sync result neither clears nor recomputes the current error");
+    }
 }

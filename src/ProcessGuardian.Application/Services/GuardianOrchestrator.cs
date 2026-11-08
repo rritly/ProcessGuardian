@@ -365,6 +365,11 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
                 return CommitSettingsResult.SaveFailed();
             }
 
+            // Capture the previously committed autostart preference BEFORE the snapshot is
+            // replaced: the change gate (R-AS-AUTOSTART-CHANGE-GATE) compares the new desired
+            // value against the old committed one.
+            var previousAutostart = _committed.AutostartEnabled;
+
             _committed = snapshot;
 
             // Path change is effective only in the stopped state; a stale UI save during an
@@ -386,10 +391,19 @@ public sealed class GuardianOrchestrator : BackgroundService, IMonitoringControl
             if (!saved)
                 return CommitSettingsResult.SaveFailed();
 
-            // 2) Autostart sync only after a successful initial save. The autostart result is
-            //    surfaced with the commit so a registration failure is never masked by a successful
-            //    settings save (the UI shows the error explicitly).
-            var autostart = await SyncAutostartAsync(snapshot.AutostartEnabled, ct).ConfigureAwait(false);
+            // 2) Autostart sync only after a successful initial save AND only when the autostart
+            //    preference actually changed (R-AS-AUTOSTART-CHANGE-GATE): a target-path, pin,
+            //    numeric or toast-only edit at an unchanged AutostartEnabled performs zero
+            //    scheduler queries and zero mutations. No scheduler state is cached across
+            //    commits — a skipped sync returns no AutostartResult (null), which the UI treats
+            //    as "no new confirmed state" (its current effective state and error stay put);
+            //    startup reconciliation stays unconditional and re-verifies the registration
+            //    against the persisted preference on every launch. The autostart result is
+            //    surfaced with the commit so a registration failure is never masked by a
+            //    successful settings save (the UI shows the error explicitly).
+            AutostartResult? autostart = null;
+            if (snapshot.AutostartEnabled != previousAutostart)
+                autostart = await SyncAutostartAsync(snapshot.AutostartEnabled, ct).ConfigureAwait(false);
 
             // 3) [R-AS-TXN rollback] A requested enable that the scheduler rejected must not leave
             //    a stale AutostartEnabled=true in the persisted config or the committed snapshot: a

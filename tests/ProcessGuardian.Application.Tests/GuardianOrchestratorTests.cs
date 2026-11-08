@@ -1142,6 +1142,10 @@ public class GuardianOrchestratorTests
         using var h = new Harness();
         h.Config.InitializeAsync(Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        // A persisted true preference makes the disable commit a REAL preference change
+        // (R-AS-AUTOSTART-CHANGE-GATE), so the synchronization (and its failure) still runs.
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings { AutostartEnabled = true }));
         // R-AS-AUTOSTART-QUERY-DEDUP: the controller performs no pre-read; the failure comes from
         // the SetEnabledAsync result alone.
         h.Autostart.SetEnabledAsync(false, Arg.Any<CancellationToken>())
@@ -1289,6 +1293,149 @@ public class GuardianOrchestratorTests
         Func<Task> act = () => controller.ReconcileAsync();
 
         await act.Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    // ---------------------------------------------------------------------
+    // R-AS-AUTOSTART-CHANGE-GATE: sync only when the autostart preference changes
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task Reconcile_AutostartFalse_SyncStillRuns_Unconditionally()
+    {
+        // Startup reconciliation never consults the change gate: even with no settings commit in
+        // sight, the persisted false preference is re-verified against the scheduler (a leftover
+        // app-owned task is removed and verified absent by the service).
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings { AutostartEnabled = false }));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+
+        _ = h.Autostart.Received(1).SetEnabledAsync(false, Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task CommitSettings_UnchangedAutostartPreference_ZeroAutostartServiceCalls()
+    {
+        // An interval- and toast-only edit at an unchanged AutostartEnabled performs zero
+        // scheduler queries and zero mutations, and carries no autostart outcome.
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync(); // committed AutostartEnabled=false (default doc)
+        h.Autostart.ClearReceivedCalls();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings
+        {
+            AutostartEnabled = false,
+            CheckIntervalSeconds = 9,
+            EnableToasts = false,
+        });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        result.Saved.Should().BeTrue("the settings save itself succeeds");
+        result.Autostart.Should().BeNull("a skipped sync synthesizes no autostart outcome");
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task CommitSettings_TargetPathChangeOnly_NoAutostartCalls()
+    {
+        // A target-path change (stopped session) clears the pin through the controller but never
+        // queries or mutates the scheduler while the autostart preference is unchanged.
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync(); // committed AutostartEnabled=false (default doc)
+        h.Autostart.ClearReceivedCalls();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = false });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\new\app.exe");
+
+        result.Saved.Should().BeTrue();
+        result.Autostart.Should().BeNull();
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task CommitSettings_AutostartPreferenceChanged_ExactOneSync_AfterSuccessfulSave(
+        bool persisted, bool requested)
+    {
+        // A real preference change performs exactly one desired-state synchronization, and only
+        // AFTER the settings save succeeded (R-AS-TXN ordering preserved).
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Config.LoadAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new AppSettings { AutostartEnabled = persisted }));
+
+        var order = new List<string>();
+        h.Config.SaveAsync(Arg.Do<AppSettings>(_ => order.Add("save")), Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+        h.Autostart.SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                order.Add("sync");
+                var desired = callInfo.ArgAt<bool>(0);
+                return Task.FromResult(AutostartResult.Success(
+                    desired ? AutostartState.Enabled : AutostartState.Absent));
+            });
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+        h.Autostart.ClearReceivedCalls();
+        order.Clear();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = requested });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        result.Saved.Should().BeTrue();
+        result.Autostart.Should().NotBeNull("a real preference change carries its verified outcome");
+        result.Autostart!.Value.Succeeded.Should().BeTrue();
+        result.Autostart!.Value.ActualState.Should().Be(
+            requested ? AutostartState.Enabled : AutostartState.Absent);
+        _ = h.Autostart.Received(1).SetEnabledAsync(requested, Arg.Any<CancellationToken>());
+        order.Should().Equal("save", "sync");
+    }
+
+    [Fact]
+    public async Task CommitSettings_SaveFails_ZeroSchedulerCalls_NoAutostartOutcome()
+    {
+        // A failed initial save never reaches the scheduler (R-AS-TXN), regardless of whether the
+        // preference changed.
+        using var h = new Harness();
+        h.Config.InitializeAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(ConfigurationInitializationStatus.Success));
+        h.Config.SaveAsync(Arg.Any<AppSettings>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException(new InvalidOperationException("disk full")));
+
+        var controller = h.CreateController();
+        await controller.ReconcileAsync();
+        h.Autostart.ClearReceivedCalls();
+
+        var snapshot = CommittedSettingsSnapshot.From(new AppSettings { AutostartEnabled = true });
+        var result = await controller.CommitSettingsAsync(snapshot, @"C:\app.exe");
+
+        result.Saved.Should().BeFalse();
+        result.Autostart.Should().BeNull();
+        _ = h.Autostart.DidNotReceive().SetEnabledAsync(Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().ReadStateAsync(Arg.Any<CancellationToken>());
+        _ = h.Autostart.DidNotReceive().RemoveRegistrationAsync(Arg.Any<CancellationToken>());
     }
 
     // R-AS-TXN §4.2 #3: initial save succeeds, enable fails, but the compensating rollback save
