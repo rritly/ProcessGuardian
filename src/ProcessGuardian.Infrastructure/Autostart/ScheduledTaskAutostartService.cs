@@ -98,13 +98,18 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             }
         }
 
+        // Display-only normalization (R-AS-TASK-SCHEDULER-DIAGNOSTICS): surrounding
+        // whitespace/CR/LF is trimmed BEFORE the cap so log lines never end in raw CR/LF;
+        // internal text is preserved. The raw StandardOutput/StandardError used for
+        // classification stay untouched.
         internal static string Bound(string? value, int maxChars = MaxStreamChars)
         {
             if (string.IsNullOrEmpty(value))
                 return string.Empty;
-            return value.Length <= maxChars
-                ? value
-                : value[..maxChars] + $"...[truncated at {maxChars}]";
+            var trimmed = value.Trim();
+            return trimmed.Length <= maxChars
+                ? trimmed
+                : trimmed[..maxChars] + $"...[truncated at {maxChars}]";
         }
     }
 
@@ -167,7 +172,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                 // Exit 0 but the XML is unparsable/unverifiable: a task we cannot describe is a
                 // task we cannot call enabled — fail-closed Unknown, never Absent.
                 _logger.LogWarning(
-                    "Autostart task query succeeded but the task XML could not be parsed; stderr: {Stderr}",
+                    "Autostart task query succeeded but the task XML could not be parsed; stderr: {Stderr:l}",
                     SchTasksCommandResult.Bound(query.StandardError));
                 return (AutostartState.Unknown, null);
             }
@@ -187,11 +192,13 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         switch (ClassifyQueryResult(query))
         {
             case SchTasksQueryFailure.MissingTask:
-                _logger.LogInformation(
-                    "Autostart task not found (exit {Code}); stdout: {StdOut}; stderr: {StdErr}",
-                    query.ExitCode,
-                    SchTasksCommandResult.Bound(query.StandardOutput),
-                    SchTasksCommandResult.Bound(query.StandardError));
+                // A positively classified missing task is the ordinary Absent state, especially
+                // on first install: routine Debug diagnostics, no raw localized stdout/stderr and
+                // no Error event (R-AS-TASK-SCHEDULER-DIAGNOSTICS). The fail-closed rule is
+                // unchanged — only the supported task-not-found response reaches this case, and
+                // the actual raw streams stay in the SchTasksCommandResult for any genuine
+                // failure diagnostic that later needs them.
+                _logger.LogDebug("Autostart task is absent (exit {Code})", query.ExitCode);
                 return (AutostartState.Absent, null);
             case SchTasksQueryFailure.AccessDenied:
                 LogCommandFailure("query-xml", query);
@@ -217,7 +224,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
     {
         foreach (var m in mismatches)
             _logger.LogError(
-                "Autostart task mismatch ({Context}): check {Check}; expected {Expected}; actual {Actual}",
+                "Autostart task mismatch ({Context:l}): check {Check:l}; expected {Expected:l}; actual {Actual:l}",
                 context, m.Check, m.Expected, m.Actual);
     }
 
@@ -236,6 +243,9 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                 AutostartState.Unknown);
         }
 
+        // Carried out of the branch so the disable path's provisional delete result can reach the
+        // shared verification block below (R-AS-TASK-SCHEDULER-DIAGNOSTICS).
+        SchTasksCommandResult? delete = null;
         if (enabled)
         {
             if (state == AutostartState.Enabled)
@@ -256,7 +266,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
                 // invoked and nothing was registered, so the post-create verification is skipped.
                 // The refusal reason travels with the result for the report.
                 _logger.LogError(
-                    "Autostart enable failed: the task definition could not be staged securely ({Reason})",
+                    "Autostart enable failed: the task definition could not be staged securely ({Reason:l})",
                     create.StagingFailure);
                 return AutostartResult.Failure(
                     $"task creation failed: the task definition could not be staged securely: {create.StagingFailure}",
@@ -265,14 +275,15 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             if (create.InvocationFailed)
             {
                 LogCommandFailure("create", create);
-                return AutostartResult.Failure(
-                    $"task creation failed: {create.InvocationException!.GetType().Name}: {create.InvocationException.Message}",
-                    state);
+                // The user-facing message stays concise English (R-AS-TASK-SCHEDULER-DIAGNOSTICS):
+                // raw localized exception text stays in the bounded structured log above, never in
+                // the ErrorMessage that MainViewModel displays as AutostartError.
+                return AutostartResult.Failure("task creation failed: schtasks.exe could not be started", state);
             }
             if (create.ExitCode != 0)
             {
                 LogCommandFailure("create", create);
-                return AutostartResult.Failure($"task creation failed (exit {create.ExitCode}): {create.BoundedText}", state);
+                return AutostartResult.Failure($"task creation failed (exit {create.ExitCode})", state);
             }
         }
         else
@@ -280,31 +291,41 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             if (state == AutostartState.Absent)
                 return AutostartResult.Success(AutostartState.Absent);
 
-            var delete = await RunSchTasksAsync(BuildDeleteArguments(), ct).ConfigureAwait(false);
-            if (delete.InvocationFailed)
+            var result = await RunSchTasksAsync(BuildDeleteArguments(), ct).ConfigureAwait(false);
+            delete = result;
+            if (result.InvocationFailed)
             {
-                LogCommandFailure("delete", delete);
-                return AutostartResult.Failure(
-                    $"task deletion failed: {delete.InvocationException!.GetType().Name}: {delete.InvocationException.Message}",
-                    state);
+                LogCommandFailure("delete", result);
+                return AutostartResult.Failure("task deletion failed: schtasks.exe could not be started", state);
             }
-            if (delete.ExitCode != 0)
+            if (result.ExitCode != 0)
             {
-                LogCommandFailure("delete", delete);
-                return AutostartResult.Failure($"task deletion failed (exit {delete.ExitCode}): {delete.BoundedText}", state);
+                // Provisional (R-AS-TASK-SCHEDULER-DIAGNOSTICS): a concurrent removal between the
+                // pre-query and this delete is a benign race — the task may already be absent, so
+                // the post-operation verification below decides, and a verified absence is an
+                // idempotent success. Logged at Debug for now; a genuine failure re-logs the
+                // bounded diagnostics at Error. A failure to invoke schtasks.exe remains an
+                // invocation failure above.
+                _logger.LogDebug(
+                    "Autostart task delete reported nonzero (exit {Code}); verifying actual absence", result.ExitCode);
             }
         }
 
         // Verify the actual registration state rather than trusting the exit code alone: a
-        // command that exits 0 without the state taking effect is still a failure.
+        // command that exits 0 without the state taking effect is still a failure, and a nonzero
+        // delete that already achieved the desired absence is still an idempotent success.
         var (actual, descriptor) = await ReadStateDetailedAsync(ct).ConfigureAwait(false);
         var expected = enabled ? AutostartState.Enabled : AutostartState.Absent;
         if (actual == expected)
             return AutostartResult.Success(actual);
         if (actual == AutostartState.Unknown)
+        {
+            if (delete is { ExitCode: not 0 })
+                LogCommandFailure("delete", delete.Value);
             return AutostartResult.Failure(
                 "the operation completed but the resulting autostart state could not be verified",
                 AutostartState.Unknown);
+        }
 
         // For a Misconfigured task whose descriptor we could parse, log the exact failing check
         // with the expected and actual values — never the whole exported XML — so the cause of a
@@ -312,12 +333,17 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         if (actual == AutostartState.Misconfigured && descriptor is { } d)
             LogMismatches(GetMismatches(d, ExpectedCommand), enabled ? "set-enabled=true" : "set-enabled=false");
 
+        // A genuine failure re-logs the bounded delete diagnostics at Error (R-AS-TASK-SCHEDULER-
+        // DIAGNOSTICS): the provisional Debug above is upgraded exactly once, only when the
+        // desired postcondition was NOT achieved.
+        if (!enabled && delete is { ExitCode: not 0 })
+            LogCommandFailure("delete", delete.Value);
         _logger.LogError("Autostart state ({Actual}) does not match the requested state ({Requested}) after the operation",
             actual, expected);
         return AutostartResult.Failure(
             enabled
                 ? "the autostart task is not correctly registered after the create exited successfully"
-                : "the autostart task is still registered after the delete exited successfully",
+                : "the autostart task is still registered after the delete attempt",
             actual);
     }
 
@@ -335,16 +361,18 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         if (delete.InvocationFailed)
         {
             LogCommandFailure("delete", delete);
-            return AutostartResult.Failure(
-                $"task deletion failed: {delete.InvocationException!.GetType().Name}: {delete.InvocationException.Message}",
-                AutostartState.Unknown);
+            // English-only user-facing message (R-AS-TASK-SCHEDULER-DIAGNOSTICS): raw localized
+            // exception text stays in the bounded structured log above.
+            return AutostartResult.Failure("task deletion failed: schtasks.exe could not be started", AutostartState.Unknown);
         }
 
-        // A nonzero /Delete exit code alone proves nothing (not-found is expected when the task was
-        // already removed by a previous, interrupted recovery). The exit code is recorded for
-        // diagnostics; success is decided only by the positive Absent verification below.
+        // A nonzero /Delete exit code alone proves nothing and is NOT yet an error (not-found is
+        // expected when the task was already removed by a previous, interrupted recovery or a
+        // concurrent actor). It is provisional until the positive verification below decides
+        // (R-AS-TASK-SCHEDULER-DIAGNOSTICS); a genuine failure re-logs the bounded diagnostics
+        // at Error exactly once.
         if (delete.ExitCode != 0)
-            LogCommandFailure("delete", delete);
+            _logger.LogDebug("Autostart task delete reported nonzero (exit {Code}); verifying actual absence", delete.ExitCode);
         else
             _logger.LogInformation("Autostart task delete command reported success (exit 0); verifying actual absence");
 
@@ -358,6 +386,10 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
             return AutostartResult.Success(AutostartState.Absent);
         }
 
+        // A genuine failure re-logs the bounded delete diagnostics at Error (the provisional
+        // Debug above is upgraded only when the required postcondition was not achieved).
+        if (delete.ExitCode != 0)
+            LogCommandFailure("delete", delete);
         _logger.LogWarning("Autostart task removal could not be verified (actual state: {Actual}); recovery stays pending", actual);
         return AutostartResult.Failure(
             actual == AutostartState.Unknown
@@ -642,11 +674,11 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         if (result.InvocationFailed)
         {
             _logger.LogError(result.InvocationException,
-                "Autostart {Operation} failed: schtasks.exe could not be invoked", operation);
+                "Autostart {Operation:l} failed: schtasks.exe could not be invoked", operation);
             return;
         }
         _logger.LogError(
-            "Autostart {Operation} failed (exit {Code}); stdout: {StdOut}; stderr: {StdErr}",
+            "Autostart {Operation:l} failed (exit {Code}); stdout: {StdOut:l}; stderr: {StdErr:l}",
             operation,
             result.ExitCode,
             SchTasksCommandResult.Bound(result.StandardOutput),
@@ -728,7 +760,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         if (!_staging.ExistsAndIsNotReparse(stagingRoot))
         {
             _logger.LogError(
-                "Autostart staging refused: the protected data root {Root} is missing or is a reparse point",
+                "Autostart staging refused: the protected data root {Root:l} is missing or is a reparse point",
                 stagingRoot);
             return SchTasksCommandResult.SecureStagingRefused(
                 "the protected data root is missing or is a reparse point");
@@ -736,7 +768,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         if (_staging.Classify(stagingRoot, isDirectory: true) != ProtectionClassification.Trusted)
         {
             _logger.LogError(
-                "Autostart staging refused: the protected data root {Root} is not classified as trusted",
+                "Autostart staging refused: the protected data root {Root:l} is not classified as trusted",
                 stagingRoot);
             return SchTasksCommandResult.SecureStagingRefused(
                 "the protected data root is not classified as trusted");
@@ -805,7 +837,7 @@ public sealed class ScheduledTaskAutostartService : IAutostartService
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
         {
-            _logger.LogWarning(ex, "The staged task-definition file could not be deleted: {Path}", path);
+            _logger.LogWarning(ex, "The staged task-definition file could not be deleted: {Path:l}", path);
         }
     }
 

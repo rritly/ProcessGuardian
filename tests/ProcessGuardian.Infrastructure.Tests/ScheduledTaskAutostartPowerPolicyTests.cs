@@ -553,7 +553,10 @@ public class ScheduledTaskAutostartPowerPolicyTests
         var result = await service.SetEnabledAsync(true);
 
         result.Succeeded.Should().BeFalse();
-        result.ErrorMessage.Should().Contain("boom");
+        // R-AS-TASK-SCHEDULER-DIAGNOSTICS: the raw exception message stays out of the
+        // user-facing ErrorMessage (it remains in the structured log).
+        result.ErrorMessage.Should().Be("task creation failed: schtasks.exe could not be started");
+        result.ErrorMessage.Should().NotContain("boom");
         definitionPath.Should().NotBeNullOrEmpty();
         store.Deleted.Should().Contain(definitionPath,
             "the finally-block cleanup runs even when the invocation throws");

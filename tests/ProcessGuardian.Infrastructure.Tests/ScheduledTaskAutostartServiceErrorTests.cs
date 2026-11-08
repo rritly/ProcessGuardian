@@ -537,7 +537,9 @@ public class ScheduledTaskAutostartServiceErrorTests
         var result = await service.SetEnabledAsync(false);
 
         result.Succeeded.Should().BeFalse();
-        result.ErrorMessage.Should().Contain("exit 1");
+        // R-AS-TASK-SCHEDULER-DIAGNOSTICS: the nonzero delete is provisional until the follow-up
+        // query; that query still finds the task registered, so the deletion genuinely failed.
+        result.ErrorMessage.Should().Contain("still registered after the delete attempt");
     }
 
     [Fact]
@@ -574,7 +576,11 @@ public class ScheduledTaskAutostartServiceErrorTests
         var result = await service.SetEnabledAsync(true);
 
         result.Succeeded.Should().BeFalse();
-        result.ErrorMessage.Should().Contain("boom");
+        // R-AS-TASK-SCHEDULER-DIAGNOSTICS: the user-facing message stays stable English; the raw
+        // (potentially localized) exception message never leaks into it — it remains in the
+        // bounded structured log.
+        result.ErrorMessage.Should().Be("task creation failed: schtasks.exe could not be started");
+        result.ErrorMessage.Should().NotContain("boom");
     }
 
     // ---------------------------------------------------------------------
