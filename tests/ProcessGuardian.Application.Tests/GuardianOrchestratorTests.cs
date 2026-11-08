@@ -2163,12 +2163,20 @@ public class GuardianOrchestratorTests
         await WaitUntilAsync(() => controller.CurrentState.Status == GuardianStatus.Error,
             "Error to be published after the fatal mismatch");
 
+        // The terminal Error is published BEFORE the disabled-save completes (§4.2/§4.3);
+        // the failed save surfaces SaveFailed only through the follow-up Error publication
+        // after the save attempt has finished. Waiting for the flag deterministically avoids
+        // racing the settlement continuation right after the first Error publication —
+        // an immediately-following assertion passes on a fast machine but flakes on CI.
         controller.CurrentState.Status.Should().Be(GuardianStatus.Error);
-        controller.CurrentState.SaveFailed.Should().BeTrue(
-            "a failed Save(false) must not suppress the Error publication (F)");
         controller.CurrentState.IsDegraded.Should().BeFalse(
             "a persistence failure is SaveFailed, never IsDegraded (R-F)");
         _ = h.Monitor.DidNotReceive().TryStart(Arg.Any<ProcessTarget>(), Arg.Any<CancellationToken>());
+
+        await WaitUntilAsync(() => controller.CurrentState.SaveFailed,
+            "the SaveFailed flag to be surfaced after the failed fatal disabled-save completes");
+        controller.CurrentState.SaveFailed.Should().BeTrue(
+            "a failed Save(false) must not suppress the Error publication (F)");
     }
 
     // §4.2/§4.3: the terminal Error is published BEFORE the disabled-save completes. The save
