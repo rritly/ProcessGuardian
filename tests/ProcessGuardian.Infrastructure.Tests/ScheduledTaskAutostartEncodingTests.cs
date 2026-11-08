@@ -11,8 +11,15 @@ namespace ProcessGuardian.Infrastructure.Tests;
 // with that page; without it a windowless WPF process decodes with code page 0 and the
 // localized task-not-found message becomes mojibake, silently downgrading a verified Absent
 // state to Unknown. Fixtures below are split into LIVE raw-byte captures (real schtasks.exe
-// runs on the target Windows installation) and SYNTHETIC strings (unit-only, never live
-// evidence).
+// runs) and SYNTHETIC strings (unit-only, never live evidence).
+//
+// Environment independence: each LIVE fixture is a byte-for-byte capture from ONE known
+// Windows installation whose OEM page was CP866, so it is decoded with that FIXED capture page
+// (never the runtime page resolved from GetOEMCP() on the machine executing the tests). A
+// GitHub Actions windows-latest runner is en-US (OEMCP 437): decoding a CP866 capture with the
+// runtime page yields mojibake and the exact-message/classification assertions below would
+// fail on CI while passing on a ru-RU machine. The runtime page selection itself is validated
+// separately by CommandOutputEncoding_IsTheSystemOemCodePage.
 public class ScheduledTaskAutostartEncodingTests
 {
     // ------------------------------------------------------------------
@@ -53,24 +60,36 @@ public class ScheduledTaskAutostartEncodingTests
     private const string LiveWindowsMissingTaskStderrHex =
         "8E9888818A803A208DA520E3A4A0A5E2E1EF20ADA0A9E2A820E3AAA0A7A0ADADEBA920E4A0A9AB2E0D0D0A";
 
-    private static string DecodeWithCommandEncoding(byte[] raw) =>
-        ScheduledTaskAutostartService.CommandOutputEncoding.GetString(raw);
+    // The LIVE fixtures were captured on a machine whose OEM page was CP866, so they are decoded
+    // with that fixed page, never the runtime GetOEMCP() page of the machine running the tests
+    // (machine independence for CI, see the class comment). The runtime selection is asserted by
+    // CommandOutputEncoding_IsTheSystemOemCodePage.
+    private static readonly Encoding LiveFixtureEncoding = CreateLiveFixtureEncoding();
+
+    private static Encoding CreateLiveFixtureEncoding()
+    {
+        // Legacy Windows code pages (e.g. CP866) require the code-pages provider on .NET.
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        return Encoding.GetEncoding(866);
+    }
+
+    private static string DecodeLiveFixture(byte[] raw) => LiveFixtureEncoding.GetString(raw);
 
     private static byte[] LiveMissingTaskBytes() => Convert.FromHexString(LiveWindowsMissingTaskStderrHex);
 
     [Fact]
     public void LiveWindowsRawBytes_MissingTaskOnStderr_DecodeToTheRealMessage()
     {
-        var decoded = DecodeWithCommandEncoding(LiveMissingTaskBytes());
+        var decoded = DecodeLiveFixture(LiveMissingTaskBytes());
 
         decoded.Should().Be("ОШИБКА: Не удается найти указанный файл.\r\r\n",
-            "the live raw-byte capture must round-trip through the selected command output encoding");
+            "the live raw-byte capture must round-trip through its fixed capture page (CP866)");
     }
 
     [Fact]
     public void LiveWindowsRawBytes_MissingTaskOnStderr_ClassifiesAsMissingTask()
     {
-        var decoded = DecodeWithCommandEncoding(LiveMissingTaskBytes());
+        var decoded = DecodeLiveFixture(LiveMissingTaskBytes());
         var result = new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty, decoded, null);
 
         ScheduledTaskAutostartService.ClassifyQueryResult(result)
@@ -83,7 +102,7 @@ public class ScheduledTaskAutostartEncodingTests
     {
         // The marker may arrive on either stream; the same live bytes delivered on stdout must
         // still classify as MissingTask.
-        var decoded = DecodeWithCommandEncoding(LiveMissingTaskBytes());
+        var decoded = DecodeLiveFixture(LiveMissingTaskBytes());
         var result = new ScheduledTaskAutostartService.SchTasksCommandResult(1, decoded, string.Empty, null);
 
         ScheduledTaskAutostartService.ClassifyQueryResult(result)
@@ -98,7 +117,7 @@ public class ScheduledTaskAutostartEncodingTests
         var raw = LiveMissingTaskBytes();
         for (var i = 0; i < raw.Length; i++)
             raw[i] ^= 0x5A;
-        var decoded = DecodeWithCommandEncoding(raw);
+        var decoded = DecodeLiveFixture(raw);
         var result = new ScheduledTaskAutostartService.SchTasksCommandResult(1, string.Empty, decoded, null);
 
         ScheduledTaskAutostartService.ClassifyQueryResult(result)
