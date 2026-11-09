@@ -726,7 +726,7 @@
         </Border>
 
         <!-- ===== CARD 2: MONITORING ===== -->
-        <Border Grid.Row="2"
+        <Border x:Name="MonitoringCard" Grid.Row="2"
                 Background="{StaticResource CardBgBrush}"
                 BorderBrush="{StaticResource CardBorderBrush}"
                 BorderThickness="1"
@@ -741,23 +741,55 @@
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
-                <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
+                <StackPanel x:Name="MonitoringRow" Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
 
-                <Grid Width="151" Height="30" Margin="15,0,0,0">
-                    <Button Content="Start monitoring"
+                <!-- The row is a fixed single-line strip inside the ~540.8 DIP inner card width
+                     (DesignRoot 573 - 2x15 outer margin - 2x1 card border; measured via a real
+                     WPF measure/arrange). Without the DEGRADED banner the row measures 526.4 DIP
+                     and the status pill keeps its balanced insets (first control at 16 DIP from
+                     the card edge, right inset 15.2 DIP). When the DEGRADED banner appears
+                     (8 margin + 58.4 text = 66.4 DIP) the previous static gaps overflowed the
+                     card by ~52.8 DIP and the banner was clipped by the window edge
+                     (R-UI-STATUS-ROW-LAYOUT). The gaps therefore compress ONLY while the banner
+                     is visible (15->10, 35->12 x2, 8->4 = 55 DIP reclaimed, measured degraded
+                     row 536.8 <= 540.8); when hidden, the geometry is unchanged and the banner
+                     reserves no width (Collapsed, never Hidden). All control and pill sizes,
+                     fonts, colors, captions and triggers are untouched. -->
+                <Grid Width="151" Height="30">
+                    <Grid.Style>
+                        <Style TargetType="Grid">
+                            <Setter Property="Margin" Value="15,0,0,0" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsDegraded}" Value="True">
+                                    <Setter Property="Margin" Value="10,0,0,0" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Grid.Style>
+                    <Button x:Name="StartButton" Content="Start monitoring"
                             Style="{StaticResource StartButtonStyle}"
                             Command="{Binding StartCommand}" />
-                    <Button Content="Disable"
+                    <Button x:Name="DisableButton" Content="Disable"
                             Style="{StaticResource StopButtonStyle}"
                             Command="{Binding StopCommand}" />
                 </Grid>
 
                 <TextBlock Text="toast-notifications"
-                           Margin="35,0,0,0"
                            Width="113"
                            VerticalAlignment="Center"
                            FontSize="12"
-                           Foreground="{StaticResource LabelBrush}" />
+                           Foreground="{StaticResource LabelBrush}">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Margin" Value="35,0,0,0" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsDegraded}" Value="True">
+                                    <Setter Property="Margin" Value="12,0,0,0" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
 
                 <CheckBox Width="18" Height="18"
                           Margin="1,0,0,0"
@@ -767,30 +799,50 @@
                           IsChecked="{Binding Settings.EnableToasts, Mode=TwoWay}" />
 
                 <TextBlock Text="status"
-                           Margin="35,0,0,0"
                            Width="46"
                            VerticalAlignment="Center"
                            FontSize="12"
-                           Foreground="{StaticResource LabelBrush}" />
+                           Foreground="{StaticResource LabelBrush}">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Margin" Value="35,0,0,0" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsDegraded}" Value="True">
+                                    <Setter Property="Margin" Value="12,0,0,0" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
 
-                <Border Width="111" Height="30"
+                <Border x:Name="StatusPill" Width="111" Height="30"
                         Margin="1,0,0,0"
                         CornerRadius="5"
                         Style="{StaticResource StatusBorderStyle}">
-                    <TextBlock Text="{Binding Status, Converter={StaticResource StatusToDisplayConverter}}"
+                    <TextBlock x:Name="StatusText" Text="{Binding Status, Converter={StaticResource StatusToDisplayConverter}}"
                                Style="{StaticResource StatusTextStyle}"
                                HorizontalAlignment="Center"
                                VerticalAlignment="Center" />
                 </Border>
 
-                <TextBlock Text="DEGRADED"
-                           Margin="8,0,0,0"
+                <TextBlock x:Name="DegradedText" Text="DEGRADED"
                            FontSize="11"
                            FontWeight="Bold"
                            Foreground="#E5554F"
                            VerticalAlignment="Center"
                            ToolTip="{Binding StatusReason}"
-                           Visibility="{Binding IsDegraded, Converter={StaticResource BoolToVisibilityConverter}}" />
+                           Visibility="{Binding IsDegraded, Converter={StaticResource BoolToVisibilityConverter}}">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Margin" Value="8,0,0,0" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsDegraded}" Value="True">
+                                    <Setter Property="Margin" Value="4,0,0,0" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
                 </StackPanel>
             </Grid>
         </Border>
